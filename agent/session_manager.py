@@ -2,17 +2,20 @@
 # 将外部通道的线程 ID 映射到内部 UUID，并为每个线程管理撤销状态。
 
 import asyncio
-from typing import Dict, Optional
+import logging
 from dataclasses import dataclass
-from uuid import UUID, uuid4
+from datetime import datetime, timedelta, timezone
+from typing import Any, Tuple
+from typing import Dict, Optional
+from uuid import UUID
+
 from agent.session import Session
 from agent.undo import UndoManager
 from hooks import HookRegistry, HookEvent
-from typing import Any, Tuple
-import logging
 
 # 当会话数量超过此阈值时发出警告
 SESSION_COUNT_WARNING_THRESHOLD = 1000
+
 
 @dataclass(frozen=True)  # frozen=True 使实例不可变，对应 Rust 的 #[derive(Clone, Hash, Eq, PartialEq)]
 class ThreadKey:
@@ -45,6 +48,10 @@ class SessionManager:
         self.undo_managers: Dict[UUID, UndoManager] = undo_managers
 
         self.hooks: Optional[HookRegistry] = hooks
+
+    @classmethod
+    def default(cls):
+        return cls()
 
     def with_hooks(self, hooks: HookRegistry) -> 'SessionManager':
         """
@@ -168,3 +175,121 @@ class SessionManager:
         # undo_managers.insert(thread_id, Arc::new(Mutex::new(UndoManager::new())));
 
         return (session, thread_id)
+
+    async def register_thread(self, user_id: str, channel: str, thread_id: str, session: str) -> None:
+        """
+        注册一个已存在的线程（例如从数据库恢复的线程）。
+        插入 thread_map，创建撤销管理器，并确保会话被跟踪。
+        :param user_id:
+        :param channel:
+        :param thread_id:
+        :param session:
+        :return:
+        """
+        # 构造 ThreadKey
+        key = ThreadKey(user_id, channel, thread_id)
+        # 插入 thread_map
+        thread_map = await self.thread_map.write()
+        thread_map.insert(key, thread_id)
+
+        # 为线程创建撤销管理器（若不存在）
+        undo_managers = await self.undo_managers.write()
+        undo_managers.entry(thread_id)  # .or_insert_with(|| Arc::new(Mutex::new(UndoManager::new())))
+
+        # 确保会话被跟踪
+        sessions = await self.sessions.write()
+        sessions.entry(user_id.to_string()).or_insert(session)
+
+    async def get_undo_manager(self, thread_id: str) -> UndoManager:
+        """
+        获取线程的撤销管理器句柄。如果不存在则创建。
+        返回的句柄支持 `async with` 使用，保证线程安全。
+        :param thread_id:
+        :return:
+        """
+        # 快速路径
+        managers = await self.undo_managers.read()
+        if mgr := managers.get(thread_id):
+            return mgr
+
+        # 慢路径：创建新管理器（双检锁）
+        managers = await self.undo_managers.write()
+        if mgr := managers.get(thread_id):
+            return mgr
+
+        # 创建新的 UndoManager 和句柄
+        mgr = UndoManager()
+        managers.insert(thread_id, mgr)
+        return mgr
+
+    # 钩子处理函数
+    async def _fire_session_end_hook(self, user_id: str, session_id: str):
+        try:
+            event = HookEvent.SessionEnd(user_id, session_id)  # 根据实际事件类型构造
+            await self.hooks.run(event)
+        except Exception as e:
+            logging.warning(f"OnSessionEnd hook error: {e}")
+
+    async def prune_stale_sessions(self, max_idle: timedelta):
+        """
+        删除闲置时间超过规定时长的会话。
+        :param max_idle:
+        :return:
+        """
+        # 计算截止时间
+        cutoff = datetime.now(timezone.utc) - max_idle
+
+        # 查找空闲会话（用户ID + 会话ID）
+        sessions = await self.sessions.read()
+        # 遍历所有会话，对每个会话尝试非阻塞地获取锁。若锁被占用，说明会话正在活跃使用，跳过它（不视为空闲）。
+        # 若成功获取锁，则检查其最后活动时间是否早于设定的截止时间。
+        # 如果是，则记录该会话的用户 ID 和会话 ID，作为待清理的对象。
+        # 否则跳过。
+        # 最终得到一个只包含真正空闲会话的列表。
+        stale_sessions = []
+        for user_id, session in sessions:
+            # 尝试非阻塞获取会话锁
+            sess = session.try_lock()
+            if sess and sess.last_active_at < cutoff:
+                stale_sessions.append((user_id, sess.id))
+
+        stale_users = [user_id for user_id, _ in stale_sessions]
+
+        if not stale_users:
+            return 0
+
+        # 从过期会话中收集线程 ID 以进行清理
+        stale_thread_ids = []
+        sessions = await self.sessions.read()
+        for user_id in stale_users:
+            session = sessions.get(user_id)
+            sess = session.try_lock()
+            if sess:
+                stale_thread_ids.extend(sess.threads.keys())
+
+        # 为过期的会话触发 OnSessionEnd 钩子（即发即弃）
+        if self.hooks:
+            for user_id, session_id in stale_sessions:
+                # 异步启动钩子任务，不等待
+                asyncio.create_task(self._fire_session_end_hook(user_id, session_id))
+
+        # 移除会话
+        sessions = await self.sessions.write()
+        before = len(sessions)
+        for user_id in stale_users:
+            sessions.remove(user_id)
+        count = before - len(sessions)
+
+        # 清理指向过期会话的线程映射
+        thread_map = await self.thread_map.write()
+        thread_map = {k: v for k, v in thread_map.items() if k.user_id not in stale_users}
+
+        # 清理过期线程的撤销管理器
+        undo_managers = await self.undo_managers.write()
+        for thread_id in stale_thread_ids:
+            undo_managers.remove(thread_id)
+
+        if count > 0:
+            logging.info(f"Pruned {count} stale session(s) (idle > {max_idle}s)")
+
+        return count

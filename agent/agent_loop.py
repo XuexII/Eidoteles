@@ -6,7 +6,7 @@ from agent.routine_engine import RoutineEngine, spawn_cron_ticker
 from agent.self_repair import DefaultSelfRepair, RepairResult, SelfRepair
 from agent.session_manager import SessionManager
 from agent.submission import Submission, SubmissionParser, SubmissionResult
-from agent import HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler
+from agent import Router, Scheduler, HeartbeatConfig as AgentHeartbeatConfig
 from channels import ChannelManager, IncomingMessage, OutgoingResponse
 from config import AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig
 from context import ContextManager
@@ -389,7 +389,7 @@ class Agent:
         # 3. 启动会话清理任务
         session_mgr = self.session_manager
         session_idle_timeout = self.config.session_idle_timeout
-        pruning_handle = asyncio.create_task(self._session_pruning_task(session_mgr, self.config.session_idle_timeout))
+        pruning_handle = asyncio.create_task(self._session_pruning_task(session_mgr, session_idle_timeout))
 
         # 4. 启动心跳任务（如果启用）
         hb_config = self.heartbeat_config
