@@ -7,7 +7,7 @@ from agent.self_repair import DefaultSelfRepair, RepairResult, SelfRepair
 from agent.session_manager import SessionManager
 from agent.submission import Submission, SubmissionParser, SubmissionResult
 from agent import Router, Scheduler, HeartbeatConfig as AgentHeartbeatConfig
-from channels import ChannelManager, IncomingMessage, OutgoingResponse
+from channels import ChannelManager, IncomingMessage, OutgoingResponse, AttachmentKind
 from config import AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig
 from context import ContextManager
 from db import Database
@@ -22,6 +22,7 @@ from workspace import Workspace
 from dataclasses import dataclass
 from typing import Optional
 import asyncio
+from datetime import datetime, timezone
 
 
 # 代理的核心依赖。
@@ -333,6 +334,7 @@ class Agent:
                 for (ch, result) in results:
                     if result == "erro":
                         logging.warning(f"未能向目标主机广播心跳信号 {ch}: {result}")
+
     async def _routine_task(self, notify_queue, channel, extension_manager):
         while True:
             response = await notify_queue.get()
@@ -384,7 +386,8 @@ class Agent:
         repair_owner_id = self.owner_id  # .to_string()
 
         # tokio::spawn(async move {loop {}}) tokio::spawn: 创建一个异步任务，loop: 无限循环函数
-        repair_handle = asyncio.create_task(self._self_repair_task(repair, repair_interval, repair_channels, repair_owner_id))
+        repair_handle = asyncio.create_task(
+            self._self_repair_task(repair, repair_interval, repair_channels, repair_owner_id))
 
         # 3. 启动会话清理任务
         session_mgr = self.session_manager
@@ -499,8 +502,11 @@ class Agent:
                 # 存储提取的文档
                 await self.store_extracted_documents(message)
 
-                # 事件触发例程会在用户输入进入正常的聊天/工具流程之前对其进行处理。这避免了主代理响应后，例程又对同一条入站消息触发的重复操作。
-                if not message.is_internal and SubmissionParser.parse(message.content) == Submission.UserInput and routine_engine_for_loop:
+                # 事件触发例程会在用户输入进入正常的聊天/工具流程之前对其进行处理。
+                # 这避免了主代理响应后，例程又对同一条入站消息触发的重复操作。
+                if (not message.is_internal
+                        and SubmissionParser.parse(message.content) == Submission.UserInput
+                        and routine_engine_for_loop):
                     fired = await routine_engine_for_loop.check_event_triggers(message)
                     if fired > 0:
                         logging.debug(
@@ -513,106 +519,62 @@ class Agent:
                 response, error = await self.handle_message(message)
                 if response:
                     # 钩子：BeforeOutbound
-                    event = HookEvent.Outbound(user_id = message.user_id,
-                        channel = message.channel,
-                        content = response,
-                        thread_id = message.thread_id)
+                    event = HookEvent.Outbound(user_id=message.user_id,
+                                               channel=message.channel,
+                                               content=response,
+                                               thread_id=message.thread_id)
 
                     outcome = await self.hooks().run(event)
                     if outcome == "erro":
                         logging.warning(f"BeforeOutbound 钩子阻塞了响应：{outcome}")
                     elif isinstance(outcome, HookOutcome.Continue):
+                        pass
 
 
 
         except:
             pass
 
-/// Run the agent main loop.
-    pub async fn run(self) -> Result<(), Error> {
+    async def store_extracted_documents(self, message: IncomingMessage):
+        """
+        将提取的文档文本存储在工作区内存中，以便将来搜索/调用。
+        :param message:
+        :return:
+        """
+        if not self.workspace():
+            return
 
-        loop {
+        workspace = self.workspace()
 
-            match self.handle_message(&message).await {
-                Ok(Some(response)) if !response.is_empty() => {
+        for attachment in message.attachments:
+            if attachment.kind != AttachmentKind.Document:
+                continue
 
-                    match self.hooks().run(&event).await {
-                        Err(err) => {
-                            tracing::warn!("BeforeOutbound hook blocked response: {}", err);
-                        }
-                        Ok(crate::hooks::HookOutcome::Continue {
-                            modified: Some(new_content),
-                        }) => {
-                            if let Err(e) = self
-                                .channels
-                                .respond(&message, OutgoingResponse::text(new_content))
-                                .await
-                            {
-                                tracing::error!(
-                                    channel = %message.channel,
-                                    error = %e,
-                                    "Failed to send response to channel"
-                                );
-                            }
-                        }
-                        _ => {
-                            if let Err(e) = self
-                                .channels
-                                .respond(&message, OutgoingResponse::text(response))
-                                .await
-                            {
-                                tracing::error!(
-                                    channel = %message.channel,
-                                    error = %e,
-                                    "Failed to send response to channel"
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(Some(empty)) => {
-                    // Empty response, nothing to send (e.g. approval handled via send_status)
-                    tracing::debug!(
-                        channel = %message.channel,
-                        user = %message.user_id,
-                        empty_len = empty.len(),
-                        "Suppressed empty response (not sent to channel)"
-                    );
-                }
-                Ok(None) => {
-                    // Shutdown signal received (/quit, /exit, /shutdown)
-                    tracing::debug!("Shutdown command received, exiting...");
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!("Error handling message: {}", e);
-                    if let Err(send_err) = self
-                        .channels
-                        .respond(&message, OutgoingResponse::text(format!("Error: {}", e)))
-                        .await
-                    {
-                        tracing::error!(
-                            channel = %message.channel,
-                            error = %send_err,
-                            "Failed to send error response to channel"
-                        );
-                    }
-                }
-            }
-        }
+            text = attachment.extracted_text
 
-        // Cleanup
-        tracing::debug!("Agent shutting down...");
-        repair_handle.abort();
-        pruning_handle.abort();
-        if let Some(handle) = heartbeat_handle {
-            handle.abort();
-        }
-        if let Some((cron_handle, _)) = routine_handle {
-            cron_handle.abort();
-        }
-        self.scheduler.stop_all().await;
-        self.channels.shutdown_all().await?;
+            if not text or text.startswith('['):
+                # 跳过报错信息，如: "[Failed to..."
+                continue
 
-        Ok(())
-    }
+            # 清理文件名：去除路径分隔符以防止目录遍历
+            raw_name = attachment.filename if attachment.filename else "unnamed_document"
+            # 字符是 /、\ 或 \0，则替换为 _
+            trans_table = str.maketrans({'/': '_', '\\': '_', '\0': '_'})
+            filename = raw_name.translate(trans_table)
+            # 删除开头的.
+            filename = filename.lstrip('.')
+            filename = filename if filename else "unnamed_document"
+
+            # timezone.utc  时区
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = f"documents/{date}/{filename}"
+
+            header = f"# {filename}\n\n> 由 **{message.user_id}** 通过 **{message.channel}** 于 {date} 上传\n> MIME: {attachment.mime_type} | Size: {attachment.size_bytes.unwrap_or(0)} bytes\n\n---\n\n"
+            content = f"{header}{text}"
+
+            try:
+                await workspace.write(path, content)
+                logging.info(f"已将提取的文档存储在工作区内存中: path={path}, text_len={len(text)}")
+
+            except Exception as e:
+                logging.warning(f"将提取的文档存储在工作区内存时失败")
