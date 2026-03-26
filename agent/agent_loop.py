@@ -20,7 +20,7 @@ from skills import SkillRegistry
 from tools import ToolRegistry
 from workspace import Workspace
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 import asyncio
 from datetime import datetime, timezone
 
@@ -161,48 +161,56 @@ class Agent:
         """设置例行引擎槽位，用于将引擎暴露给网关。"""
         self.routine_engine_slot = slot
 
+    @property
     def scheduler(self) -> Scheduler:
         """
         获取调度器（用于外部连接，例如 CreateJobTool 等）。
         """
         return self.scheduler
 
+    @property
     def store(self) -> Optional[Database]:
         """
         获取数据库存储（如果存在）。
         """
         return self.deps.store
 
+    @property
     def llm(self) -> LlmProvider:
         """
         获取主 LLM 提供者。
         """
         return self.deps.llm
 
+    @property
     def cheap_llm(self) -> LlmProvider:
         """
         获取便宜/快速的 LLM 提供者，如果未设置则回退到主 LLM 提供者。
         """
         return self.deps.cheap_llm
 
+    @property
     def safety(self) -> SafetyLayer:
         """
         获取安全层。
         """
         return self.deps.safety
 
+    @property
     def tools(self) -> ToolRegistry:
         """
         获取工具注册表。
         """
         return self.deps.tools
 
+    @property
     def workspace(self) -> Optional[Workspace]:
         """
         获取工作区（如果存在）。
         """
         return self.deps.workspace
 
+    @property
     def hooks(self) -> HookRegistry:
         """
         获取钩子注册表。
@@ -210,12 +218,14 @@ class Agent:
         return self.deps.hooks
 
     # crate::agent::cost_guard::CostGuard
+    @property
     def cost_guard(self) -> CostGuard:
         """
         获取成本守卫。
         """
         return self.deps.cost_guard
 
+    @property
     def skill_registry(self) -> Optional[SkillRegistry]:
         """
         获取技能注册表（如果存在）。
@@ -223,6 +233,7 @@ class Agent:
         return self.deps.skill_registry
 
     # crate::skills::catalog::SkillCatalog
+    @property
     def skill_catalog(self) -> Optional[SkillCatalog]:
         """
         获取技能目录（如果存在）。
@@ -578,3 +589,138 @@ class Agent:
 
             except Exception as e:
                 logging.warning(f"将提取的文档存储在工作区内存时失败")
+
+    async def handle_message(self, message: IncomingMessage) -> Union[Optional[str], Error]:
+        # 仅在信息级别记录日志以用于跟踪，同时避免暴露个人身份信息（用户ID可能是手机号）
+        logging.info(f"Processing message: {message.id}")
+        # 在调试级别记录敏感详细信息以用于故障排查。
+        logging.debug(f"Message details: {message.model_dump(include={'message_id', 'user_id', 'channel', 'thread_id'})}")
+
+        # 内部消息（如任务监控通知）已经是渲染好的文本，应直接转发给用户，而不进入正常的用户输入管道（LLM/工具循环）。
+        # is_internal 字段和 into_internal() 设置器均为 私有，因此外部渠道无法伪造此标志。
+        if message._is_internal:
+            logging.debug(f"转发内部消息: {message.model_dump(include={'message_id', 'channel'})}")
+            return message.content
+
+        # 为此轮对话设置消息工具上下文（当前渠道和目标）
+        # 对于 Signal，使用元数据中的 signal_target（group:ID 或手机号），否则回退使用 user_id
+        target = message.routing_target() or message.user_id
+        await self.tools.set_message_tool_context(message.channel, target)
+
+        # 首先解析提交类型
+        submission = SubmissionParser.parse(message.content)
+        logging.debug(f"[agent_loop] Parsed submission: {type(submission).__name__}")
+        # 钩子：BeforeInbound — 允许钩子修改或拒绝用户输入
+
+        if isinstance(submission, Submission.UserInput):
+            content = submission.content
+            event = HookEvent.Inbound(user_id=message.user_id, channel=message.channel,
+                                      content=content, thread_id=message.thread_id)
+            try:
+                outcome = await self.hooks.run(event)
+                if isinstance(outcome, HookOutcome.Continue) and outcome.modified is not None:
+                    submission = UserInput(content=outcome.modified)
+            except HookError.Rejected as e:
+                return f"[消息被拒绝 {e.reason}]"
+            except HookError as e:
+                return f"[消息被钩子策略阻止: {e}]"
+            # 继续执行，故障开放模式下的错误已在注册表中记录
+
+        # 如果会话线程是历史线程且不在内存中，则从数据库加载
+        if external_thread_id := message.conversation_scope():
+            logging.debug(f"正在从数据库加载会话线程: {message.model_dump(include={'message_id', 'thread_id'})}")
+            rejection = await self.maybe_hydrate_thread(message, external_thread_id)
+            if rejection:
+                return f"Error: {rejection}"
+
+        # 解析会话和线程
+        logging.debug(f"正在解析会话和线程: {message.model_dump(include={'message_id'})}")
+        session, thread_id = await self.session_manager.resolve_thread(message.user_id, message.channel, message.conversation_scope())
+        logging.debug(f"解析会话和线程成功: {message.model_dump(include={'message_id'})}")
+
+        # 认证模式拦截：如果会话线程正在等待令牌，则将消息直接路由到凭证存储
+        # 不会触及日志、对话轮次、历史记录或压缩
+        sess = await session.lock()  # 获取锁
+        thread = sess.threads.get(thread_id)
+        pending_auth = thread.pending_auth if thread is not None else None
+        if pending_auth:
+            if pending_auth.is_expired():
+                # TTL 已超时 — 清除过期的认证模式
+                logging.warning(f"认证模式在 TTL 后已过期，正在清除: extension: {pending_auth.extension_name}")
+                sess = await session.lock()
+                if thread := sess.threads.get_mut(thread_id):
+                    thread.pending_auth = None
+                # 如果这是一条用户消息（可能是粘贴的令牌）返回显式错误，而不是将其转发给 LLM/历史记录。
+                if isinstance(submission, Submission.UserInput):
+                    return f"{pending_auth.extension_name} 的身份验证已过期，请重试"
+        # 控制类提交（中断、撤销等）会回退到常规处理流程
+        elif isinstance(submission, Submission.UserInput):
+            return await self.process_auth_token(message, pending_auth, submission.content, session, thread_id)
+        # 任何控制提交（中断、撤销等）都会取消认证模式
+        else:
+            sess = await session.lock()
+            if thread := sess.threads.get_mut(thread_id):
+                thread.pending_auth = None
+            # 回退到常规处理流程
+
+        logging.debug(f"收到来自 {message.user_id} 在 {message.channel} 上的消息（{len(message.content)} 个字符）")
+
+        # 根据submission的类型进行处理
+        result = None
+        if isinstance(submission, Submission.UserInput):
+            result = await self.process_user_input(message, session, thread_id, submission.content)
+        elif isinstance(submission, Submission.SystemCommand):
+            logging.debug(f"[agent_loop] SystemCommand: command={submission.command}, channel={message.channel}")
+            # 授权检查（包括重启渠道检查）在 handle_system_command 中强制执行
+            result = await self.handle_system_command(submission.command, submission.args, message.channel)
+        elif isinstance(submission, Submission.Undo):
+            result = await self.process_undo(session, thread_id)
+        elif isinstance(submission, Submission.Redo):
+            result = await self.process_redo(session, thread_id)
+        elif isinstance(submission, Submission.Interrupt):
+            result = await self.process_interrupt(session, thread_id)
+        elif isinstance(submission, Submission.Compact):
+            result = await self.process_compact(session, thread_id)
+        elif isinstance(submission, Submission.Clear):
+            result = await self.process_clear(session, thread_id)
+        elif isinstance(submission, Submission.NewThread):
+            result = await self.process_new_thread(message)
+        elif isinstance(submission, Submission.Heartbeat):
+            result = await self.process_heartbeat()
+        elif isinstance(submission, Submission.Summarize):
+            result = await self.process_summarize(session, thread_id)
+        elif isinstance(submission, Submission.Suggest):
+            result = await self.process_suggest(session, thread_id)
+        elif isinstance(submission, Submission.JobStatus):
+            result = await self.process_job_status(message.user_id, submission.job_id)
+        elif isinstance(submission, Submission.JobCancel):
+            result = await self.process_job_cancel(message.user_id, submission.job_id)
+        elif isinstance(submission, Submission.Quit):
+            return None
+        elif isinstance(submission, Submission.SwitchThread):
+            result = await self.process_switch_thread(message, target)
+        elif isinstance(submission, Submission.Resume):
+            result = await self.process_resume(session, thread_id, submission.checkpoint_id)
+        elif isinstance(submission, Submission.ExecApproval):
+            result = await self.process_approval(message, session, thread_id, submission.request_id, submission.approved, submission.always)
+        elif isinstance(submission, Submission.ApprovalResponse):
+            result = await self.process_approval(message, session, thread_id, None, submission.approved, submission.always)
+
+        # 将 SubmissionResult 转换为响应字符串
+        if isinstance(result, SubmissionResult.Response):
+            # 抑制静默回复（例如来自群聊的“无话可说”响应）
+            # llm.is_silent_reply
+            if is_silent_reply(result.content):
+                logging.debug("抑制静默回复")
+                return None
+            return result.content
+        if isinstance(result, SubmissionResult.Ok):
+            return result.message
+        if isinstance(result, SubmissionResult.Error):
+            return f"Error: {result.message}"
+        if isinstance(result, SubmissionResult.Interrupted):
+            return "Interrupted."  # 已中断
+        if isinstance(result, SubmissionResult.NeedApproval):
+            # ApprovalNeeded 状态已在 thread_ops.rs 中返回此结果之前发送。
+            # 空字符串表示调用方跳过 respond()（避免重复发送文本）
+            return ""
