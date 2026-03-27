@@ -516,7 +516,7 @@ class Agent:
                 # 事件触发例程会在用户输入进入正常的聊天/工具流程之前对其进行处理。
                 # 这避免了主代理响应后，例程又对同一条入站消息触发的重复操作。
                 if (not message.is_internal
-                        and SubmissionParser.parse(message.content) == Submission.UserInput
+                        and isinstance(SubmissionParser.parse(message.content), Submission.UserInput)
                         and routine_engine_for_loop):
                     fired = await routine_engine_for_loop.check_event_triggers(message)
                     if fired > 0:
