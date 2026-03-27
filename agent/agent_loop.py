@@ -598,7 +598,7 @@ class Agent:
 
         # 内部消息（如任务监控通知）已经是渲染好的文本，应直接转发给用户，而不进入正常的用户输入管道（LLM/工具循环）。
         # is_internal 字段和 into_internal() 设置器均为 私有，因此外部渠道无法伪造此标志。
-        if message._is_internal:
+        if message.is_internal:
             logging.debug(f"转发内部消息: {message.model_dump(include={'message_id', 'channel'})}")
             return message.content
 
