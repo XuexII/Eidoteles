@@ -131,17 +131,39 @@ class IncomingMessage(BaseModel):
         """
 
         return self.conversation_scope_id or self.thread_id
-    # Best-effort routing target for proactive replies on the current channel.
+
     def routing_target(self) -> Optional[str]:
         """
         在当前频道上进行主动回复时的尽力路由目标。
         :return:
         """
-        routing_target_from_metadata(&self.metadata).or_else(|| {
-            if self.sender_id.is_empty() {
-                None
-            } else {
-                Some(self.sender_id.clone())
-            }
-        })
-    }
+        target = routing_target_from_metadata(self.metadata)
+        if target:
+            return target
+
+        return self.sender_id if self.sender_id else None
+
+def routing_target_from_metadata(metadata: Dict) -> Optional[str]:
+    """
+    从消息元数据中提取特定频道的主动路由目标。
+    :param metadata:
+    :return:
+    """
+
+    if signal_target := metadata.get("signal_target", None):
+        if isinstance(signal_target, str):
+            return signal_target
+        if isinstance(signal_target, (int, float)):
+            return str(signal_target)
+    elif chat_id := metadata.get("chat_id", None):
+        if isinstance(chat_id, str):
+            return chat_id
+        if isinstance(chat_id, (int, float)):
+            return str(chat_id)
+    elif target := metadata.get("target", None):
+        if isinstance(target, str):
+            return target
+        if isinstance(target, (int, float)):
+            return str(target)
+
+    return None
