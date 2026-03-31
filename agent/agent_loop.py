@@ -13,7 +13,7 @@ from context import ContextManager
 from db import Database
 from error import ChannelError, Error
 from extensions import ExtensionManager
-from hooks import HookRegistry
+from hooks import HookRegistry, HookEvent
 from llm import LlmProvider
 from safety import SafetyLayer
 from skills import SkillRegistry
@@ -605,6 +605,7 @@ class Agent:
         # 为此轮对话设置消息工具上下文（当前渠道和目标）
         # 对于 Signal，使用元数据中的 signal_target（group:ID 或手机号），否则回退使用 user_id
         target = message.routing_target() or message.user_id
+        # 为消息工具设置默认频道和目标
         await self.tools.set_message_tool_context(message.channel, target)
 
         # 首先解析提交类型
@@ -612,8 +613,10 @@ class Agent:
         logging.debug(f"[agent_loop] Parsed submission: {type(submission).__name__}")
         # 钩子：BeforeInbound — 允许钩子修改或拒绝用户输入
 
+        # 如果提交是用户输入
         if isinstance(submission, Submission.UserInput):
             content = submission.content
+            # 即将被处理的入站用户消息
             event = HookEvent.Inbound(user_id=message.user_id, channel=message.channel,
                                       content=content, thread_id=message.thread_id)
             try:

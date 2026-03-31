@@ -32,3 +32,8 @@ class RWLockSet(set):
     def __init__(self):
         super().__init__()
 
+@with_rwlock
+class RWLockList(list):
+
+    def __init__(self):
+        super().__init__()
