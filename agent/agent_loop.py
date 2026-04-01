@@ -13,7 +13,7 @@ from context import ContextManager
 from db import Database
 from error import ChannelError, Error
 from extensions import ExtensionManager
-from hooks import HookRegistry, HookEvent
+from hooks import HookRegistry, HookEvent, HookOutcome, HookError
 from llm import LlmProvider
 from safety import SafetyLayer
 from skills import SkillRegistry
@@ -622,7 +622,7 @@ class Agent:
             try:
                 outcome = await self.hooks.run(event)
                 if isinstance(outcome, HookOutcome.Continue) and outcome.modified is not None:
-                    submission = UserInput(content=outcome.modified)
+                    submission = Submission.UserInput(content=outcome.modified)
             except HookError.Rejected as e:
                 return f"[消息被拒绝 {e.reason}]"
             except HookError as e:

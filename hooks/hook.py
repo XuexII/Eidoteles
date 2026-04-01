@@ -1,8 +1,9 @@
+from isoduration.types import Duration
 from pydantic import BaseModel, Field, ConfigDict
 from abc import ABC, abstractmethod
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Union, Optional, Dict
-from enum import Enum, EnumDict
+from enum import Enum, auto
 
 
 class HookPoint(Enum):
@@ -99,7 +100,87 @@ class HookEvent(Enum):
         """
         返回此事件对应的 [`HookPoint`]。
         """
+        pass
 
+    def apply_modification(self, modified: str):
+        """
+        将一个修改字符串应用到事件的主要内容字段。
+        :param modified:
+        :return:
+        """
+        pass
+
+
+class HookOutcome:
+    """
+    hook的执行结果
+    """
+
+    class Continue(BaseModel):
+        """
+        继续处理，可选择使用修改后的内容。
+        """
+        # 如果不为为 `None`，则将此值替换事件的主要内容。
+        modified: Optional[str] = None
+
+    class Reject(BaseModel):
+        """
+        完全拒绝此事件。
+        """
+        # 拒绝原因的人类可读说明。
+        reason: str
+
+    def ok(self):
+        return self.Continue()
+
+    def modify(self, value: str):
+        return self.Continue(modified=value)
+
+    def reject(self, reason: str):
+        return self.Reject(reason=reason)
+
+
+class HookFailureMode(Enum):
+    """
+    如何处理钩子执行失败的情况。
+    """
+    # 发生错误或超时时，继续处理，如同钩子返回了 `ok()`。
+    FailOpen = auto()
+    # 发生错误或超时时，拒绝此事件。
+    FailClosed = auto()
+
+
+class HookError(Enum):
+    """
+    钩子执行错误。
+    """
+
+    class ExecutionFailed(BaseModel):
+        """
+        [error("钩子执行失败：{reason}")]
+        """
+        reason: str
+
+    class Timeout(BaseModel):
+        """
+        [error("hook执行超时，执行时间：{timeout}")]
+        """
+        timeout: Duration
+
+    class Rejected(BaseModel):
+        """
+        [error("hook被拒绝：{reason}")]
+        """
+
+        reason: str
+
+
+class HookContext(BaseModel):
+    """
+    与事件一起传递给钩子的上下文。
+    """
+    # 钩子可以使用的任意元数据。
+    metadata: Optional[Dict] = None
 
 
 # pub trait Hook: Send + Sync

@@ -103,8 +103,8 @@ async def async_main():
         run_claude_bridge()
     elif command == "web":
         init_cli_tracing()
-    else:
-        pass
+
+    # 继续执行
 
     # ---- PID锁（防止多实例） ----
     try:
