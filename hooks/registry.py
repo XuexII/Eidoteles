@@ -1,10 +1,12 @@
-from schems.async_schems import RWLockList
-from hooks.hook import Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome
-from typing import Optional, List, Dict, Union, Tuple
-from copy import deepcopy
 import asyncio
+import json
 import logging
-from pydantic import BaseModel
+from copy import deepcopy
+from typing import List, Union
+
+from hooks.hook import Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome
+from schems.async_schems import RWLockList
+
 logger = logging.getLogger(__name__)
 
 
@@ -13,13 +15,11 @@ class HookRegistry:
     def __init__(self):
         self.hooks: RWLockList = RWLockList()
 
-
     async def register(self, hook: Hook):
         """
         以默认优先级（100）注册一个钩子
         """
         await self.register_with_priority(hook, 100)
-
 
     async def register_with_priority(self, hook: Hook, priority: int):
         """
@@ -37,7 +37,6 @@ class HookRegistry:
             # 如果存在，替换为新的钩子和优先级（并记录警告）
             # 如果不存在，添加新钩子
 
-
     #     if let Some(existing) = hooks
     #         .iter_mut()
     #         .find(|entry| entry.hook.name() == hook_name)
@@ -54,7 +53,6 @@ class HookRegistry:
     #
     #     hooks.sort_by_key(|e| e.priority);
     # }
-
 
     async def unregister(self, name: str) -> bool:
         """
@@ -75,7 +73,6 @@ class HookRegistry:
         """
         async with self.hooks.read:
             return [entry.hook.name() for entry in self.hooks]
-
 
     def __repr__(self):
         super().__repr__()
@@ -106,69 +103,65 @@ class HookRegistry:
         current_event = deepcopy(event)
         for hook in matching:
             timeout = hook.timeout()
-            result = await asyncio.wait_for(
-                hook.execute(current_event, ctx),
-                timeout=timeout
-            )
 
-            match result:
-                case HookOutcome.Reject:
-                    logger.debug(f"Hook {hook.name()} rejected: {result.reason}")
+            try:
+                result = await asyncio.wait_for(hook.execute(current_event, ctx), timeout=timeout)
+                match result:
+                    case HookOutcome.Reject.value(reason):
+                        logger.debug(f"Hook {hook.name()} rejected: {reason}")
+                        return HookError.Rejected(reason=reason)
+
+                    case HookOutcome.Continue.value(modified=None):
+                        # 无操作，继续执行链
+                        pass
+                    case HookOutcome.Continue.value(modified):
+                        logger.debug(f"Hook {hook.name()} modified content")
+                        current_event.apply_modification(modified)
 
 
-        for hook in &matching {
-            match result {
-                Ok(Ok(HookOutcome::Reject { reason })) => {
-                    tracing::debug!(hook = hook.name(), "Hook rejected: {}", reason);
-                    return Err(HookError::Rejected { reason });
-                }
-                Ok(Ok(HookOutcome::Continue {
-                    modified: Some(value),
-                })) => {
-                    tracing::debug!(hook = hook.name(), "Hook modified content");
-                    current_event.apply_modification(&value);
-                }
-                Ok(Ok(HookOutcome::Continue { modified: None })) => {
-                    // No-op, continue chain
-                }
-                Ok(Err(err)) => match hook.failure_mode() {
-                    HookFailureMode::FailOpen => {
-                        tracing::warn!(hook = hook.name(), "Hook failed (fail-open): {}", err);
-                    }
-                    HookFailureMode::FailClosed => {
-                        tracing::warn!(hook = hook.name(), "Hook failed (fail-closed): {}", err);
-                        return Err(HookError::ExecutionFailed {
-                            reason: format!("Hook '{}' failed: {}", hook.name(), err),
-                        });
-                    }
-                },
-                Err(_elapsed) => match hook.failure_mode() {
-                    HookFailureMode::FailOpen => {
-                        tracing::warn!(
-                            hook = hook.name(),
-                            "Hook timed out (fail-open) after {:?}",
-                            timeout
-                        );
-                    }
-                    HookFailureMode::FailClosed => {
-                        tracing::warn!(
-                            hook = hook.name(),
-                            "Hook timed out (fail-closed) after {:?}",
-                            timeout
-                        );
-                        return Err(HookError::Timeout { timeout });
-                    }
-                },
-            }
-        }
+            except asyncio.TimeoutError:
 
-        // Determine final outcome by comparing with original event
-        let modified = extract_content(&current_event);
-        let original = extract_content(event);
+                # 对应 Rust: Err(_elapsed) -> 超时
 
-        if modified != original {
-            Ok(HookOutcome::modify(modified))
-        } else {
-            Ok(HookOutcome::ok())
-        }
-    }
+                failure_mode = hook.failure_mode()
+
+                match failure_mode:
+                    case HookFailureMode.FailOpen:
+                        logger.warning(f"钩子 {hook.name()} 在 {timeout} 秒后超时（采用故障开放策略）")
+                    case HookFailureMode.FailClosed:
+                        logger.warning(f"钩子 {hook.name()} 在 {timeout} 秒后超时（采用故障关闭策略）")
+                        return HookError.Timeout(timeout=timeout)
+
+            except Exception as err:
+                failure_mode = hook.failure_mode()
+
+                match failure_mode:
+                    case HookFailureMode.FailOpen:
+                        logger.warning(f"钩子 {hook.name()} 报错（采用故障开放策略): {err}")
+                    case HookFailureMode.FailClosed:
+                        logger.warning(f"钩子 {hook.name()} 报错（采用故障关闭策略): {err}")
+                        return HookError.ExecutionFailed(reason=f"钩子 {hook.name()} 报错: {err}")
+
+        # 通过对比原始事件来确定最终结果。
+        modified = extract_content(current_event)
+        original = extract_content(event)
+        if modified != original:
+            return HookOutcome.modify(modified=modified)
+        return HookOutcome.ok()
+
+
+def extract_content(event: HookEvent) -> str:
+    """
+    从钩子事件中提取主要内容字符串。
+    :param event:
+    :return:
+    """
+    match event:
+        case HookEvent.Inbound.value(content) | HookEvent.Outbound.value(content=content):
+            return content
+        case HookEvent.ToolCall.value(parameters=parameters):
+            return json.dumps(parameters, ensure_ascii=False)
+        case HookEvent.ResponseTransform.value(response=response):
+            return response
+        case HookEvent.SessionStart.value(session_id=session_id) | HookEvent.SessionEnd.value(session_id=session_id):
+            return session_id

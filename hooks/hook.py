@@ -1,9 +1,10 @@
-from isoduration.types import Duration
 from pydantic import BaseModel, Field, ConfigDict
 from abc import ABC, abstractmethod
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Union, Optional, Dict
 from enum import Enum, auto
+from schems.enum_schems import ClassEnum
+from dataclasses import dataclass
 
 
 class HookPoint(Enum):
@@ -88,7 +89,7 @@ class ResponseTransform(BaseModel):
     response: str
 
 
-class HookEvent(Enum):
+class HookEvent(ClassEnum):
     Inbound = Inbound
     ToolCall = ToolCall
     Outbound = Outbound
@@ -110,34 +111,43 @@ class HookEvent(Enum):
         """
         pass
 
+class Continue(BaseModel):
+    """
+    继续处理，可选择使用修改后的内容。
+    """
+    # 如果不为为 `None`，则将此值替换事件的主要内容。
+    modified: Optional[str] = None
 
-class HookOutcome:
+    __match_args__ = ("modified",)
+
+class Reject(BaseModel):
+    """
+    完全拒绝此事件。
+    """
+    # 拒绝原因的人类可读说明。
+    reason: str
+
+    __match_args__ = ("reason",)
+
+class HookOutcome(ClassEnum):
     """
     hook的执行结果
     """
+    Continue: Continue
+    Reject: Reject
 
-    class Continue(BaseModel):
-        """
-        继续处理，可选择使用修改后的内容。
-        """
-        # 如果不为为 `None`，则将此值替换事件的主要内容。
-        modified: Optional[str] = None
 
-    class Reject(BaseModel):
-        """
-        完全拒绝此事件。
-        """
-        # 拒绝原因的人类可读说明。
-        reason: str
+    @classmethod
+    def ok(cls):
+        return cls.Continue(modified=None)
 
-    def ok(self):
-        return self.Continue()
+    @classmethod
+    def modify(cls, value: str):
+        return cls.Continue(modified=value)
 
-    def modify(self, value: str):
-        return self.Continue(modified=value)
-
-    def reject(self, reason: str):
-        return self.Reject(reason=reason)
+    @classmethod
+    def reject(cls, reason: str):
+        return cls.Reject(reason=reason)
 
 
 class HookFailureMode(Enum):
@@ -149,30 +159,34 @@ class HookFailureMode(Enum):
     # 发生错误或超时时，拒绝此事件。
     FailClosed = auto()
 
+class ExecutionFailed(BaseModel):
+    """
+    [error("钩子执行失败：{reason}")]
+    """
+    reason: str
 
-class HookError(Enum):
+class Timeout(BaseModel):
+    """
+    [error("hook执行超时，执行时间：{timeout}")]
+    """
+    timeout: float
+
+class Rejected(BaseModel):
+    """
+    [error("hook被拒绝：{reason}")]
+    """
+
+    reason: str
+
+class HookError(ClassEnum):
     """
     钩子执行错误。
     """
+    ExecutionFailed = ExecutionFailed
+    Timeout = Timeout
+    Rejected = Rejected
 
-    class ExecutionFailed(BaseModel):
-        """
-        [error("钩子执行失败：{reason}")]
-        """
-        reason: str
 
-    class Timeout(BaseModel):
-        """
-        [error("hook执行超时，执行时间：{timeout}")]
-        """
-        timeout: Duration
-
-    class Rejected(BaseModel):
-        """
-        [error("hook被拒绝：{reason}")]
-        """
-
-        reason: str
 
 
 class HookContext(BaseModel):
@@ -214,12 +228,12 @@ class Hook(ABC):
         """
         return HookFailureMode.FailOpen
 
-    def timeout(self) -> Duration:
+    def timeout(self) -> float:
         """
         此钩子允许运行的最长时间。
         默认值: 5s
         """
-        return Duration.from_secs(5)
+        return 5.0
 
     @abstractmethod
     async def execute(self, event: HookEvent, ctx: HookContext) -> Union[HookOutcome, HookError]:
