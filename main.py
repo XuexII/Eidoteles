@@ -1,5 +1,5 @@
-from ironclaw.agent import Agent, AgentDeps
-from ironclaw.app import AppBuilder, AppBuilderFlags
+from agent import Agent, AgentDeps
+from app import AppBuilder, AppBuilderFlags
 from ironclaw.channels import ChannelManager, GatewayChannel, HttpChannel, ReplChannel, SignalChannel, WebhookServer, \
     WebhookServerConfig, ChannelSecretUpdater
 from ironclaw.channels.wasm import WasmChannelRouter, WasmChannelRuntime
@@ -24,9 +24,11 @@ import logging
 import sys
 import argparse
 from pathlib import Path
+from transcription import TranscriptionMiddleware
+from datetime import timedelta
 
 # 配置日志
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logger.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("ironclaw")
 
 
@@ -149,9 +151,9 @@ async def async_main():
 
     # ---- 构建核心组件 ----
     flags = AppBuilderFlags(no_db=args.no_db)
-    components = await AppBuilder(config, flags, Path(toml_path) if toml_path else None,
-                            session,
-                            log_broadcaster).build_all()
+    toml_path = Path(toml_path) if toml_path else None
+    components = await AppBuilder(config, flags, toml_path, session,
+                                  log_broadcaster).build_all()
 
     config = components.config
 
@@ -191,3 +193,93 @@ async def async_main():
         else:
             channel_names.append("repl")
             logger.debug("REPL模式启用")
+
+    # 构建Agent依赖
+    transcription = None
+    if provider := config.transcription.create_provider():
+        transcription = TranscriptionMiddleware(provider)
+
+    deps = AgentDeps(
+        owner_id=config.owner_id,
+        store=components.db,
+        llm=components.llm,
+        cheap_llm=components.cheap_llm,
+        safety=components.safety,
+        tools=components.tools,
+        workspace=components.workspace,
+        extension_manager=components.extension_manager,
+        skill_registry=components.skill_registry,
+        skill_catalog=components.skill_catalog,
+        skills_config=config.skills.clone(),
+        hooks=components.hooks,
+        cost_guard=components.cost_guard,
+        sse_tx=sse_sender,
+        http_interceptor=http_interceptor,
+        transcription=transcription
+    )
+
+    # 创建代理实例
+    agent = Agent(
+        config = config.agent,
+        deps = deps,
+        channels=channels,
+        heartbeat_config=config.heartbeat,
+        hygiene_config=config.hygiene,
+        routine_config=config.routines,
+        context_manager=components.context_manager,
+        session_manager=session_manager
+    )
+
+    # 现在代理（及其调度器）已存在，填充调度器槽位
+    # 异步获取写锁，并将 agent.scheduler() 的结果包装为 Some 后赋值给锁保护的值
+    async with scheduler_slot.write_lock() as guard:
+        guard.value = agent.scheduler()
+
+    # 生成沙盒回收器以清理孤儿容器
+    if container_job_manager:
+        reaper_config = ReaperConfig(
+            scan_interval=timedelta(seconds=config.sandbox.reaper_interval_secs),
+            orphan_threshold=timedelta(seconds=config.sandbox.orphan_threshold_secs)
+        )
+        # TODO 创建异步任务
+
+    # 将例程引擎槽交给代理，以便网关可以访问引擎
+    agent.set_routine_engine_slot(shared_routine_engine_slot)
+
+    # 准备 SIGHUP 处理程序，用于热重载 HTTP Webhook 配置
+    # 创建广播通道，用于干净地关闭后台任务
+    shutdown_tx = None
+
+    # 仅unix系统执行代码
+
+
+    # 运行代理主循环
+    await agent.run()
+
+    # ── 关闭 ──
+    # 通知后台任务（SIGHUP 处理程序等）优雅关闭
+    _ = shutdown_tx.send(())
+
+    # 关闭所有 stdio MCP 服务器子进程
+    await components.mcp_process_manager.shutdown_all()
+    # 如果启用了 LLM 追踪记录，则刷新
+    if recorder := components.recording_handle:
+        try:
+            await recorder.flush()
+        except Exception as e:
+            # 对应 Rust 中的 tracing::warn!
+            logger.warning(f"写入 LLM 追踪记录失败: {e}")
+
+    # 关闭 Webhook 服务器
+    if webhook_server:
+        pass
+
+    # 停止隧道
+    if active_tunnel:
+        logger.debug(f"正在停止 {active_tunnel.name} 隧道...")
+        try:
+            await active_tunnel.stop()
+        except Exception as e:
+            logger.warning(f"停止隧道时出错: {e}")
+
+    logger.debug("代理关闭完成")
