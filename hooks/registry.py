@@ -93,9 +93,9 @@ class HookRegistry:
         # 每个钩子可能运行至其超时时间，若持有读锁则会阻塞并发的注册/注销/运行调用。
         matching = []
         async with  self.hooks.read:
-            for event in self.hooks:
-                if point in event.hook.hook_points():
-                    matching.append(event.hook)
+            for entry in self.hooks:
+                if point in entry.hook.hook_points():
+                    matching.append(entry.hook)
 
         if len(matching) == 0:
             return HookOutcome.ok()
