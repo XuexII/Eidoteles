@@ -6,13 +6,11 @@ def with_rwlock(cls):
     class RWLocked(cls):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self._lock = RWLock()   # 暂不创建
+            self._lock = RWLock()
 
-        @property
         def read(self) -> _ReaderLock:
             return self._lock.reader_lock
 
-        @property
         def write(self) -> _WriterLock:
             return self._lock.writer_lock
 

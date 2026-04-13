@@ -6,44 +6,31 @@ from channels import Channel, IncomingMessage, MessageStream, OutgoingResponse, 
 from error import ChannelError
 import logging
 from futures import StreamExt
+from pydantic import BaseModel, ConfigDict, Field
+from schems.async_schems import RWLockDict
 
-# 管理多个输入通道并合并它们的消息流。
-# 包含一个注入通道，使得后台任务（例如任务监控器）可以向代理循环推送消息，而无需实现完整的 `Channel` trait。
+logger = logging.getLogger(__name__)
 
-class ChannelManager:
 
-    def __init__(
-            self,
-            channels: Dict[str, Channel],
-            inject_tx,
-            # Taken once in `start_all()` and merged into the stream.
-            # tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>
-            inject_rx
-    ):
-        self.channels = channels
-        self.inject_tx = inject_tx
-        self.inject_rx = inject_rx
 
-    @classmethod
-    def new(cls):
-        # 创建了一个有界通道，缓冲区最多可容纳 64 条未处理的消息。当缓冲区满时，发送操作会等待，起到流量控制作用，防止生产过快导致内存无限增长。
-        # 创建容量为 64 的队列
-        inject_queue = asyncio.Queue(maxsize=64)
-        # 发送端，将消息加入队列
-        inject_tx = None
-        # 接受端，异步等待下一条消息。当所有发送端被丢弃后，recv() 返回 None，表示通道已关闭
-        inject_rx = None
-        # TODO 实现一个带异步锁的自字典
-        channels = {}
-        return cls(channels, inject_tx, inject_rx)
+class ChannelManager(BaseModel):
+    """
+    管理多个输入通道并合并它们的消息流。
+    包含一个注入通道，使得后台任务（例如任务监控器）可以向代理循环推送消息，而无需实现完整的 `Channel` trait。
+    """
+    channels: RWLockDict[str, Channel]
+    # 创建容量为 64 的异步队列
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    # 在 `start_all()` 中获取一次，并合并到流中。
+
 
     def inject_sender(self):
         """
-        获取注入发送端的克隆。
-        python队列的 put 方法天然支持多生产者，无需显式克隆发送端
-        :return:
+        获取注入发送器的一个克隆。
+
+        后台任务（例如作业监视器）使用此发送器将消息推送到智能体循环中，而无需实现完整的 Channel 接口。
         """
-        return self.inject_tx.clone()
+        return self.queue
 
     async def add(self, channel: Channel):
         """
@@ -52,7 +39,8 @@ class ChannelManager:
         :return:
         """
         name = channel.name
-        await self.channels.insert(name, channel)
+        async with self.channels.write():
+            self.channels[name] = channel
         logging.debug("Added channel: {}", name)
 
 
