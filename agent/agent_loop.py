@@ -4,8 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Union
 
-from starlette.middleware.sessions import Session
-
+from agent.session import Session
 from llm import LlmProvider
 from db import Database
 from workspace import Workspace
@@ -16,6 +15,10 @@ from document_extraction import DocumentExtractionMiddleware
 from channels import ChannelManager, IncomingMessage, OutgoingResponse, AttachmentKind
 from agent.submission import SubmissionParser, Submission, Command
 from config import AgentConfig
+from context import ContextManager
+from agent.scheduler import Scheduler
+from agent.router import Router
+from agent.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,12 @@ class AgentDeps(BaseModel):
 class Agent(BaseModel):
     config: AgentConfig
     deps: AgentDeps
+    # 通道: 接受和发送消息
     channels: ChannelManager
+    context_manager: ContextManager
+    scheduler: Scheduler
+    router: Router
+    session_manager: SessionManager
 
     @property
     def store(self) -> Optional[Database]:
@@ -141,7 +149,29 @@ class Agent(BaseModel):
                                  thread_id: str,
                                  content: str):
         logger.info(f"处理用户输入: message_id: {message.id}")
-        pass
+
+        # 首先检查线程状态，在 I/O 操作期间不持有锁。
+
+        # 用户输入的安全验证。
+
+        # 扫描入站消息中的密钥（API 密钥、令牌）。
+        # 在此处捕获它们可以防止大语言模型将其回显，
+        # 否则会触发外发泄漏检测器并造成错误循环。
+
+        # 直接处理以 / 开头的显式命令
+        # 其余所有内容都通过正常的智能体循环（带工具）处理
+        temp_message = message
+        temp_message.content = content
+
+        if intent := self.router.route_command(temp_message):
+            # 直接处理以 / 开头的显式命令
+            return await self.handle_job_or_command(intent, message)
+
+        # 自然语言将通过智能体循环处理
+        # 作业工具（create_job、list_jobs 等）位于工具注册表中
+        #
+        # 在添加新轮次之前，如果需要则自动压缩会话
+
 
 
 

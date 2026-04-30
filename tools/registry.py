@@ -3,6 +3,8 @@ from pydantic import BaseModel, Field, ConfigDict
 import logging
 from tools.builtin.message import MessageTool
 from tools.tool import Tool
+from secrets import SecretsStore
+from tools.wasm import SharedCredentialRegistry
 
 logger = logging.getLogger(__name__)
 
