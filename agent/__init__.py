@@ -1,1 +1,1 @@
-from agent.agent_loop import Agent, AgentDeps
+from .agent_loop import AgentDeps, Agent

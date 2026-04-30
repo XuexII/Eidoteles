@@ -1,102 +1,72 @@
-import asyncio
-from abc import ABC, abstractmethod
-from typing import AsyncIterator, Dict, Optional, Union
-
-from channels import Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate
-from error import ChannelError
 import logging
-from futures import StreamExt
+from typing import Dict, List, Optional, AsyncIterator
+from pydantic import BaseModel, Field
+from channels.channel import IncomingMessage, MessageStream, Channel
+import asyncio
+from dataclasses import dataclass, field
+from utils.async_schems import RWLockDict
+from aiorwlock import RWLock
+
+logger = logging.getLogger(__name__)
 
 # 管理多个输入通道并合并它们的消息流。
 # 包含一个注入通道，使得后台任务（例如任务监控器）可以向代理循环推送消息，而无需实现完整的 `Channel` trait。
-
+@dataclass
 class ChannelManager:
+    channels: Dict[str, Channel] = field(default_factory=dict)
+    inject_tx: asyncio.Queue = asyncio.Queue(64)
+    lock: RWLock = RWLock()
+    inject_rx = None
+    _inject_rx = None
 
-    def __init__(
-            self,
-            channels: Dict[str, Channel],
-            inject_tx,
-            # Taken once in `start_all()` and merged into the stream.
-            # tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>
-            inject_rx
-    ):
-        self.channels = channels
-        self.inject_tx = inject_tx
-        self.inject_rx = inject_rx
-
-    @classmethod
-    def new(cls):
-        # 创建了一个有界通道，缓冲区最多可容纳 64 条未处理的消息。当缓冲区满时，发送操作会等待，起到流量控制作用，防止生产过快导致内存无限增长。
-        # 创建容量为 64 的队列
-        inject_queue = asyncio.Queue(maxsize=64)
-        # 发送端，将消息加入队列
-        inject_tx = None
-        # 接受端，异步等待下一条消息。当所有发送端被丢弃后，recv() 返回 None，表示通道已关闭
-        inject_rx = None
-        # TODO 实现一个带异步锁的自字典
-        channels = {}
-        return cls(channels, inject_tx, inject_rx)
-
-    def inject_sender(self):
-        """
-        获取注入发送端的克隆。
-        python队列的 put 方法天然支持多生产者，无需显式克隆发送端
-        :return:
-        """
-        return self.inject_tx.clone()
 
     async def add(self, channel: Channel):
         """
-        向manger添加channel
-        :param channel:
-        :return:
+        添加channel
         """
-        name = channel.name
-        await self.channels.insert(name, channel)
-        logging.debug("Added channel: {}", name)
+        name = channel.name()
+        async with self.lock.writer_lock:
+            self.channels[name] = channel
+        logger.info(f"新增一个通道: {name}")
 
-
-    async def _forward_stream_messages(self, name, stream, tx):
-        """转发消息"""
-        try:
-            async for msg in stream:
-                try:
-                    await tx.send(msg)
-                except Exception as e:
-                    logging.warning(f"{name}通道的接受通道已经关闭，停止热添加通道")
-                    break
-        except Exception as e:
-            logging.error("流可能异常结束")
-
-        finally:
-            logging.debug(f"{name}通道的热添加结束")
-
-
-    async def hot_add(self, channel: Channel):
+    async def start_all(self):
         """
-        向运行中的代理热添加一个通道。
-        启动该通道，在用于 respond() / broadcast() 的通道映射中注册，并生成一个任务，通过 inject_tx 将其流消息转发到代理循环中。
-        :param channel:
-        :return:
+        启动所有频道并返回合并后的消息流。
+        还会合并注入通道，以便后台任务可以将消息推入同一消息流。
         """
-        name = channel.name
 
-        # 关闭任何同名现有通道，以避免出现并行消费者
-        # 旧转发任务将在通道关闭后、其流结束时停止
-        channels = await self.channels.read()
-        if existing := channels.get(name):
-            logging.debug(f"在热添加前关闭已经存在的channel: {name}")
-            await existing.shutdown()
+        streams: List[MessageStream] = []
 
-        stream = await channel.start()
+        for name, channel in self.channels.items():
+            try:
+                stream = await channel.start()
+                logger.info(f"启动通道: {name}")
+                streams.append(stream)
+            except Exception as e:
+                logger.error(f"启动通道失败: {name}")
 
-        # 注册用于 respond / broadcast / send_status
-        await self.channels.insert(name, channel)
+        if not streams:
+            return "ERRO: 所有通道启动失败"
 
-        # 通过 inject_tx 转发流消息
-        tx = self.inject_tx.clone()
-        asyncio.create_task(self._forward_stream_messages(name, stream, tx))
+        # 提取注入接收端（只做一次），如果存在则加入流列表
+        # async with self._inject_lock:
+        #     inject_rx = self._inject_rx
+        #     self._inject_rx = None  # 取出后置空，确保只消费一次
+        #
+        # if inject_rx is not None:
+        #     # 注入接收端本身就是一个 asyncio.Queue，直接用作流
+        #     streams.append(inject_rx)
+        #     logging.debug("Injection channel merged into message stream")
 
+        # 创建统一的消息队列，所有子流和注入流都会汇聚到此
+        merged: asyncio.Queue = asyncio.Queue()
 
+        async def _merge(msg_stream: MessageStream):
+            async for item in msg_stream:
+                await merged.put(item)
+            # 可选：放一个哨兵表示该流结束？但简单起见，流结束后任务直接退出
 
+        merge_tasks = [asyncio.create_task(_merge(s)) for s in streams]
+
+        return merged
 
