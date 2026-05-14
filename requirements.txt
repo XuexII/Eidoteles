@@ -1,0 +1,4 @@
+smolagents[gradio,toolkit,openai]==1.24.0
+pandas
+openpyxl
+sqlalchemy
