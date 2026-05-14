@@ -105,7 +105,7 @@ class SqlAgent(MultiStepAgent):
                     input_tokens = plan_message.token_usage.input_tokens
                     output_tokens = plan_message.token_usage.output_tokens
             plan = textwrap.dedent(
-                f"""Here are the facts I know and the plan of action that I will follow to solve the task:\n```\n{plan_message_content}\n```"""
+                f"""以下是我所了解的事实以及为解决该任务将遵循的行动计划:\n```\n{plan_message_content}\n```"""
             )
         else:
             # Summary mode removes the system prompt and previous planning messages output by the model.

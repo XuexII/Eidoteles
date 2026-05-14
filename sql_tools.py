@@ -54,6 +54,37 @@ class ExecuteSQL(Tool):
 
         return result
 
+{
+    "name": "generate_chart",
+    "description": "根据输入的二维数据表生成合适的图表，支持柱状图、折线图、饼图、散点图等常见类型",
+    "arguments": {
+        "type": "object",
+        "properties": {
+            "data_file": {
+                "type": "string",
+                "description": "要生成图表数据的文件路径，必须是xlsx文件",
+            },
+            "chart_type": {
+                "type": "string",
+                "description": "图表类型，bar为柱状图，line为折线图，pie为饼图，scatter为散点图，table为表格。",
+                "enum": ["bar", "line", "pie", "scatter", "table"],
+            },
+            "x_axis_field": {
+                "type": "string",
+                "description": "用作X轴（或分类维度）的字段名，饼图对应扇区名称字段。",
+            },
+            "y_axis_field": {
+                "type": "string",
+                "description": "用作Y轴（或数值）的字段名，饼图对应数值字段。",
+            },
+            "title": {
+            "type": "string",
+            "description": "图表标题，默认为空。"
+        }
+        },
+        "required": ["data", "chart_type", "x_axis_field", "y_axis_field"]
+    }
+}
 
 class FinalAnswerTool(Tool):
     name = "final_answer"
