@@ -8,11 +8,9 @@ def with_rwlock(cls):
             super().__init__(*args, **kwargs)
             self._lock = RWLock()   # 暂不创建
 
-        @property
         def read(self) -> _ReaderLock:
             return self._lock.reader_lock
 
-        @property
         def write(self) -> _WriterLock:
             return self._lock.writer_lock
 
