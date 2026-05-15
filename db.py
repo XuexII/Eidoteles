@@ -1,33 +1,22 @@
-import logging
-import math
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple
+import os
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, create_engine, text, inspect
-from sqlalchemy.exc import SQLAlchemyError
+import pandas as pd
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    joinedload,
-    mapped_column,
-    relationship,
     sessionmaker,
 )
-import pandas as pd
-
+from tqdm import tqdm
 
 # ============================================================
 # 1. 配置数据库连接（这里用 SQLite，可替换为其他数据库）
 # ============================================================
 # SQLite 示例（文件型数据库，无需安装服务）
-DATABASE_URL = "sqlite:///./datasets/example.db"
+# DATABASE_URL = "sqlite:///./datasets/e-commerce.db"
 
 # MySQL 示例（需先安装 pymysql：pip install pymysql）
 # DATABASE_URL = "mysql+pymysql://用户名:密码@主机:端口/数据库名?charset=utf8mb4"
+DATABASE_URL = "mysql+pymysql://root:@127.0.0.1:3306/mydatabase"
 
-# PostgreSQL 示例（需先安装 psycopg2）
-# DATABASE_URL = "postgresql+psycopg2://用户名:密码@主机:端口/数据库名"
 
 engine = create_engine(DATABASE_URL, echo=False)  # echo=True 可打印执行的 SQL
 SessionLocal = sessionmaker(bind=engine)
@@ -36,7 +25,7 @@ SessionLocal = sessionmaker(bind=engine)
 # ============================================================
 # 2. 从 Excel 导入数据到数据库表
 # ============================================================
-def import_excel_to_table(excel_path: str, table_name: str, if_exists: str = "replace"):
+def import_excel_to_table(df, table_name: str, if_exists: str = "replace"):
     """
     将 Excel 文件导入为数据库表
 
@@ -45,8 +34,8 @@ def import_excel_to_table(excel_path: str, table_name: str, if_exists: str = "re
         table_name: 目标表名
         if_exists: 表存在时的处理方式 {'fail', 'replace', 'append'}
     """
-    # 读取 Excel 所有列，pandas 会自动推断数据类型
-    df = pd.read_excel(excel_path)
+    # # 读取 Excel 所有列，pandas 会自动推断数据类型
+    # df = pd.read_excel(excel_path)
 
     # 可选：手动处理列名（去除空格、特殊符号等）
     df.columns = [col.strip().replace(" ", "_") for col in df.columns]
@@ -60,7 +49,31 @@ def import_excel_to_table(excel_path: str, table_name: str, if_exists: str = "re
             index=False,
             method="multi"  # 批量插入，提升性能
         )
-    print(f"导入成功：{excel_path} -> 表 [{table_name}]，共 {len(df)} 行")
+    print(f"导入成功：表 [{table_name}]，共 {len(df)} 行")
+
+
+date_col_map = {
+    "user": ["register_date"],
+    "products": ["launch_date"],
+    "inventory": ["update_time"],
+    "orders": ["order_date"],
+    "reviews": ["review_date"]
+}
+
+
+def import_excel_to_table_batch(dir_path):
+    dir_items = os.listdir(dir_path)
+    for file in tqdm(dir_items, total=len(dir_items)):
+        if file.startswith(".") or not file.endswith(".csv"):
+            continue
+        file_name, _ = os.path.splitext(file)
+        file_path = os.path.join(dir_path, file)
+        parse_dates = date_col_map.get(file_name, [])
+        try:
+            df = pd.read_csv(file_path, parse_dates=parse_dates)
+        except Exception as e:
+            df = pd.read_csv(file_path, parse_dates=parse_dates, encoding='gbk')
+        import_excel_to_table(df, file_name)
 
 
 # ============================================================
@@ -96,35 +109,73 @@ def list_tables():
 # 5. 综合示例：从 Excel 导入 -> 执行 SQL 查询
 # ============================================================
 if __name__ == "__main__":
-    # ----- 准备一个测试 Excel 文件（如果本地没有，可自动生成示例） -----
-    sample_df = pd.DataFrame({
-        "员工编号": [1001, 1002, 1003],
-        "姓名": ["张三", "李四", "王五"],
-        "部门": ["技术部", "市场部", "技术部"],
-        "薪资": [15000, 12000, 18000]
-    })
-    excel_file = "datasets/sample_employees.xlsx"
-    sample_df.to_excel(excel_file, index=False)
-    print(f"已生成示例 Excel: {excel_file}")
+    # # ----- 步骤1: 导入 Excel 到数据库 -----
 
-    # ----- 步骤1: 导入 Excel 到数据库 -----
-    import_excel_to_table(excel_file, table_name="employees", if_exists="replace")
+    dir_path = "datasets"
+    # import_excel_to_table_batch(dir_path)
 
     # ----- 步骤2: 查看数据库中有哪些表 -----
-    list_tables()
+    # list_tables()
 
     # ----- 步骤3: 执行查询 -----
     # 简单查询
-    sql1 = "SELECT * FROM employees"
+    sql1 = """SELECT product_name, price
+FROM products
+WHERE product_id = '101';"""
+
     df1 = query_as_dataframe(sql1)
     print("\n所有员工：\n", df1)
 
     # 带参数查询（防止 SQL 注入）
-    sql2 = "SELECT 姓名, 薪资 FROM employees WHERE 部门 = :dept"
-    df2 = query_as_dataframe(sql2, {"dept": "技术部"})
+    sql2 = """SELECT order_date, total_amount
+FROM orders
+WHERE order_date >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01')
+  AND order_date < DATE_FORMAT(CURDATE(), '%Y-%m-01');"""
+    df2 = query_as_dataframe(sql2)
     print("\n技术部员工薪资：\n", df2)
 
     # 聚合查询
-    sql3 = "SELECT 部门, AVG(薪资) as 平均薪资 FROM employees GROUP BY 部门"
+    sql3 = """SELECT 
+    c.category_name,
+    ROUND(AVG(r.rating), 2) AS avg_rating
+FROM categories c
+INNER JOIN products p ON c.category_id = p.category_id
+INNER JOIN reviews r ON p.product_id = r.product_id
+GROUP BY c.category_id, c.category_name;"""
     df3 = query_as_dataframe(sql3)
     print("\n各部门平均薪资：\n", df3)
+
+    sql4 = """SELECT 
+    u.city,
+    SUM(total_amount) AS total_sales
+FROM orders o
+JOIN user u
+ON o.user_id=u.user_id
+WHERE u.city IN ('北京', '上海')
+  AND order_date >= MAKEDATE(YEAR(CURDATE()), 1) + INTERVAL (QUARTER(CURDATE()) - 2) * 3 MONTH
+  AND order_date < MAKEDATE(YEAR(CURDATE()), 1) + INTERVAL (QUARTER(CURDATE()) - 1) * 3 MONTH
+GROUP BY u.city;"""
+
+    df4 = query_as_dataframe(sql4)
+    print("\nsq4：\n", df4)
+
+    sql5 = """SELECT 
+    p.product_name,
+    SUM(i.stock_quantity) AS total_stock
+FROM categories c
+INNER JOIN products p ON c.category_id = p.category_id
+INNER JOIN inventory i ON p.product_id = i.product_id
+WHERE c.category_name in ('手机')
+GROUP BY p.product_name;"""
+    df5 = query_as_dataframe(sql5)
+    print("\nsq5：\n", df5)
+
+    sql6 = """SELECT order_date,SUM(total_amount) AS total_sales
+    FROM orders
+    WHERE order_date >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01')
+      AND order_date < DATE_FORMAT(CURDATE(), '%Y-%m-01')
+    GROUP BY order_date
+    ORDER BY order_date;"""
+
+    df6 = query_as_dataframe(sql6)
+    print("\nsq4：\n", df6)

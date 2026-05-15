@@ -3,7 +3,7 @@ import config
 from utils import load_yaml
 from sql_tools import all_sql_tools, FinalAnswerTool
 from agent import SqlAgent
-import os
+from gradio_ui import GradioUI
 
 model_id = config.model_id
 base_url = config.base_url
@@ -12,15 +12,82 @@ headers = config.headers
 
 dataset_info = [
     {
-        "table": "employees",
-        "description": "员工信息表",
+        "table": "user",
+        "description": "用户信息表",
         "column": {
-            "员工编号": "员工的编号",
-            "姓名": "员工姓名",
-            "部门": "员工所在部门",
-            "薪资": "员工每月的薪资"
+            "user_id": "用户的唯一id",
+            "username": "用户的姓名",
+            "register_date": "用户注册时间",
+            "user_level": "会员等级",
+            "city": "所在城市"
         }
-    }
+    },
+    {
+        "table": "categories",
+        "description": "商品类目信息表",
+        "column": {
+            "category_id": "类目的唯一id",
+            "category_name": "类目的具体名称"
+        }
+    },
+    {
+        "table": "products",
+        "description": "商品信息表",
+        "column": {
+            "product_id": "商品的唯一id",
+            "product_name": "商品名称",
+            "category_id": "商品所属的类目id",
+            "brand": "品牌名称",
+            "price": "商品价格",
+            "launch_date": "首次上架销售时间"
+        }
+    },
+    {
+        "table": "inventory",
+        "description": "商品库存信息表",
+        "column": {
+            "product_id": "产品的唯一id",
+            "warehouse_id": "库存id",
+            "stock_quantity": "库存数量",
+            "update_time": "更新时间"
+        }
+    },
+    {
+        "table": "orders",
+        "description": "销售订单信息表",
+        "column": {
+            "order_id": "订单唯一id",
+            "user_id": "下单用户id",
+            "order_date": "下单时间",
+            "total_amount": "订单总金额",
+            "payment_method": "支付方式",
+            "status": "订单状态。可选值['已完成', '未完成']"
+        }
+    },
+    {
+        "table": "order_items",
+        "description": "销售订单明细表",
+        "column": {
+            "item_id": "明细唯一id",
+            "order_id": "所属订单id",
+            "product_id": "购买的商品id",
+            "quantity": "购买数量",
+            "unit_price": "购买时的单价",
+            "discount": "购买时的折扣"
+        }
+    },
+    {
+        "table": "reviews",
+        "description": "商品评价/评论表，存储用户对购买过的商品发表的使用感受、评分等。",
+        "column": {
+            "review_id": "评论唯一id",
+            "user_id": "发表评论的用户id",
+            "product_id": "被评价的商品id",
+            "rating": "评分",
+            "comment": "评论正文",
+            "review_date": "评论发表时间"
+        }
+    },
 ]
 
 gen_args = {
@@ -61,42 +128,7 @@ agent = SqlAgent(
 
 agent.tools["final_answer"] = FinalAnswerTool()
 
-query = "帮我看一下我每个月公共要支付多少钱的工资给员工"
+query = "上个月总销售额是多少"
 
-agent.run(query)
-
-
-
-# import gradio as gr
-#
-# with gr.Blocks(title="电商Text2SQL智能分析助手",theme=gr.themes.Soft()) as demo:
-#     gr.Markdown("# 电商数据分析助手")
-#     gr.Markdown("用文字输入需求，获取SQL查询、图表与分析报告。")
-#
-#     with gr.Row():
-#         with gr.Column(scale=3):
-#             chatbot = gr.Chatbot(
-#                 label="对话历史",
-#                 height=285,
-#                 avatar_images=(None, "")
-#             )
-#             with gr.Row():
-#                 gr.Markdown(
-#                     "<div style='line-height: 38px; font-weight: bold;'>输入问题</div>",
-#                 )
-#                 msg = gr.Textbox(placeholder="例如：上周销售额最高的5个商品是哪些？", scale=5, show_label=False)
-#                 send_btn = gr.Button("发送", variant="primary", scale=5)
-#
-#         with gr.Column(scale=2):
-#             with gr.Tabs():
-#                 with gr.TabItem("图表"):
-#                     plot_display = gr.Plot(label="可视化结果")
-#                 with gr.TabItem("数据"):
-#                     data_table = gr.Dataframe(label="查询结果", interactive=False)
-#                 with gr.TabItem("分析报告"):
-#                     report_display = gr.Markdown("等待查询结果...")
-#
-#             with gr.Accordion("查看生成的SQL", open=False):
-#                 sql_display = gr.Code(label="SQL语句", language="sql", interactive=False)
-#
-#     demo.launch()
+# agent.run(query)
+GradioUI(agent).launch()
