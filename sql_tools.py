@@ -1,13 +1,15 @@
+import os
+
 import pandas as pd
 from smolagents.tools import Tool
 from sqlalchemy import create_engine, text
-from utils import convert_mysql_date_to_sqlite
 from datetime import datetime
 import json
 from agent import SQLOutput
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from typing import Any
+from smolagents.agent_types import AgentAudio, AgentImage, handle_agent_input_types, handle_agent_output_types
 
 
 @dataclass
@@ -29,7 +31,29 @@ class ChartOutput(SQLOutput):
         return self.state
 
 
-class ExecuteSQL(Tool):
+class SQLTool(Tool):
+    def __call__(self, *args, sanitize_inputs_outputs: bool = False, **kwargs):
+        if not self.is_initialized:
+            self.setup()
+
+        # Handle the arguments might be passed as a single dictionary
+        if len(args) == 1 and len(kwargs) == 0 and isinstance(args[0], dict):
+            potential_kwargs = args[0]
+
+            # If the dictionary keys match our input parameters, convert it to kwargs
+            if all(key in self.inputs for key in potential_kwargs):
+                args = ()
+                kwargs = potential_kwargs
+
+        if sanitize_inputs_outputs:
+            args, kwargs = handle_agent_input_types(*args, **kwargs)
+        outputs = self.forward(*args, **kwargs)
+        if sanitize_inputs_outputs:
+            outputs = handle_agent_output_types(outputs, self.output_type)
+        return outputs
+
+
+class ExecuteSQL(SQLTool):
     name = "execute_sql"
     description = "执行SQL的SELECT查询语句，并返回查询的结果。"
     inputs = {
@@ -73,7 +97,8 @@ class ExecuteSQL(Tool):
         try:
             df = self.query_as_dataframe(sql)
             now = datetime.now().strftime("%Y%m%d%H%M%S")
-            save_path = f"cache/{now}.xlsx"
+            save_path = f"./cache/{now}.xlsx"
+            os.makedirs("./cache", exist_ok=True)
             df.to_excel(save_path, index=False)
             result = "\n".join([json.dumps(row, ensure_ascii=False) for row in df.to_dict("records")])
             result = f"查询结果如下:\n结果保存位置: {save_path}\n详细信息:\n{result}"
@@ -84,7 +109,7 @@ class ExecuteSQL(Tool):
         return result
 
 
-class GenerateChart(Tool):
+class GenerateChart(SQLTool):
     name = "generate_chart"
     description = "根据输入的excel数据生成合适的图表，支持柱状图、折线图、饼图、散点图。执行成功后你将会收到: '执行成功'，否则你会收到报错信息。"
     inputs = {
@@ -157,7 +182,7 @@ class GenerateChart(Tool):
         return result
 
 
-class FinalAnswerTool(Tool):
+class FinalAnswerTool(SQLTool):
     name = "final_answer"
     description = "将最终的分析报告发送给用户"
     inputs = {

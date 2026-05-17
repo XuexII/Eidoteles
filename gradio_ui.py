@@ -128,7 +128,7 @@ def _process_action_step(step_log: ActionStep, skip_model_outputs: bool = False)
 
         # 执行sql
         if first_tool_call.name == ExecuteSQL.name:
-            sql = content
+            sql = args.get("sql", content)
             if isinstance(fist_action_output, ExecuteOutput):
                 content = "查询完成"
                 df = pd.read_excel(fist_action_output.path)

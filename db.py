@@ -112,7 +112,7 @@ if __name__ == "__main__":
     # # ----- 步骤1: 导入 Excel 到数据库 -----
 
     dir_path = "datasets"
-    # import_excel_to_table_batch(dir_path)
+    import_excel_to_table_batch(dir_path)
 
     # ----- 步骤2: 查看数据库中有哪些表 -----
     # list_tables()
