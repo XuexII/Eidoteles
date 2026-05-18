@@ -121,7 +121,7 @@ class GenerateChart(SQLTool):
         },
         'chart_type': {
             'type': 'string',
-            'description': '图表类型，bar为柱状图，line为折线图，pie为饼图。'
+            'description': '图表类型，bar为柱状图，line为折线图(如变化趋势使用)，pie为饼图(如占比问题使用)。'
         },
         "x_axis_field": {
             "type": "string",
@@ -192,7 +192,7 @@ class FinalAnswerTool(SQLTool):
     name = "final_answer"
     description = "将最终的分析报告发送给用户"
     inputs = {
-        "report": {"type": "string", "description": "最终发送给用户的分析报告"}}
+        "report": {"type": "string", "description": "最终发送给用户的分析报告。用简短的总结性术语回答用户的问题，如变化趋势或最终结果，不需要展示图片或图表信息。"}}
     output_type = "string"
 
     def forward(self, report: str) -> str:
@@ -206,12 +206,15 @@ all_sql_tools = [
 
 if __name__ == '__main__':
     sql = """SELECT 
-    c.category_name,
-    ROUND(AVG(r.rating), 2) AS avg_rating
-FROM categories c
-INNER JOIN products p ON c.category_id = p.category_id
-INNER JOIN reviews r ON p.product_id = r.product_id
-GROUP BY c.category_id, c.category_name;"""
+    u.city,
+    SUM(total_amount) AS total_sales
+FROM orders o
+JOIN user u
+ON o.user_id=u.user_id
+WHERE u.city IN ('北京', '上海')
+  AND order_date >= MAKEDATE(YEAR(CURDATE()), 1) + INTERVAL (QUARTER(CURDATE()) - 2) * 3 MONTH
+  AND order_date < MAKEDATE(YEAR(CURDATE()), 1) + INTERVAL (QUARTER(CURDATE()) - 1) * 3 MONTH
+GROUP BY u.city;"""
 
     exc_sql = all_sql_tools[0]
     res = exc_sql(sql=sql)

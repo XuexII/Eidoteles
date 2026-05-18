@@ -15,10 +15,26 @@ from tqdm import tqdm
 
 # MySQL 示例（需先安装 pymysql：pip install pymysql）
 # DATABASE_URL = "mysql+pymysql://用户名:密码@主机:端口/数据库名?charset=utf8mb4"
-DATABASE_URL = "mysql+pymysql://root:@127.0.0.1:3306/mydatabase"
+SERVER_URL = "mysql+pymysql://root:@127.0.0.1:3306"
+DB_NAME = "mydatabase"
+
+server_engine = create_engine(SERVER_URL, echo=False)
+with server_engine.connect() as conn:
+    result = conn.execute(
+        text(f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = :db"),
+        {"db": DB_NAME}
+    )
+    exists = result.fetchone() is not None
+    if not exists:
+        print(f"数据库`{DB_NAME}`不存在，开始创建")
+        conn.execute(text(f"CREATE DATABASE `{DB_NAME}` DEFAULT CHARACTER SET utf8mb4"))
+        conn.commit()
+    else:
+        print(f"数据库`{DB_NAME}`已经存在")
+server_engine.dispose()
 
 
-engine = create_engine(DATABASE_URL, echo=False)  # echo=True 可打印执行的 SQL
+engine = create_engine(f"{SERVER_URL}/{DB_NAME}", echo=False)  # echo=True 可打印执行的 SQL
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -115,7 +131,7 @@ if __name__ == "__main__":
     import_excel_to_table_batch(dir_path)
 
     # ----- 步骤2: 查看数据库中有哪些表 -----
-    # list_tables()
+    list_tables()
 
     # ----- 步骤3: 执行查询 -----
     # 简单查询
@@ -124,7 +140,7 @@ FROM products
 WHERE product_id = '101';"""
 
     df1 = query_as_dataframe(sql1)
-    print("\n所有员工：\n", df1)
+    print("\nsq1：\n", df1)
 
     # 带参数查询（防止 SQL 注入）
     sql2 = """SELECT order_date, total_amount
@@ -132,10 +148,10 @@ FROM orders
 WHERE order_date >= DATE_FORMAT(CURDATE() - INTERVAL 1 MONTH, '%Y-%m-01')
   AND order_date < DATE_FORMAT(CURDATE(), '%Y-%m-01');"""
     df2 = query_as_dataframe(sql2)
-    print("\n技术部员工薪资：\n", df2)
+    print("\nsq2：\n", df2)
 
     # 聚合查询
-    sql3 = """SELECT 
+    sql3 = """SELECT
     c.category_name,
     ROUND(AVG(r.rating), 2) AS avg_rating
 FROM categories c
@@ -143,9 +159,9 @@ INNER JOIN products p ON c.category_id = p.category_id
 INNER JOIN reviews r ON p.product_id = r.product_id
 GROUP BY c.category_id, c.category_name;"""
     df3 = query_as_dataframe(sql3)
-    print("\n各部门平均薪资：\n", df3)
+    print("\nsq3：\n", df3)
 
-    sql4 = """SELECT 
+    sql4 = """SELECT
     u.city,
     SUM(total_amount) AS total_sales
 FROM orders o
@@ -159,7 +175,7 @@ GROUP BY u.city;"""
     df4 = query_as_dataframe(sql4)
     print("\nsq4：\n", df4)
 
-    sql5 = """SELECT 
+    sql5 = """SELECT
     p.product_name,
     SUM(i.stock_quantity) AS total_stock
 FROM categories c

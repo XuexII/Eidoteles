@@ -21,6 +21,10 @@ __all__ = ["AgentMemory"]
 
 logger = getLogger(__name__)
 
+@dataclass
+class SQLChatChatMessage(ChatMessage):
+    tool_call_id: str | None = None
+
 
 @dataclass
 class ToolCall:
@@ -129,8 +133,9 @@ class ActionStep(MemoryStep):
 
         if self.observations is not None:
             messages.append(
-                ChatMessage(
+                SQLChatChatMessage(
                     role=MessageRole.TOOL_RESPONSE,
+                    tool_call_id=self.tool_calls[0].id,
                     content=[
                         {
                             "type": "text",

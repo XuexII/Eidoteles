@@ -123,6 +123,7 @@ model = SQLModel(
 agent = SqlAgent(
     tools=tools,
     model=model,
+    max_steps=5,
     prompt_templates=prompt_templates,
     planning_interval=100,  # 每多少步更新一次计划
     dataset_info=dataset_info
@@ -130,7 +131,7 @@ agent = SqlAgent(
 
 agent.tools["final_answer"] = FinalAnswerTool()
 
-query = "每个商品类别的平均评分是多少"
+# query = "每个商品类别的平均评分是多少"
 
 # agent.run(query)
 GradioUI(agent).launch()

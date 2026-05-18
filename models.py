@@ -2,8 +2,9 @@ from copy import deepcopy
 from typing import Any
 
 from smolagents import OpenAIModel, ChatMessage, Tool, MessageRole
-from smolagents.models import get_tool_json_schema, tool_role_conversions, REMOVE_PARAMETER
+from smolagents.models import get_tool_json_schema, tool_role_conversions, REMOVE_PARAMETER, remove_content_after_stop_sequences
 from smolagents.utils import encode_image_base64, make_image_url
+from smolagents.monitoring import TokenUsage
 
 
 def get_clean_message_list(
@@ -65,13 +66,31 @@ def get_clean_message_list(
                 content = message.content[0]["text"]
             else:
                 content = message.content
-            output_message_list.append(
-                {
-                    "role": message.role,
-                    "content": content,
-                    "tool_calls": message.tool_calls
-                }
-            )
+
+            if role == MessageRole.ASSISTANT:
+                output_message_list.append(
+                    {
+                        "role": message.role,
+                        "content": content,
+                        "tool_calls": message.tool_calls
+                    }
+                )
+            elif role == MessageRole.TOOL_RESPONSE:
+                output_message_list.append(
+                    {
+                        "role": message.role,
+                        "content": content,
+                        "tool_call_id": message.tool_call_id
+                    }
+                )
+            else:
+                output_message_list.append(
+                    {
+                        "role": message.role,
+                        "content": content
+                    }
+                )
+
     return output_message_list
 
 
@@ -126,3 +145,42 @@ class SQLModel(OpenAIModel):
             else:
                 completion_kwargs[kwarg_name] = kwarg_value  # Set/override parameter
         return completion_kwargs
+
+    def generate(
+        self,
+        messages: list[ChatMessage | dict],
+        stop_sequences: list[str] | None = None,
+        response_format: dict[str, str] | None = None,
+        tools_to_call_from: list[Tool] | None = None,
+        **kwargs,
+    ) -> ChatMessage:
+        completion_kwargs = self._prepare_completion_kwargs(
+            messages=messages,
+            stop_sequences=stop_sequences,
+            response_format=response_format,
+            tools_to_call_from=tools_to_call_from,
+            model=self.model_id,
+            custom_role_conversions=self.custom_role_conversions,
+            convert_images_to_image_urls=True,
+            **kwargs,
+        )
+        self._apply_rate_limit()
+        response = self.retryer(self.client.chat.completions.create, **completion_kwargs)
+        content = response.choices[0].message.content
+        if stop_sequences is not None and not self.supports_stop_parameter:
+            content = remove_content_after_stop_sequences(content, stop_sequences)
+
+        tool_calls = response.choices[0].message.tool_calls
+        if isinstance(tool_calls, list):
+            tool_calls = tool_calls[:1]
+
+        return ChatMessage(
+            role=response.choices[0].message.role,
+            content=content,
+            tool_calls=tool_calls,
+            raw=response,
+            token_usage=TokenUsage(
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            ),
+        )
