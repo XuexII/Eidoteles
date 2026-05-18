@@ -1,16 +1,18 @@
 import os
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
+import matplotlib.pyplot as plt
 import pandas as pd
+from smolagents.agent_types import handle_agent_input_types, handle_agent_output_types
 from smolagents.tools import Tool
 from sqlalchemy import create_engine, text
-from datetime import datetime
-import json
-from agent import SQLOutput
-from dataclasses import dataclass
-import matplotlib.pyplot as plt
-from typing import Any
-from smolagents.agent_types import AgentAudio, AgentImage, handle_agent_input_types, handle_agent_output_types
 
+from agent import SQLOutput
+
+plt.rcParams['font.sans-serif'] = ['STHeiti']  # 或 ['Hei']
+plt.rcParams['axes.unicode_minus'] = False
 
 @dataclass
 class ExecuteOutput(SQLOutput):
@@ -100,7 +102,7 @@ class ExecuteSQL(SQLTool):
             save_path = f"./cache/{now}.xlsx"
             os.makedirs("./cache", exist_ok=True)
             df.to_excel(save_path, index=False)
-            result = "\n".join([json.dumps(row, ensure_ascii=False) for row in df.to_dict("records")])
+            result = df.to_string()
             result = f"查询结果如下:\n结果保存位置: {save_path}\n详细信息:\n{result}"
             result = ExecuteOutput(sql=sql, path=save_path, content=result)
         except Exception as e:
@@ -111,11 +113,11 @@ class ExecuteSQL(SQLTool):
 
 class GenerateChart(SQLTool):
     name = "generate_chart"
-    description = "根据输入的excel数据生成合适的图表，支持柱状图、折线图、饼图、散点图。执行成功后你将会收到: '执行成功'，否则你会收到报错信息。"
+    description = "根据输入的excel数据生成合适的图表并在前端展示图表，支持柱状图、折线图、饼图、散点图。"
     inputs = {
         "path": {
             'type': 'string',
-            'description': 'excel文件的路径'
+            'description': 'SQL查询结果结果保存位置'
         },
         'chart_type': {
             'type': 'string',
@@ -155,15 +157,18 @@ class GenerateChart(SQLTool):
 
             fig, ax = plt.subplots(figsize=(8, 5))
 
+            x_items = df[x_axis_field]
+            y_items = df[y_axis_field]
+
             if chart_type == "bar":
-                ax.bar(df.iloc[:, 0], df.iloc[:, 1], color='skyblue')
+                ax.bar(x_items, y_items, color='skyblue')
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel(ylabel)
                 ax.set_title(title)
                 plt.xticks(rotation=45, ha='right')  # 旋转x轴标签防止重叠
 
             elif chart_type == "line":
-                ax.plot(df.iloc[:, 0], df.iloc[:, 1], marker='o', linestyle='-', color='orange')
+                ax.plot(x_items, y_items, marker='o', linestyle='-', color='orange')
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel(ylabel)
                 ax.set_title(title)
@@ -171,12 +176,13 @@ class GenerateChart(SQLTool):
                 plt.grid(True, linestyle='--', alpha=0.7)
             else:  # pie
                 # 绘制饼图，自动计算百分比
-                ax.pie(df.iloc[:, 1], labels=df.iloc[:, 0], autopct='%1.1f%%', startangle=90)
+                ax.pie(x_items, labels=y_items, autopct='%1.1f%%', startangle=90)
                 ax.set_title(title)
                 ax.axis('equal')  # 保证饼图为正圆
 
             plt.tight_layout()
-            result = ChartOutput(state="执行成功", fig=fig)
+            state = "图表已在前端展示，请继续执行下一步计划。"
+            result = ChartOutput(state=state, fig=fig)
         except Exception as e:
             result = f"generate_chart执行时报错: \n{e}"
         return result
@@ -198,3 +204,19 @@ all_sql_tools = [
     GenerateChart()
 ]
 
+if __name__ == '__main__':
+    sql = """SELECT 
+    c.category_name,
+    ROUND(AVG(r.rating), 2) AS avg_rating
+FROM categories c
+INNER JOIN products p ON c.category_id = p.category_id
+INNER JOIN reviews r ON p.product_id = r.product_id
+GROUP BY c.category_id, c.category_name;"""
+
+    exc_sql = all_sql_tools[0]
+    res = exc_sql(sql=sql)
+    print(str(res))
+
+    args = {"path": "./cache/20260518141051.xlsx", "chart_type": "bar", "x_axis_field": "category_name",
+            "y_axis_field": "avg_rating", "xlabel": "商品类别", "ylabel": "平均评分", "title": "各商品平均评分"}
+    all_sql_tools[1](**args)

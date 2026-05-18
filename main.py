@@ -1,9 +1,10 @@
-from smolagents import OpenAIModel, GradioUI, MessageRole
+from smolagents import GradioUI, MessageRole
 import config
 from utils import load_yaml
 from sql_tools import all_sql_tools, FinalAnswerTool
 from agent import SqlAgent
 from gradio_ui import GradioUI
+from models import SQLModel
 
 model_id = config.model_id
 base_url = config.base_url
@@ -102,19 +103,20 @@ gen_args = {
     }
 }
 
-prompt_templates = load_yaml("prompts/toolcalling_agent_v1.3.yaml")
+prompt_templates = load_yaml("prompts/toolcalling_agent_v1.4.yaml")
 tools = all_sql_tools
 
 custom_role_conversions = {
     MessageRole.TOOL_RESPONSE: "tool"
 }
 
-model = OpenAIModel(
+model = SQLModel(
     model_id=model_id,
     api_base=base_url,
     api_key=api_key,
     client_kwargs={"default_headers": headers},
     custom_role_conversions=custom_role_conversions,
+    flatten_messages_as_text=False,
     **gen_args
 )
 
@@ -128,7 +130,7 @@ agent = SqlAgent(
 
 agent.tools["final_answer"] = FinalAnswerTool()
 
-query = "上个月总销售额是多少"
+query = "每个商品类别的平均评分是多少"
 
 # agent.run(query)
 GradioUI(agent).launch()

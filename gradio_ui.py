@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Generator
 
 from smolagents.agent_types import AgentAudio, AgentImage, AgentText
-from smolagents.agents import MultiStepAgent, PlanningStep
-from memory import ActionStep, FinalAnswerStep
+from smolagents.agents import MultiStepAgent, FinalAnswerStep
+from memory import ActionStep, PlanningStep
 from smolagents.models import ChatMessageStreamDelta, MessageRole, agglomerate_stream_deltas
 from smolagents.utils import _is_package_available
 from sql_tools import ExecuteSQL, GenerateChart, ExecuteOutput, ChartOutput
@@ -349,7 +349,7 @@ class GradioUI:
         ```
     """
 
-    def __init__(self, agent: MultiStepAgent, file_upload_folder: str | None = None, reset_agent_memory: bool = False):
+    def __init__(self, agent: MultiStepAgent, file_upload_folder: str | None = None, reset_agent_memory: bool = True):
         if not _is_package_available("gradio"):
             raise ModuleNotFoundError(
                 "Please install 'gradio' extra to use the GradioUI: `pip install 'smolagents[gradio]'`"
@@ -446,9 +446,12 @@ class GradioUI:
                 ):
                     if isinstance(event, ActionStep):
                         msg, _sql, _df, _chart_fig = res
-                        sql = sql or _sql
-                        df = df or _df
-                        chart_fig = chart_fig or _chart_fig
+                        if _sql is not None:
+                            sql = _sql
+                        if _df is not None:
+                            df = _df
+                        if _chart_fig is not None:
+                            chart_fig = _chart_fig
                     else:
                         msg = res
 

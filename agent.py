@@ -1,6 +1,6 @@
 from smolagents.agents import *
 import json
-from memory import ActionStep
+from memory import ActionStep, PlanningStep, TaskStep
 
 
 @dataclass
@@ -210,7 +210,7 @@ class SqlAgent(MultiStepAgent):
             if self.stream_outputs and hasattr(self.model, "generate_stream"):
                 output_stream = self.model.generate_stream(
                     input_messages,
-                    stop_sequences=["Observation:", "Calling tools:"],
+                    # stop_sequences=["Observation:", "Calling tools:"],
                     tools_to_call_from=self.tools_and_managed_agents,
                 )
 
@@ -226,7 +226,7 @@ class SqlAgent(MultiStepAgent):
             else:
                 chat_message: ChatMessage = self.model.generate(
                     input_messages,
-                    stop_sequences=["Observation:", "Calling tools:"],
+                    # stop_sequences=["Observation:", "Calling tools:"],
                     tools_to_call_from=self.tools_and_managed_agents,
                 )
                 self.logger.log_markdown(
@@ -404,7 +404,7 @@ class SqlAgent(MultiStepAgent):
         try:
             # Call tool with appropriate arguments
             if isinstance(arguments, dict):
-                return tool(**arguments) if is_managed_agent else tool(**arguments, sanitize_inputs_outputs=True)
+                return tool(**arguments) if is_managed_agent else tool(**arguments, sanitize_inputs_outputs=False)
             else:
                 return tool(arguments) if is_managed_agent else tool(arguments, sanitize_inputs_outputs=True)
 
@@ -485,7 +485,8 @@ class SqlAgent(MultiStepAgent):
             finally:
                 self._finalize_step(action_step)
                 self.memory.steps.append(action_step)
-                yield action_step
+                if not returned_final_answer:
+                    yield action_step
                 self.step_number += 1
 
         if not returned_final_answer and self.step_number == max_steps + 1:

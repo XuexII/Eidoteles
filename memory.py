@@ -181,7 +181,7 @@ class PlanningStep(MemoryStep):
         return [
             ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": self.plan.strip()}]),
             ChatMessage(
-                role=MessageRole.USER, content=[{"type": "text", "text": "Now proceed and carry out this plan."}]
+                role=MessageRole.USER, content=[{"type": "text", "text": "现在开始逐步的执行计划"}]
             ),
             # This second message creates a role change to prevent models models from simply continuing the plan message
         ]
