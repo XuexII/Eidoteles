@@ -1000,19 +1000,17 @@ class Agent:
         # 对于 Signal，使用来自元数据的 signal_target（group:ID 或电话号码），
         # 否则回退到 user_id
         target = message.routing_target or message.user_id
+        # ------Step1: 设置Agent可见的内置工具------
         await self.tools.set_message_tool_context(message.channel, target)
 
-        # 首先解析提交类型
-        # 对应 Rust: let mut submission = message.structured_submission.clone().unwrap_or_else(|| SubmissionParser::parse(&message.content));
+        # ------Step2: 解析提交类型------
         submission = message.structured_submission or SubmissionParser.parse(message.content)
-        # 对应 Rust: tracing::trace!("[agent_loop] Parsed submission: {:?}", ...);
         logger.log(TRACE, "[agent_loop] 已解析提交: %s", type(submission).__name__)
 
         # 引擎 V2 早期降级：当没有待处理的审批门控或认证流程时，
         # 将裸关键词 ApprovalResponse 降级为 UserInput。
         # 在 BeforeInbound 钩子检查之前完成，以便降级后的消息经过完整的 UserInput 管道。
         # 仅适用于 engine_v2，因为遗留路径需要会话/线程状态（尚未解析）来确定 AwaitingApproval。
-        # 对应 Rust: if self.config.engine_v2 && matches!(&submission, Submission::ApprovalResponse { .. }) && !message.content.trim().starts_with('/') { ... }
         if (
                 self.config.engine_v2
                 and isinstance(submission, Submission.ApprovalResponse)
@@ -1023,11 +1021,10 @@ class Agent:
                     or await has_any_pending_gate(message.user_id, message.conversation_scope())
             )
             if not has_pending:
-                # 对应 Rust: submission = Submission::UserInput { content: message.content.clone() };
                 submission = Submission.UserInput(content=message.content)
 
         # 钩子：BeforeInbound — 允许钩子修改或拒绝用户输入
-        # 对应 Rust: if let Submission::UserInput { ref content } = submission { ... }
+        # ------Step3: 允许拦截恶意内容或修改用户消息------
         if isinstance(submission, Submission.UserInput):
             content = submission.content
             event = HookEvent.Inbound(
@@ -1057,7 +1054,8 @@ class Agent:
         # 引擎 V2 路由（策略 C：并行部署）。
         # 桥接处理程序返回 BridgeOutcome，直接映射到 HandleOutcome ——
         # 门控状态编码在返回类型中，而不是事后查询。
-        # 对应 Rust: if self.config.engine_v2 { match &submission { ... } }
+        # ------Step4: 处理消息------
+        # ------Step4-1: 重定向到handle_with_engine进行处理，而不是v1 agentic loop------
         if self.config.engine_v2:
             if isinstance(submission, Submission.UserInput):
                 outcome = await handle_with_engine(self, message, submission.content)
@@ -1138,7 +1136,6 @@ class Agent:
         # 解析会话和线程。审批提交允许通过 UUID 跨频道
         # 定位已加载的所属线程，以便 web 审批 UI 可以审批源自 HTTP/其他
         # 所有者范围频道的作业。
-        # 对应 Rust: let approval_thread_uuid = if matches!(submission, ...) { ... } else { None };
         approval_thread_uuid = None
         if isinstance(submission, (Submission.ExecApproval, Submission.ApprovalResponse,
                                    Submission.ExternalCallback, Submission.GateAuthResolution)):
@@ -1242,8 +1239,7 @@ class Agent:
                     if thread is not None:
                         thread.pending_auth = None
 
-        # 对应 Rust: tracing::trace!("Received message from {} on {} ({} chars)", ...);
-        logger.log(TRACE, "收到来自 %s 在 %s 的消息（%d 字符）", message.user_id, message.channel, len(message.content))
+        logger.log("收到来自 %s 在 %s 的消息（%d 字符）", message.user_id, message.channel, len(message.content))
 
         # 检查例程引擎事件触发器
         # 对应 Rust: if !message.is_internal && let Submission::UserInput { ref content } = submission && let Some(engine) = self.routine_engine().await { ... }
@@ -1274,7 +1270,6 @@ class Agent:
         session_for_empty_exit = session
 
         # 根据提交类型处理
-        # 对应 Rust: let result = match submission { ... };
         if isinstance(submission, Submission.UserInput):
             result = await self._handle_user_input_with_drain(
                 message, tenant, session, thread_id, submission.content,

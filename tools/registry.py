@@ -49,6 +49,7 @@ from tools.builtin import (
     WriteFileTool,
     shared_file_history,
     shared_read_file_state,
+    MessageTool,
     MessageTool
 )
 from tools.rate_limiter import RateLimiter
@@ -164,7 +165,6 @@ def is_protected_tool_name(name: str) -> bool:
 # 注册可用工具
 @dataclass
 class ToolRegistry:
-
     tools: Dict[str, Tool] = field(default_factory=dict)
 
     # 追踪哪些名称是通过内置启动路径注册的。
@@ -806,11 +806,9 @@ class ToolRegistry:
         设置消息工具的默认频道和目标。
         在每个代理回合之前调用，传入当前对话的上下文。
 
-        对应 Rust: pub async fn set_message_tool_context(&self, channel: Option<String>, target: Option<String>)
         """
-        async with self._message_tool_lock:
-            if self._message_tool is not None:
-                await self._message_tool.set_context(channel, target)
+        if self.message_tool:
+            await self.message_tool.set_context(channel, target)
 
     def register_image_tools(
             self,
