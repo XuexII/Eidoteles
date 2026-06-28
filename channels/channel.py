@@ -6,62 +6,278 @@ from typing import Any, Tuple, Optional, List, Dict, AsyncIterator
 from uuid import UUID, uuid4
 from abc import ABC, abstractmethod
 from enum import Enum
+import uuid
+from ironclaw_common import (
+    ExtensionName,
+    ExternalThreadId,
+    ExternalThreadIdError,
+    JobResultStatus
+)
+from ironclaw_common.attachment import IncomingAttachment
+from agent.submission import Submission
 
-from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 
-class IncomingMessage(BaseModel):
-    """从外部渠道收到的消息。"""
-    # 唯一消息 ID
-    id: str = Field(default_factory=uuid4)
-    # Channel this message came from.
+@dataclass
+class IncomingMessage:
+    """
+    传入消息。
+    """
+    # 频道名称。
     channel: str
-    # 此交互的存储/持久化范围
-    # 对于支持所有者的渠道，当配置的所有者发言时，此为稳定的实例所有者 ID；否则，它可以是访客/发送者范围内的标识符，以保持隔离性。
+    # 用户标识符。
     user_id: str
-    # 此 IronClaw 部署的稳定实例所有者范围
-    owner_id: str
-    # 特定渠道的发送者/参与者标识符
-    sender_id: str
-    # 可选的显示名称
-    user_name: Optional[str] = None
-    # Message content.
+    # 消息内容。
     content: str
-    # 用于线程对话的线程/会话 ID
-    thread_id: Optional[str] = None
-    # 此会话的稳定渠道/聊天/线程范围。
+    # 消息的唯一标识符。
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # 发送者标识符。
+    sender_id: str = ""
+    # 元数据，默认包含 user_id。
+    metadata: dict = field(default_factory=dict)
+    # 可选用户名称。
+    user_name: Optional[str] = None
+    # 可选的结构化提交负载。
+    structured_submission: Optional[Submission] = None
+    # 可选的线程 ID。
+    thread_id: Optional[ExternalThreadId] = None
+    # 可选的对话范围 ID。
     conversation_scope_id: Optional[str] = None
-    # When the message was received.
-    received_at: datetime = Field(default_factory=lambda: datetime.now())
-    # Channel-specific metadata.
-    metadata: Any = None
-    # 可选的 IANA 时区字符串（如 "America/New_York"）
+    # 接收时间。
+    received_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # 可选的客户端时区。
     timezone: Optional[str] = None
-    # 收到的消息中的文件或媒体文件
-    # attachments: List[IncomingAttachment] = Field(default_factory=list)
-    # 内部专用标志：消息由进程内部生成（如任务监控），必须绕过正常的用户输入管道。该字段无法通过元数据设置，因此外部渠道无法伪造。
-    is_internal: bool = Field(default=False, frozen=True)
+    # 附件列表。
+    attachments: List[IncomingAttachment] = field(default_factory=list)
+    # 是否为内部消息。
+    is_internal: bool = False
+    # 是否为代理广播回显。
+    is_agent_broadcast: bool = False
+    # 可选的任务触发 ID。
+    triggering_mission_id: Optional[str] = None
 
+    def __post_init__(self):
+        """
+        在 dataclass 初始化后确保 metadata 中包含正确的 user_id。
+
+        对应 Rust 中 new() 的默认 metadata 携带 {"user_id": &user_id} 的逻辑：
+        如果 metadata 中 user_id 为空或与 self.user_id 不一致，则同步。
+        """
+        if isinstance(self.metadata, dict):
+            # 字符串类型的 user_id 始终被 self.user_id 覆盖
+            existing = self.metadata.get("user_id")
+            if existing is None or isinstance(existing, str):
+                self.metadata["user_id"] = self.user_id
+
+
+    def with_agent_broadcast(self) -> "IncomingMessage":
+        """
+        将此消息标记为代理广播回显。将代理自身出站文本重新作为入站事件发出的
+        频道适配器必须调用此方法，以便任务的 OnEvent 触发跳过它。
+
+        对应 Rust:
+        pub fn with_agent_broadcast(mut self) -> Self
+        """
+        self.is_agent_broadcast = True
+        return self
+
+    def with_triggering_mission(self, mission_id: str) -> "IncomingMessage":
+        """
+        将此消息标记为由任务触发产生。用于跨不同任务的链式递归保护。
+
+        对应 Rust:
+        pub fn with_triggering_mission(mut self, mission_id: impl Into<String>) -> Self
+        """
+        self.triggering_mission_id = mission_id
+        return self
+
+    def with_thread(self, thread_id: str) -> "IncomingMessage":
+        """
+        设置线程 ID（可信路径 —— 无需验证）。
+
+        接受原始字符串 —— 该值通过 ExternalThreadId::from_trusted 包装。
+        这是一个**可信路径便利方法**：假设调用者从内部/类型化来源
+        （数据库行、内部频道适配器、上游频道已接受的平台标识符）获取了字符串。
+        conversation_scope_id 影子镜像原始字符串。
+
+        对于不受信任的输入（HTTP webhooks、中继回调、任何原始调用者提供的负载），
+        优先使用 try_with_thread，它通过 ExternalThreadId::new 验证，
+        并在空/含 NUL/过大字符串时返回错误。
+
+        对应 Rust:
+        pub fn with_thread(mut self, thread_id: impl Into<String>) -> Self
+        """
+        self.conversation_scope_id = thread_id
+        self.thread_id = ExternalThreadId.from_trusted(thread_id)
+        return self
+
+    def try_with_thread(self, thread_id: str) -> None:
+        """
+        从不受信任的输入设置线程 ID，验证原始字符串。
+
+        在系统边界使用此变体 —— HTTP webhooks、中继回调负载，
+        或任何字符串来自外部调用者的路径。对空、过大或含 NUL 的值
+        返回 ExternalThreadIdError；调用者通常记录并丢弃 thread_id
+        （或返回 400）。对于内部可信路径（类型化数据库行、已验证的
+        频道适配器状态），使用 with_thread。
+
+        接受 &mut self 以便调用者在验证失败时保留消息的所有权。
+
+        对应 Rust:
+        pub fn try_with_thread(&mut self, thread_id: impl AsRef<str>) -> Result<(), ExternalThreadIdError>
+        """
+        typed = ExternalThreadId.new(thread_id)  # 可能抛出 ExternalThreadIdError
+        self.conversation_scope_id = typed.as_str()
+        self.thread_id = typed
+
+    def with_external_thread(self, thread_id: Any) -> "IncomingMessage":
+        """
+        从已类型化的 ExternalThreadId 设置线程 ID。
+
+        对应 Rust:
+        pub fn with_external_thread(mut self, thread_id: ExternalThreadId) -> Self
+        """
+        self.conversation_scope_id = thread_id.as_str()
+        self.thread_id = thread_id
+        return self
+
+    def with_sender_id(self, sender_id: str) -> "IncomingMessage":
+        """
+        设置频道特定的发送者/参与者标识符。
+
+        对应 Rust:
+        pub fn with_sender_id(mut self, sender_id: impl Into<String>) -> Self
+        """
+        self.sender_id = sender_id
+        return self
+
+    def with_conversation_scope(self, scope_id: str) -> "IncomingMessage":
+        """
+        设置此消息的对话范围。
+
+        对应 Rust:
+        pub fn with_conversation_scope(mut self, scope_id: impl Into<String>) -> Self
+        """
+        self.conversation_scope_id = scope_id
+        return self
+
+    def with_metadata(self, metadata: dict) -> "IncomingMessage":
+        """
+        设置元数据。
+
+        字符串类型的 metadata.user_id 始终被 self.user_id 覆盖 ——
+        调用者提供的字符串值被丢弃。这使得 SSE/WS 接收者范围无法从频道元数据伪造：
+        WASM 扩展发出的包含 {"user_id":"victim"} 的 JSON 无法将后续的
+        ToolStarted/ToolResult 事件路由到另一个租户的流中。
+
+        非字符串的 user_id 值（例如 Telegram 的 i64 聊天用户 ID）保持不变：
+        它们无法被利用，因为 SSE 路由层（as_str()）将其视为缺失，
+        在多租户模式下故障关闭。覆盖它们会损坏频道私有的元数据。
+
+        非对象输入（Null、数组、标量）被替换为携带 self.user_id 的新对象。
+        缺失的 user_id 键被插入为 self.user_id。
+
+        对应 Rust:
+        pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self
+        """
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        # 检查是否需要设置 user_id
+        should_set = True
+        if "user_id" in metadata:
+            existing = metadata["user_id"]
+            if isinstance(existing, str):
+                should_set = True  # 覆盖字符串值
+            else:
+                should_set = False  # 保留非字符串值
+
+        if should_set:
+            metadata["user_id"] = self.user_id
+
+        self.metadata = metadata
+        return self
+
+    def with_user_name(self, name: str) -> "IncomingMessage":
+        """
+        设置用户名称。
+
+        对应 Rust:
+        pub fn with_user_name(mut self, name: impl Into<String>) -> Self
+        """
+        self.user_name = name
+        return self
+
+    def with_structured_submission(self, submission: Any) -> "IncomingMessage":
+        """
+        附加结构化提交侧带负载。
+
+        对应 Rust:
+        pub fn with_structured_submission(mut self, submission: Submission) -> Self
+        """
+        self.structured_submission = submission
+        return self
+
+    def with_timezone(self, tz: str) -> "IncomingMessage":
+        """
+        设置客户端时区。
+
+        对应 Rust:
+        pub fn with_timezone(mut self, tz: impl Into<String>) -> Self
+        """
+        self.timezone = tz
+        return self
+
+    def with_attachments(self, attachments: List[Any]) -> "IncomingMessage":
+        """
+        设置附件。
+
+        对应 Rust:
+        pub fn with_attachments(mut self, attachments: Vec<IncomingAttachment>) -> Self
+        """
+        self.attachments = attachments
+        return self
+
+    def into_internal(self) -> "IncomingMessage":
+        """
+        将此消息标记为内部消息（绕过用户输入管道）。
+
+        对应 Rust:
+        pub(crate) fn into_internal(mut self) -> Self
+        """
+        self.is_internal = True
+        return self
+
+
+    @property
     def conversation_scope(self) -> Optional[str]:
         """
-        有效的会话范围，对于旧版调用者则回退至 thread_id。
-        :return:
+        有效的对话范围，对遗留调用者回退到 thread_id。
         """
+        if self.conversation_scope_id is not None:
+            return self.conversation_scope_id
+        if self.thread_id is not None:
+            return self.thread_id.as_str()
+        return None
 
-        return self.conversation_scope_id or self.thread_id
-
+    @property
     def routing_target(self) -> Optional[str]:
         """
-        在当前频道上进行主动回复时的尽力路由目标。
-        :return:
-        """
-        target = routing_target_from_metadata(self.metadata)
-        if target:
-            return target
+        当前频道上主动回复的最佳路由目标。
 
-        return self.sender_id if self.sender_id else None
+        对应 Rust:
+        pub fn routing_target(&self) -> Option<String>
+        """
+        # 首先尝试从元数据中提取路由目标
+        target = routing_target_from_metadata(self.metadata)
+        if target is not None:
+            return target
+        # 否则回退到 sender_id
+        if self.sender_id:
+            return self.sender_id
+        return None
 
 
 def routing_target_from_metadata(metadata: Dict) -> Optional[str]:
@@ -87,25 +303,54 @@ def routing_target_from_metadata(metadata: Dict) -> Optional[str]:
 
     return None
 
+
 # 异步迭代器
 MessageStream = AsyncIterator[IncomingMessage]
 
+
 @dataclass
 class OutgoingResponse:
-    """
-    返回给channel的结果
-    """
     content: str
-    # 回复时使用的线程 ID。
-    thread_id: Optional[str]
-    # 附加文件路径
-    attachments: List[str] = field(default_factory=list)
-    # 响应的通道特定元数据。
-    metadata: Any = None
+    thread_id: ExternalThreadId | None = None
+    attachments: list[str] = field(default_factory=list)
+    inline_attachments: list[OutgoingAttachment] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+    # --- 工厂方法 ---
+    @classmethod
+    def text(cls, content: str) -> "OutgoingResponse":
+        """创建一个纯文本响应，其他字段用默认值"""
+        return cls(content=content)
+
+    # --- Builder 方法 (返回 Self 实现链式调用) ---
+    def in_thread(self, thread_id: str) -> "OutgoingResponse":
+        """设置线程 ID（信任的输入）"""
+        self.thread_id = ExternalThreadId.from_trusted(thread_id)
+        return self
+
+    def try_in_thread(self, thread_id: str) -> None:
+        """设置线程 ID（不信任的输入，会校验）"""
+        self.thread_id = ExternalThreadId.new(thread_id)  # 失败会抛异常
+        # 如果你想要 Result 风格，可以不返回 Self 而是 raise 异常
+
+    def in_external_thread(self, thread_id: ExternalThreadId) -> "OutgoingResponse":
+        """直接用已构造好的 ExternalThreadId"""
+        self.thread_id = thread_id
+        return self
+
+    def with_attachments(self, paths: list[str]) -> "OutgoingResponse":
+        self.attachments = paths
+        return self
+
+    def with_inline_attachments(self, attachments: list[OutgoingAttachment]) -> "OutgoingResponse":
+        self.inline_attachments = attachments
+        return self
+
 
 class StatusUpdate(Enum):
     # 智能体正在思考/处理信息。
     Thinking = "1"
+
 
 class Channel(ABC):
     """消息通道特质（trait）
