@@ -1310,16 +1310,16 @@ async def engine_capability_action_names() -> Optional[List[str]]:
         return names
 
 
-@dataclass
+@dataclass(kw_only=True)
 class EngineState:
     """跨消息持久化的引擎状态。"""
-    thread_manager: ThreadManager = None
-    conversation_manager: ConversationManager = None
-    effect_adapter: EffectBridgeAdapter = None
-    store: Store = None
-    default_project_id: ProjectId = None
+    thread_manager: ThreadManager
+    conversation_manager: ConversationManager
+    effect_adapter: EffectBridgeAdapter
+    store: Store
+    default_project_id: ProjectId
     # 统一待处理门控存储——按 (user_id, thread_id) 键控
-    pending_gates: PendingGateStore = None
+    pending_gates: PendingGateStore
     # 用于向 Web 网关广播 AppEvents 的 SSE 管理器
     sse: Optional[SseManager] = None
     # 用于写入对话消息的 V1 数据库（网关从此处读取）
@@ -1331,7 +1331,9 @@ class EngineState:
     # 当没有认证管理器时，用于扩展支持的认证/设置的扩展管理器
     extension_manager: Optional[ExtensionManager] = None
     # 项目本地附件持久化的文件系统根目录
-    project_root: Path = None
+    project_root: Path
+
+
     # 调用者提供的外部工具的每线程目录（Responses API）。
     # 通过 Arc 克隆与 effect adapter（在操作列表和分派期间读取）
     # 和 Responses API 处理程序（在将请求发送到代理循环之前写入）共享。
