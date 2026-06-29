@@ -20,33 +20,33 @@ from agent.submission import Submission
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class IncomingMessage:
     """
     传入消息。
     """
+    # 消息的唯一标识符。
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
     # 频道名称。
     channel: str
     # 用户标识符。
     user_id: str
-    # 消息内容。
-    content: str
-    # 消息的唯一标识符。
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
     # 发送者标识符。
     sender_id: str = ""
-    # 元数据，默认包含 user_id。
-    metadata: dict = field(default_factory=dict)
     # 可选用户名称。
     user_name: Optional[str] = None
+    # 消息内容。
+    content: str
     # 可选的结构化提交负载。
     structured_submission: Optional[Submission] = None
     # 可选的线程 ID。
     thread_id: Optional[ExternalThreadId] = None
-    # 可选的对话范围 ID。
+    # 此对话的稳定频道/聊天/线程范围。
     conversation_scope_id: Optional[str] = None
     # 接收时间。
     received_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # 元数据，默认包含 user_id。
+    metadata: dict = field(default_factory=dict)
     # 可选的客户端时区。
     timezone: Optional[str] = None
     # 附件列表。
@@ -57,6 +57,7 @@ class IncomingMessage:
     is_agent_broadcast: bool = False
     # 可选的任务触发 ID。
     triggering_mission_id: Optional[str] = None
+
 
     def __post_init__(self):
         """

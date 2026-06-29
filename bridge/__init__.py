@@ -11,3 +11,4 @@
 # Gate 模型	独立的批准和认证流程	统一的 gate 模型（暂停/恢复）
 # 持久化	SQL 数据库（sessions、messages）	工作区文件系统（.system/engine/）
 # 上下文管理	Token 窗口内的消息历史	RLM 模式：上下文作为 Python 变量
+from .router import handle_with_engine

@@ -1,3 +1,11 @@
+# IronClaw 的引导辅助模块。
+#
+# 在数据库可用之前，唯一确实需要磁盘持久化的设置是 `DATABASE_URL`
+# （先有鸡还是先有蛋：没有它就无法连接数据库）。
+# 其他所有设置均可自动检测或从环境变量读取。
+#
+# 文件：`~/.ironclaw/.env`（标准 dotenvy 格式）
+
 import os
 import logging
 from pathlib import Path

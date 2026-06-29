@@ -43,6 +43,7 @@ import signal
 from tenant import SystemScope
 import asyncio
 from ironclaw_common.attachment import AttachmentKind
+from bridge import handle_with_engine
 
 logger = logging.getLogger(__name__)
 
