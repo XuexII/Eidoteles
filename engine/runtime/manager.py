@@ -1,16 +1,30 @@
 # 线程管理器——线程生命周期的顶层编排器。
 
 from __future__ import annotations
+
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from engine.runtime.messaging import (
-SignalSender,
-ThreadOutcome,
-ThreadSignal
-)
+
+from ..capability.lease import LeaseManager
+from ..capability.planner import LeasePlanner
+from ..capability.policy import PolicyEngine
+from ..capability.registry import CapabilityRegistry
+from ..executor import ExecutionLoop
+from ..gate import GateController, CancellingGateController
+from ..memory import RetrievalEngine
+from ..runtime.lease_refresh import reconcile_dynamic_tool_lease
+from ..runtime.messaging import SignalSender, ThreadOutcome, ThreadSignal
+from ..runtime.tree import ThreadTree
+from ..traits.effect import EffectExecutor
+from ..traits.llm import LlmBackend
+from ..traits.store import Store
+from ..types.event import ThreadEvent, EventKind
+from ..types.message import MessageRole, ThreadMessage
+from ..types.project import ProjectId
+from ..types.thread import Thread, ThreadConfig, ThreadId, ThreadState, ThreadType
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +49,7 @@ class RunningThread:
     signal_tx: SignalSender
     handle: asyncio.Task
 
+
 class ThreadManager:
     """
     线程生命周期的顶层编排器。
@@ -43,13 +58,13 @@ class ThreadManager:
     """
 
     def __init__(
-        self,
-        llm: LlmBackend,
-        effects: EffectExecutor,
-        store: Store,
-        capabilities: CapabilityRegistry,
-        leases: LeaseManager,
-        policy: PolicyEngine,
+            self,
+            llm: LlmBackend,
+            effects: EffectExecutor,
+            store: Store,
+            capabilities: CapabilityRegistry,
+            leases: LeaseManager,
+            policy: PolicyEngine,
     ):
         self.llm = llm
         self.effects = effects
@@ -103,13 +118,13 @@ class ThreadManager:
         pass
 
     async def spawn_thread(
-        self,
-        goal: str,
-        thread_type: ThreadType,
-        project_id: ProjectId,
-        config: ThreadConfig,
-        parent_id: Optional[ThreadId],
-        user_id: str,
+            self,
+            goal: str,
+            thread_type: ThreadType,
+            project_id: ProjectId,
+            config: ThreadConfig,
+            parent_id: Optional[ThreadId],
+            user_id: str,
     ) -> ThreadId:
         """生成新线程并开始执行。"""
         return await self.spawn_thread_with_history(
@@ -125,14 +140,14 @@ class ThreadManager:
         )
 
     async def spawn_thread_with_title(
-        self,
-        goal: str,
-        title: Optional[str],
-        thread_type: ThreadType,
-        project_id: ProjectId,
-        config: ThreadConfig,
-        parent_id: Optional[ThreadId],
-        user_id: str,
+            self,
+            goal: str,
+            title: Optional[str],
+            thread_type: ThreadType,
+            project_id: ProjectId,
+            config: ThreadConfig,
+            parent_id: Optional[ThreadId],
+            user_id: str,
     ) -> ThreadId:
         """使用显式侧边栏标题生成新线程。"""
         return await self.spawn_thread_with_history(
@@ -148,16 +163,16 @@ class ThreadManager:
         )
 
     async def spawn_thread_with_history(
-        self,
-        goal: str,
-        title: Optional[str],
-        thread_type: ThreadType,
-        project_id: ProjectId,
-        config: ThreadConfig,
-        parent_id: Optional[ThreadId],
-        user_id: str,
-        initial_messages: List[ThreadMessage],
-        initial_metadata: Dict[str, Any],
+            self,
+            goal: str,
+            title: Optional[str],
+            thread_type: ThreadType,
+            project_id: ProjectId,
+            config: ThreadConfig,
+            parent_id: Optional[ThreadId],
+            user_id: str,
+            initial_messages: List[ThreadMessage],
+            initial_metadata: Dict[str, Any],
     ) -> ThreadId:
         """
         使用初始对话历史生成线程。
@@ -170,7 +185,7 @@ class ThreadManager:
         生成的任务拥有其自己的内存 `Thread` 副本，后期更新仅落在运行中任务
         永远不会重新读取的持久化副本上。
         """
-        thread = Thread.new(goal, thread_type, project_id, user_id, config)
+        thread = Thread(goal, thread_type, project_id, user_id, config)
         if parent_id is not None:
             thread = thread.with_parent(parent_id)
         # 在 save_thread + start_thread 之前设置标题，以便执行器的内存线程原子性地观察到它
@@ -212,12 +227,12 @@ class ThreadManager:
         return await self._start_thread(thread, user_id, False)
 
     async def resume_thread(
-        self,
-        thread_id: ThreadId,
-        user_id: str,
-        injected_message: Optional[ThreadMessage] = None,
-        approval_event: Optional[Tuple[str, bool]] = None,
-        resolved_call_id: Optional[str] = None,
+            self,
+            thread_id: ThreadId,
+            user_id: str,
+            injected_message: Optional[ThreadMessage] = None,
+            approval_event: Optional[Tuple[str, bool]] = None,
+            resolved_call_id: Optional[str] = None,
     ) -> None:
         """恢复持久化的等待或挂起线程。"""
         if await self.is_running(thread_id):
@@ -251,9 +266,9 @@ class ThreadManager:
 
         if resolved_call_id is not None:
             preserve_assistant_call = (
-                injected_message is not None
-                and injected_message.role == MessageRole.ActionResult
-                and injected_message.action_call_id == resolved_call_id
+                    injected_message is not None
+                    and injected_message.role == MessageRole.ActionResult
+                    and injected_message.action_call_id == resolved_call_id
             )
             thread.messages = [
                 existing for existing in thread.messages
@@ -277,10 +292,10 @@ class ThreadManager:
         await self._start_thread(thread, user_id, True)
 
     async def _start_thread(
-        self,
-        thread: Thread,
-        user_id: str,
-        is_resume: bool,
+            self,
+            thread: Thread,
+            user_id: str,
+            is_resume: bool,
     ) -> ThreadId:
         """启动线程执行的后台任务。"""
         thread_id = thread.id
@@ -408,10 +423,10 @@ class ThreadManager:
             raise EngineError.ThreadNotFound(thread_id)
 
     async def inject_message(
-        self,
-        thread_id: ThreadId,
-        user_id: str,
-        message: ThreadMessage,
+            self,
+            thread_id: ThreadId,
+            user_id: str,
+            message: ThreadMessage,
     ) -> None:
         """向运行中的线程注入用户消息。"""
         # 在允许注入之前验证所有权
@@ -433,10 +448,10 @@ class ThreadManager:
             raise EngineError.ThreadNotFound(thread_id)
 
     async def set_thread_metadata(
-        self,
-        thread_id: ThreadId,
-        key: str,
-        value: str,
+            self,
+            thread_id: ThreadId,
+            key: str,
+            value: str,
     ) -> None:
         """
         在持久化的线程记录上设置元数据键。
@@ -548,14 +563,14 @@ class ThreadManager:
                 continue
 
             if (
-                thread.state == ThreadState.Waiting
-                and PENDING_APPROVAL_METADATA_KEY in thread.metadata
+                    thread.state == ThreadState.Waiting
+                    and PENDING_APPROVAL_METADATA_KEY in thread.metadata
             ):
                 continue
 
             if (
-                RUNTIME_CHECKPOINT_METADATA_KEY in thread.metadata
-                and thread.state in (ThreadState.Running, ThreadState.Suspended)
+                    RUNTIME_CHECKPOINT_METADATA_KEY in thread.metadata
+                    and thread.state in (ThreadState.Running, ThreadState.Suspended)
             ):
                 if thread.state == ThreadState.Running:
                     thread.transition_to(
@@ -600,6 +615,6 @@ def _is_resolved_call_message(message: ThreadMessage, call_id: str) -> bool:
 def _is_resolved_action_result_message(message: ThreadMessage, call_id: str) -> bool:
     """检查消息是否为已解析的操作结果消息。"""
     return (
-        message.role == MessageRole.ActionResult
-        and message.action_call_id == call_id
+            message.role == MessageRole.ActionResult
+            and message.action_call_id == call_id
     )
