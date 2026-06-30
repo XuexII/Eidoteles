@@ -42,6 +42,7 @@ class IncomingMessage:
     # 可选的线程 ID。
     thread_id: Optional[ExternalThreadId] = None
     # 此对话的稳定频道/聊天/线程范围。
+    # 用于标识独立的conversation
     conversation_scope_id: Optional[str] = None
     # 接收时间。
     received_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import Enum
+
 from ironclaw_engine import (
     Capability, CapabilityRegistry, ConversationManager, EffectExecutor, LeaseManager,
     MissionManager, PolicyEngine, Project, Store, ThreadConfig, ThreadManager, ThreadOutcome,
@@ -1375,20 +1377,25 @@ class EngineState:
 ENGINE_STATE: Optional[EngineState] = None  # OnceLock<RwLock<Option<EngineState>>>
 
 
-class PendingGateResolutionNone:
-    pass
+class PendingGateResolutionKind(Enum):
+    # 没有需要处理的gate
+    NONE = "none"
+    # 有需要处理的gate
+    Resolved = "resolved"
+    # 有多个gate，不明确
+    Ambiguous = "ambiguous"
+
 
 
 @dataclass
-class PendingGateResolutionResolved:
-    gate: PendingGate
+class PendingGateResolution:
+    """
+    待处理gate的解析结果
+    """
+    result: PendingGateResolutionKind
+    # 需要处理的gata，每次仅处理一个
+    gate: Optional[PendingGate] = None
 
-
-class PendingGateResolutionAmbiguous:
-    pass
-
-
-PendingGateResolution = PendingGateResolutionNone | PendingGateResolutionResolved | PendingGateResolutionAmbiguous
 
 
 def parse_engine_thread_id(scope: Optional[str]) -> Optional[ThreadId]:
@@ -2044,6 +2051,10 @@ async def resolve_pending_gate_for_user(
     - 回退到匹配 thread_id 或 conversation_id 的 UUID
     - 如果有多个候选，选择最近创建的
     - 如果有多个候选但没有有效的提示 UUID，返回 Ambiguous
+
+    :parameter pending_gates: 待处理gate存储器
+    :parameter user_id: 用户id
+    :parameter thread_id_hint:
     """
     hinted_uuid = parse_scope_uuid(thread_id_hint)
     hinted_scope = thread_id_hint
@@ -2052,16 +2063,11 @@ async def resolve_pending_gate_for_user(
     for gate in await pending_gates.list_for_user(user_id):
         if hinted_scope is None:
             candidates.append(gate)
-        elif (
-                gate.scope_thread_id == hinted_scope
-                or (
-                        hinted_uuid is not None
-                        and (
-                                gate.thread_id == hinted_uuid
-                                or gate.conversation_id == hinted_uuid
-                        )
-                )
-        ):
+        # 优先匹配 scope_thread_id
+        elif gate.scope_thread_id == hinted_scope:
+            candidates.append(gate)
+        # 回退到匹配 thread_id 或 conversation_id
+        elif hinted_uuid and (gate.thread_id == hinted_uuid or gate.conversation_id == hinted_uuid):
             candidates.append(gate)
 
     if len(candidates) == 0:
@@ -2137,35 +2143,119 @@ async def has_any_pending_gate(
     resolution = await resolve_pending_gate_for_user(
         guard.pending_gates, user_id, thread_id
     )
-    return not isinstance(resolution, PendingGateResolution.
-    None)
+    return not isinstance(resolution, PendingGateResolution.NONE)
 
-    class AuthCallbackContinuation:
-        """认证回调的延续操作类型。"""
-        None_ = "none"
-        ResolveGateExternal = "resolve_gate_external"
-        ReplayMessage = "replay_message"
 
-    async def resolve_engine_auth_callback(
-            user_id: str,
-            credential_name: str,
-    ) -> AuthCallbackContinuation:
-        """
-    解析引擎认证回调。
+class AuthCallbackContinuation:
+    """认证回调的延续操作类型。"""
+    None_ = "none"
+    ResolveGateExternal = "resolve_gate_external"
+    ReplayMessage = "replay_message"
 
-    查找匹配 credential_name 的待处理认证门控：
-    - 如果操作是 "authentication_fallback" 且有原始消息，则重放消息
-    - 否则返回 ResolveGateExternal 以通过外部回调解析门控
+
+async def resolve_engine_auth_callback(
+        user_id: str,
+        credential_name: str,
+) -> AuthCallbackContinuation:
     """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return AuthCallbackContinuation.
-            None
-        guard = await lock.read()
-        if guard is None:
-            return AuthCallbackContinuation.
-            None
+解析引擎认证回调。
 
+查找匹配 credential_name 的待处理认证门控：
+- 如果操作是 "authentication_fallback" 且有原始消息，则重放消息
+- 否则返回 ResolveGateExternal 以通过外部回调解析门控
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return AuthCallbackContinuation.
+        None
+    guard = await lock.read()
+    if guard is None:
+        return AuthCallbackContinuation.
+        None
+
+    matching: List[PendingGate] = []
+    for gate in await guard.pending_gates.list_for_user(user_id):
+        if (
+                isinstance(gate.resume_kind, ResumeKind.Authentication)
+                and gate.resume_kind.credential_name == credential_name
+        ):
+            matching.append(gate)
+
+    matching.sort(key=lambda gate: gate.created_at)
+    if not matching:
+        return AuthCallbackContinuation.
+        None
+
+    pending = matching.pop()
+
+    if pending.action_name == "authentication_fallback":
+        if pending.original_message is not None:
+            content = pending.original_message
+            # 消费门控，以便重复的 OAuth 回调无法重放它
+            key = pending.key()
+            await guard.pending_gates.discard(key)
+            return AuthCallbackContinuation.ReplayMessage(
+                channel=pending.source_channel,
+                thread_scope=pending.scope_thread_id,
+                content=content,
+            )
+        logger.debug(
+            "OAuth 回调匹配了没有可重放请求的认证回退, user_id=%s, credential_name=%s, thread_id=%s",
+            user_id,
+            credential_name,
+            pending.thread_id,
+        )
+        return AuthCallbackContinuation.
+        None
+
+    return AuthCallbackContinuation.ResolveGateExternal(
+        channel=pending.source_channel,
+        thread_scope=pending.scope_thread_id,
+        request_id=pending.request_id,
+    )
+
+
+async def resolve_inline_gates_for_credential(
+        user_id: str,
+        credential_name: str,
+) -> int:
+    """
+唤醒所有在 `(user_id, credential_name)` 对上暂停的
+Tier 0/Tier 1 内联等待等待者。
+
+#3133 的第二部分，内联等待分支。Tier 1 (CodeAct) 和 Tier 0 (结构化)
+路径现在对 Authentication 门控保持其 VM/batch 暂停在
+`GateController.pause()` 上，与 Approval 相同。
+当 OAuth 收到凭证时，此辅助函数向 `user_id` 的每个暂停等待者
+投递 `GateResolution.Approved`，以便暂停的操作内联重试
+针对现在存在的密钥——无需线程重新进入，无需重放同一步骤中
+先前的副作用。同一凭证名称上其他用户的暂停等待者保持不变。
+
+返回唤醒的等待者数量（零是正常的——大多数凭证写入不会解除任何内联 VM）。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return 0
+    guard = await lock.read()
+    if guard is None:
+        return 0
+
+    woken = await guard.gate_resolutions.deliver_for_credential(
+        user_id, credential_name
+    )
+    if woken > 0:
+        logger.debug(
+            "在凭证写入时向暂停的内联等待等待者投递了 Approved, user=%s, credential=%s, woken=%d",
+            user_id,
+            credential_name,
+            woken,
+        )
+        # #3533：同时从存储中删除匹配的 Authentication 待处理门控行。
+        # 内联等待重试将在凭证现在存在的情况下运行，并成功或引发自己的后续门控；
+        # 原始的 Authentication 行不再代表活动状态，否则会一直保留到过期
+        # （并在没有后续门控的用户中出现在 `HistoryResponse.pending_gate` 中）。
+        # 没有此删除，外部回调路径 (`resolve_engine_auth_callback`) 是唯一清理的途径——
+        # 跳过该路径以避免"线程已在运行"竞争会使该行成为孤立行。
         matching: List[PendingGate] = []
         for gate in await guard.pending_gates.list_for_user(user_id):
             if (
@@ -2174,56 +2264,20 @@ async def has_any_pending_gate(
             ):
                 matching.append(gate)
 
-        matching.sort(key=lambda gate: gate.created_at)
-        if not matching:
-            return AuthCallbackContinuation.
-            None
+        for gate in matching:
+            await guard.pending_gates.discard(gate.key())
 
-        pending = matching.pop()
+    return woken
 
-        if pending.action_name == "authentication_fallback":
-            if pending.original_message is not None:
-                content = pending.original_message
-                # 消费门控，以便重复的 OAuth 回调无法重放它
-                key = pending.key()
-                await guard.pending_gates.discard(key)
-                return AuthCallbackContinuation.ReplayMessage(
-                    channel=pending.source_channel,
-                    thread_scope=pending.scope_thread_id,
-                    content=content,
-                )
-            logger.debug(
-                "OAuth 回调匹配了没有可重放请求的认证回退, user_id=%s, credential_name=%s, thread_id=%s",
-                user_id,
-                credential_name,
-                pending.thread_id,
-            )
-            return AuthCallbackContinuation.
-            None
-
-        return AuthCallbackContinuation.ResolveGateExternal(
-            channel=pending.source_channel,
-            thread_scope=pending.scope_thread_id,
-            request_id=pending.request_id,
-        )
-
-    async def resolve_inline_gates_for_credential(
+    async def resume_paused_missions_for_credential(
             user_id: str,
             credential_name: str,
     ) -> int:
         """
-    唤醒所有在 `(user_id, credential_name)` 对上暂停的
-    Tier 0/Tier 1 内联等待等待者。
+    在凭证写入后自动恢复暂停的任务。
 
-    #3133 的第二部分，内联等待分支。Tier 1 (CodeAct) 和 Tier 0 (结构化)
-    路径现在对 Authentication 门控保持其 VM/batch 暂停在
-    `GateController.pause()` 上，与 Approval 相同。
-    当 OAuth 收到凭证时，此辅助函数向 `user_id` 的每个暂停等待者
-    投递 `GateResolution.Approved`，以便暂停的操作内联重试
-    针对现在存在的密钥——无需线程重新进入，无需重放同一步骤中
-    先前的副作用。同一凭证名称上其他用户的暂停等待者保持不变。
-
-    返回唤醒的等待者数量（零是正常的——大多数凭证写入不会解除任何内联 VM）。
+    查找匹配 credential_name 的凭证，并恢复所有因此暂停的任务。
+    返回恢复的任务数量。
     """
         lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
         if lock is None:
@@ -2232,563 +2286,632 @@ async def has_any_pending_gate(
         if guard is None:
             return 0
 
-        woken = await guard.gate_resolutions.deliver_for_credential(
-            user_id, credential_name
-        )
-        if woken > 0:
+        mission_manager = await guard.effect_adapter.mission_manager()
+        if mission_manager is None:
+            return 0
+
+        cred = CredentialName.new(credential_name)
+        if cred is None:
             logger.debug(
-                "在凭证写入时向暂停的内联等待等待者投递了 Approved, user=%s, credential=%s, woken=%d",
+                "跳过任务自动恢复——凭证名称验证失败, credential_name=%s",
+                credential_name,
+            )
+            return 0
+
+        try:
+            ids = await mission_manager.resume_paused_for_credential(cred, user_id)
+            if ids:
+                logger.debug(
+                    "凭证写入后自动恢复了暂停的任务, user_id=%s, credential=%s, resumed=%d",
+                    user_id,
+                    credential_name,
+                    len(ids),
+                )
+            return len(ids)
+        except Exception as e:
+            logger.warning(
+                "凭证写入后自动恢复暂停的任务失败, user_id=%s, credential=%s, error=%s",
                 user_id,
                 credential_name,
-                woken,
+                e,
             )
-            # #3533：同时从存储中删除匹配的 Authentication 待处理门控行。
-            # 内联等待重试将在凭证现在存在的情况下运行，并成功或引发自己的后续门控；
-            # 原始的 Authentication 行不再代表活动状态，否则会一直保留到过期
-            # （并在没有后续门控的用户中出现在 `HistoryResponse.pending_gate` 中）。
-            # 没有此删除，外部回调路径 (`resolve_engine_auth_callback`) 是唯一清理的途径——
-            # 跳过该路径以避免"线程已在运行"竞争会使该行成为孤立行。
-            matching: List[PendingGate] = []
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if (
-                        isinstance(gate.resume_kind, ResumeKind.Authentication)
-                        and gate.resume_kind.credential_name == credential_name
-                ):
-                    matching.append(gate)
+            return 0
 
-            for gate in matching:
-                await guard.pending_gates.discard(gate.key())
-
-        return woken
-
-        async def resume_paused_missions_for_credential(
-                user_id: str,
-                credential_name: str,
-        ) -> int:
-            """
-        在凭证写入后自动恢复暂停的任务。
-
-        查找匹配 credential_name 的凭证，并恢复所有因此暂停的任务。
-        返回恢复的任务数量。
+    async def resume_paused_missions_for_gate_request(
+            user_id: str,
+            gate_request_id: uuid.UUID,
+            outcome: GateResolutionOutcome,
+    ) -> Optional[MissionId]:
         """
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return 0
-            guard = await lock.read()
-            if guard is None:
-                return 0
+    根据用户驱动的门控解析结果，自动恢复其 `paused_gate.gate_request_id`
+    匹配 `gate_request_id` 的暂停任务。
 
-            mission_manager = await guard.effect_adapter.mission_manager()
-            if mission_manager is None:
-                return 0
+    #3133 的批准/外部路径的第二部分。在前台门控解析后从
+    `/api/chat/gate/resolve` 调用。对于 `Approved`，任务转换为 `Paused → Active`，
+    并（对于非手动频率）立即触发。对于 `Denied`/`Cancelled`，任务标记为 `Failed`，
+    以便用户修复底层问题并手动恢复。
 
-            cred = CredentialName.new(credential_name)
-            if cred is None:
-                logger.debug(
-                    "跳过任务自动恢复——凭证名称验证失败, credential_name=%s",
-                    credential_name,
-                )
-                return 0
-
-            try:
-                ids = await mission_manager.resume_paused_for_credential(cred, user_id)
-                if ids:
-                    logger.debug(
-                        "凭证写入后自动恢复了暂停的任务, user_id=%s, credential=%s, resumed=%d",
-                        user_id,
-                        credential_name,
-                        len(ids),
-                    )
-                return len(ids)
-            except Exception as e:
-                logger.warning(
-                    "凭证写入后自动恢复暂停的任务失败, user_id=%s, credential=%s, error=%s",
-                    user_id,
-                    credential_name,
-                    e,
-                )
-                return 0
-
-        async def resume_paused_missions_for_gate_request(
-                user_id: str,
-                gate_request_id: uuid.UUID,
-                outcome: GateResolutionOutcome,
-        ) -> Optional[MissionId]:
-            """
-        根据用户驱动的门控解析结果，自动恢复其 `paused_gate.gate_request_id`
-        匹配 `gate_request_id` 的暂停任务。
-
-        #3133 的批准/外部路径的第二部分。在前台门控解析后从
-        `/api/chat/gate/resolve` 调用。对于 `Approved`，任务转换为 `Paused → Active`，
-        并（对于非手动频率）立即触发。对于 `Denied`/`Cancelled`，任务标记为 `Failed`，
-        以便用户修复底层问题并手动恢复。
-
-        返回恢复/失败的任务 id，如果没有暂停任务等待此门控则返回 `None`
-        （仅前台门控被解析）。
-        """
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return None
-            guard = await lock.read()
-            if guard is None:
-                return None
-
-            mission_manager = await guard.effect_adapter.mission_manager()
-            if mission_manager is None:
-                return None
-
-            try:
-                result = await mission_manager.resume_paused_for_request_id(
-                    gate_request_id, outcome, user_id
-                )
-                if result is not None:
-                    logger.debug(
-                        "门控解析后任务自动恢复, user_id=%s, gate_request_id=%s, mission_id=%s, outcome=%s",
-                        user_id,
-                        gate_request_id,
-                        result,
-                        outcome,
-                    )
-                return result
-            except Exception as e:
-                logger.warning(
-                    "门控解析后自动恢复暂停的任务失败, user_id=%s, gate_request_id=%s, error=%s",
-                    user_id,
-                    gate_request_id,
-                    e,
-                )
-                return None
-
-        async def handle_approval(
-                agent: Agent,
-                message: IncomingMessage,
-                approved: bool,
-                always: bool,
-        ) -> BridgeOutcome:
-            """
-        处理引擎 v2 的批准响应（yes/no/always）。
-
-        当用户响应批准请求时从 `handle_message` 调用。
-        """
-            await init_engine(agent)
-
-            lock = ENGINE_STATE.get()
-            if lock is None:
-                raise engine_err("init", "引擎状态未初始化")
-            guard = await lock.read()
-            if guard is None:
-                raise engine_err("init", "引擎状态为空")
-
-            # 在可用时将显式批准回复范围限定到活动的网关对话，
-            # 以便 `/approve` 无法恢复属于另一个线程（例如后台例行任务）的
-            # 不相关待处理门控。其他通道仍然使用不与引擎对话范围 1:1 映射的遗留线程 ID。
-            thread_scope = (
-                message.conversation_scope() if message.channel == "gateway" else None
-            )
-            resolution = await resolve_pending_gate_for_user(
-                guard.pending_gates, message.user_id, thread_scope
-            )
-
-            if isinstance(resolution, PendingGateResolution.None):
-                logger.debug(
-                    "engine v2: 用户没有待处理的批准，忽略, user_id=%s",
-                    message.user_id,
-                )
-                return BridgeOutcome.Respond("此线程没有待处理的批准。")
-
-            if isinstance(resolution, PendingGateResolution.Ambiguous):
-                return BridgeOutcome.Respond(
-                    "多个待处理的门控正在等待。请从原始线程解析，或在选择该线程后重试。"
-                )
-
-            pending = resolution.gate
-
-            if not isinstance(pending.resume_kind, ResumeKind.Approval):
-                return BridgeOutcome.Respond(
-                    "选定的待处理门控不是批准请求。"
-                )
-
-            request_id = pending.request_id
-            thread_id = pending.thread_id
-            guard.release()
-
-            return await resolve_gate(
-                agent,
-                message,
-                thread_id,
-                request_id,
-                GateResolution.Approved(always=always) if approved else GateResolution.Denied(reason=None),
-            )
-
-        async def handle_exec_approval(
-                agent: Agent,
-                message: IncomingMessage,
-                request_id: uuid.UUID,
-                approved: bool,
-                always: bool,
-        ) -> BridgeOutcome:
-            """
-        处理 `ExecApproval` 提交（带有显式 request_id 的 Web 网关 JSON 批准）。
-        """
-            await init_engine(agent)
-
-            resolution = (
-                GateResolution.Approved(always=always)
-                if approved
-                else GateResolution.Denied(reason=None)
-            )
-
-            # 首先尝试对话范围提示快捷路径
-            thread_id = await hinted_pending_gate_thread_id(
-                message.user_id,
-                message.conversation_scope(),
-                request_id,
-                gate_view_is_approval,
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, resolution)
-
-            # 回退到全量扫描
-            thread_id = await pending_gate_thread_id_for_request(
-                message.user_id, request_id, gate_is_approval
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, resolution)
-
-            logger.debug(
-                "engine v2: 未找到匹配 request_id 的待处理批准, user_id=%s, request_id=%s",
-                message.user_id,
-                request_id,
-            )
-            return BridgeOutcome.Respond("未找到匹配的待处理批准。")
-
-        async def handle_external_callback(
-                agent: Agent,
-                message: IncomingMessage,
-                request_id: uuid.UUID,
-                payload: Optional[Dict[str, Any]],
-        ) -> BridgeOutcome:
-            """
-        处理外部回调（OAuth/配对回调或 Responses API 调用者执行的工具结果）。
-        """
-            await init_engine(agent)
-
-            resolution = GateResolution.ExternalCallback(
-                payload=payload if payload is not None else None
-            )
-
-            # 认证风格的回调（遗留 OAuth/配对）：首先查询认证谓词，
-            # 包括对话范围提示快捷路径。
-            thread_id = await hinted_pending_gate_thread_id(
-                message.user_id,
-                message.conversation_scope(),
-                request_id,
-                gate_view_is_authentication,
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, resolution)
-
-            thread_id = await pending_gate_thread_id_for_request(
-                message.user_id, request_id, gate_is_authentication
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, resolution)
-
-            # 非认证外部回调（例如 Responses API 调用者执行的工具结果）：
-            # 门控的 resume_kind 是 `External`，但它不是认证门控，
-            # 因此上面的认证谓词不匹配它。
-            thread_id = await pending_gate_thread_id_for_request(
-                message.user_id, request_id, gate_resume_is_external
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, resolution)
-
-            logger.debug(
-                "engine v2: 未找到匹配外部回调的待处理门控, user_id=%s, request_id=%s",
-                message.user_id,
-                request_id,
-            )
-            return BridgeOutcome.Respond("未找到匹配的待处理门控。")
-
-        async def handle_auth_gate_resolution(
-                agent: Agent,
-                message: IncomingMessage,
-                request_id: uuid.UUID,
-                resolution: AuthGateResolution,
-        ) -> BridgeOutcome:
-            """
-        处理认证门控解析（凭证提供或取消）。
-        """
-            await init_engine(agent)
-
-            if isinstance(resolution, AuthGateResolution.CredentialProvided):
-                gate_resolution = GateResolution.CredentialProvided(token=resolution.token)
-            else:
-                gate_resolution = GateResolution.Cancelled
-
-            # 首先尝试对话范围提示快捷路径
-            thread_id = await hinted_pending_gate_thread_id(
-                message.user_id,
-                message.conversation_scope(),
-                request_id,
-                gate_view_is_authentication,
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, gate_resolution)
-
-            # 回退到全量扫描
-            thread_id = await pending_gate_thread_id_for_request(
-                message.user_id, request_id, gate_is_authentication
-            )
-            if thread_id is not None:
-                return await resolve_gate(agent, message, thread_id, request_id, gate_resolution)
-
-            logger.debug(
-                "engine v2: 未找到匹配 request_id 的待处理认证门控, user_id=%s, request_id=%s",
-                message.user_id,
-                request_id,
-            )
-            return BridgeOutcome.Respond("未找到匹配的待处理认证门控。")
-
-        def gate_is_approval(gate: PendingGate) -> bool:
-            """检查门控是否为批准类型。"""
-            return isinstance(gate.resume_kind, ResumeKind.Approval)
-
-        def gate_is_authentication(gate: PendingGate) -> bool:
-            """检查门控是否为认证类型。"""
-            return isinstance(gate.resume_kind, ResumeKind.Authentication)
-
-        def gate_resume_is_external(gate: PendingGate) -> bool:
-            """
-        匹配任何 resume kind 为 `External` 的门控。
-        用作 `handle_external_callback` 中的回退，以恢复非认证工具调用暂停
-        （例如 Responses API 调用者执行的工具结果路径），
-        这些暂停从不经过认证谓词。
-        """
-            return isinstance(gate.resume_kind, ResumeKind.External)
-
-        def gate_view_is_approval(gate: PendingGateView) -> bool:
-            """检查门控视图是否为批准类型。"""
-            return isinstance(gate.resume_kind, ResumeKind.Approval)
-
-        def gate_view_is_authentication(gate: PendingGateView) -> bool:
-            """检查门控视图是否为认证类型。"""
-            return isinstance(gate.resume_kind, ResumeKind.Authentication)
-
-        async def hinted_pending_gate_thread_id(
-                user_id: str,
-                conversation_scope: Optional[str],
-                request_id: uuid.UUID,
-                predicate: Callable[[PendingGateView], bool],
-        ) -> Optional[ThreadId]:
-            """
-        通过对话范围提示查找待处理门控的线程 ID。
-
-        如果对话范围可以解析为线程 ID，则直接在该线程中查找匹配的门控。
-        这是 O(1) 的快捷路径，避免了全量扫描。
-        """
-            thread_id = parse_engine_thread_id(conversation_scope)
-            if thread_id is None:
-                return None
-
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                raise engine_err("init", "引擎状态未初始化")
-            guard = await lock.read()
-            if guard is None:
-                raise engine_err("init", "引擎状态为空")
-
-            gate = await guard.pending_gates.peek(
-                PendingGateKey(user_id=user_id, thread_id=thread_id)
-            )
-            guard.release()
-
-            if gate is not None and str(gate.request_id) == str(request_id) and predicate(gate):
-                return thread_id
+    返回恢复/失败的任务 id，如果没有暂停任务等待此门控则返回 `None`
+    （仅前台门控被解析）。
+    """
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return None
+        guard = await lock.read()
+        if guard is None:
             return None
 
-        async def pending_gate_thread_id_for_request(
-                user_id: str,
-                request_id: uuid.UUID,
-                predicate: Callable[[PendingGate], bool],
-        ) -> Optional[ThreadId]:
-            """
-        按 request_id 和谓词查找待处理门控的线程 ID。
+        mission_manager = await guard.effect_adapter.mission_manager()
+        if mission_manager is None:
+            return None
 
-        遍历用户的所有待处理门控，找到第一个匹配 request_id 和谓词的门控。
+        try:
+            result = await mission_manager.resume_paused_for_request_id(
+                gate_request_id, outcome, user_id
+            )
+            if result is not None:
+                logger.debug(
+                    "门控解析后任务自动恢复, user_id=%s, gate_request_id=%s, mission_id=%s, outcome=%s",
+                    user_id,
+                    gate_request_id,
+                    result,
+                    outcome,
+                )
+            return result
+        except Exception as e:
+            logger.warning(
+                "门控解析后自动恢复暂停的任务失败, user_id=%s, gate_request_id=%s, error=%s",
+                user_id,
+                gate_request_id,
+                e,
+            )
+            return None
+
+    async def handle_approval(
+            agent: Agent,
+            message: IncomingMessage,
+            approved: bool,
+            always: bool,
+    ) -> BridgeOutcome:
         """
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                raise engine_err("init", "引擎状态未初始化")
-            guard = await lock.read()
-            if guard is None:
-                raise engine_err("init", "引擎状态为空")
+    处理引擎 v2 的批准响应（yes/no/always）。
 
-            pending = None
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if gate.request_id == request_id and predicate(gate):
-                    pending = gate
-                    break
-            guard.release()
+    当用户响应批准请求时从 `handle_message` 调用。
+    """
+        await init_engine(agent)
 
-            return pending.thread_id if pending is not None else None
+        lock = ENGINE_STATE.get()
+        if lock is None:
+            raise engine_err("init", "引擎状态未初始化")
+        guard = await lock.read()
+        if guard is None:
+            raise engine_err("init", "引擎状态为空")
 
-        class InlineGateOutcome(Enum):
-            """
-        快速路径内联门控解析尝试的结果。
+        # 在可用时将显式批准回复范围限定到活动的网关对话，
+        # 以便 `/approve` 无法恢复属于另一个线程（例如后台例行任务）的
+        # 不相关待处理门控。其他通道仍然使用不与引擎对话范围 1:1 映射的遗留线程 ID。
+        thread_scope = (
+            message.conversation_scope() if message.channel == "gateway" else None
+        )
+        resolution = await resolve_pending_gate_for_user(
+            guard.pending_gates, message.user_id, thread_scope
+        )
 
-        参见 [`try_resolve_inline_approval_gate`]。
+        if isinstance(resolution, PendingGateResolution.None):
+            logger.debug(
+                "engine v2: 用户没有待处理的批准，忽略, user_id=%s",
+                message.user_id,
+            )
+            return BridgeOutcome.Respond("此线程没有待处理的批准。")
+
+        if isinstance(resolution, PendingGateResolution.Ambiguous):
+            return BridgeOutcome.Respond(
+                "多个待处理的门控正在等待。请从原始线程解析，或在选择该线程后重试。"
+            )
+
+        pending = resolution.gate
+
+        if not isinstance(pending.resume_kind, ResumeKind.Approval):
+            return BridgeOutcome.Respond(
+                "选定的待处理门控不是批准请求。"
+            )
+
+        request_id = pending.request_id
+        thread_id = pending.thread_id
+        guard.release()
+
+        return await resolve_gate(
+            agent,
+            message,
+            thread_id,
+            request_id,
+            GateResolution.Approved(always=always) if approved else GateResolution.Denied(reason=None),
+        )
+
+    async def handle_exec_approval(
+            agent: Agent,
+            message: IncomingMessage,
+            request_id: uuid.UUID,
+            approved: bool,
+            always: bool,
+    ) -> BridgeOutcome:
         """
-            # 解析被直接投递到暂停的引擎 VM。待处理门控已被消费；
-            # SSE `GateResolved` 已广播。
-            Delivered = "delivered"
-            # 没有活动 VM 等待此门控（引擎未初始化、没有匹配的暂停未来、
-            # 或非 Approval 恢复类型）。待处理门控被保留在原位——
-            # 调用者应回退到遗留 mpsc 分派路径，以便代理循环的 `resolve_gate`
-            # 可以正常恢复线程。
-            NoLiveVm = "no_live_vm"
+    处理 `ExecApproval` 提交（带有显式 request_id 的 Web 网关 JSON 批准）。
+    """
+        await init_engine(agent)
 
-        class InlineGateError(Exception):
-            """
-        [`try_resolve_inline_approval_gate`] 的验证失败，必须作为 4xx HTTP 响应显示，
-        而不是回退到遗留恢复路径。变体映射到 HTTP 边界的特定状态码
-        （参见 `chat_approval_handler`）：
+        resolution = (
+            GateResolution.Approved(always=always)
+            if approved
+            else GateResolution.Denied(reason=None)
+        )
 
-        - [`InlineGateError.ChannelMismatch`] → 403 Forbidden
-        - [`InlineGateError.Stale`] → 409 Conflict（request_id 已解析或与最新的待处理行不匹配）
-        - [`InlineGateError.Expired`] → 409 Conflict（待处理门控的 `expires_at` 已过）
-        - [`InlineGateError.Unauthorized`] → 403 Forbidden
-        - [`InlineGateError.Other`] → 500 Internal Server Error
+        # 首先尝试对话范围提示快捷路径
+        thread_id = await hinted_pending_gate_thread_id(
+            message.user_id,
+            message.conversation_scope(),
+            request_id,
+            gate_view_is_approval,
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, resolution)
 
-        在 API 边界进行类型化（而不是依赖 `error.to_string().contains("authorization")`），
-        以便未来对错误格式字符串的更改不会静默地将 403 翻转为 500。
+        # 回退到全量扫描
+        thread_id = await pending_gate_thread_id_for_request(
+            message.user_id, request_id, gate_is_approval
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, resolution)
+
+        logger.debug(
+            "engine v2: 未找到匹配 request_id 的待处理批准, user_id=%s, request_id=%s",
+            message.user_id,
+            request_id,
+        )
+        return BridgeOutcome.Respond("未找到匹配的待处理批准。")
+
+    async def handle_external_callback(
+            agent: Agent,
+            message: IncomingMessage,
+            request_id: uuid.UUID,
+            payload: Optional[Dict[str, Any]],
+    ) -> BridgeOutcome:
         """
+    处理外部回调（OAuth/配对回调或 Responses API 调用者执行的工具结果）。
+    """
+        await init_engine(agent)
 
-            def __init__(
-                    self,
-                    kind: str,
-                    message: str,
-                    expected: Optional[str] = None,
-                    actual: Optional[str] = None,
-            ):
-                self.kind = kind
-                self.expected = expected
-                self.actual = actual
-                super().__init__(message)
+        resolution = GateResolution.ExternalCallback(
+            payload=payload if payload is not None else None
+        )
 
-            @classmethod
-            def channel_mismatch(cls, expected: str, actual: str) -> "InlineGateError":
-                """解析通道与发起门控的通道不匹配（且不在可信通道允许列表中）。"""
-                return cls(
-                    kind="channel_mismatch",
-                    message=f"通道 '{actual}' 无法解析来自通道 '{expected}' 的门控",
-                    expected=expected,
-                    actual=actual,
-                )
+        # 认证风格的回调（遗留 OAuth/配对）：首先查询认证谓词，
+        # 包括对话范围提示快捷路径。
+        thread_id = await hinted_pending_gate_thread_id(
+            message.user_id,
+            message.conversation_scope(),
+            request_id,
+            gate_view_is_authentication,
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, resolution)
 
-            @classmethod
-            def stale(cls) -> "InlineGateError":
-                """request_id 与活动的待处理门控不匹配（已解析、已丢弃或被新门控行替换）。"""
-                return cls(
-                    kind="stale",
-                    message="批准请求已过时或已被解析",
-                )
+        thread_id = await pending_gate_thread_id_for_request(
+            message.user_id, request_id, gate_is_authentication
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, resolution)
 
-            @classmethod
-            def expired(cls) -> "InlineGateError":
-                """待处理门控的 `expires_at` 已过。"""
-                return cls(
-                    kind="expired",
-                    message="批准请求已过期",
-                )
+        # 非认证外部回调（例如 Responses API 调用者执行的工具结果）：
+        # 门控的 resume_kind 是 `External`，但它不是认证门控，
+        # 因此上面的认证谓词不匹配它。
+        thread_id = await pending_gate_thread_id_for_request(
+            message.user_id, request_id, gate_resume_is_external
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, resolution)
 
-            @classmethod
-            def unauthorized(cls) -> "InlineGateError":
-                """
-            待处理门控存在但不属于请求用户。
-            显示为 403 以避免跨租户泄漏门控存在性。
-            """
-                return cls(
-                    kind="unauthorized",
-                    message="无权解析此门控",
-                )
+        logger.debug(
+            "engine v2: 未找到匹配外部回调的待处理门控, user_id=%s, request_id=%s",
+            message.user_id,
+            request_id,
+        )
+        return BridgeOutcome.Respond("未找到匹配的待处理门控。")
 
-            @classmethod
-            def other(cls, message: str) -> "InlineGateError":
-                """任何其他门控存储故障。"""
-                return cls(
-                    kind="other",
-                    message=f"门控错误: {message}",
-                )
-
-        async def try_resolve_inline_approval_gate(
-                user_id: str,
-                channel: str,
-                request_id: uuid.UUID,
-                resolution: GateResolution,
-                settings_store: Optional[SettingsStore],
-        ) -> InlineGateOutcome:
-            """
-        尝试通过内联等待快速路径解析批准门控。
-
-        只有 Approval 形状的解析才有资格进行内联等待。
-        `BridgeGateController::pause` 对 Authentication 和 External 恢复类型
-        立即返回 Cancelled 而不暂停，因此没有可投递的目标，
-        我们只需要遗留恢复路径。
+    async def handle_auth_gate_resolution(
+            agent: Agent,
+            message: IncomingMessage,
+            request_id: uuid.UUID,
+            resolution: AuthGateResolution,
+    ) -> BridgeOutcome:
         """
-            # 只有 Approval 形状的解析才有资格进行内联等待
-            if not isinstance(resolution, (GateResolution.Approved, GateResolution.Denied)) and not isinstance(
-                    resolution,
-                    GateResolution.Cancelled):
-                return InlineGateOutcome.NoLiveVm
+    处理认证门控解析（凭证提供或取消）。
+    """
+        await init_engine(agent)
 
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return InlineGateOutcome.NoLiveVm
-            guard = await lock.read()
-            if guard is None:
-                return InlineGateOutcome.NoLiveVm
+        if isinstance(resolution, AuthGateResolution.CredentialProvided):
+            gate_resolution = GateResolution.CredentialProvided(token=resolution.token)
+        else:
+            gate_resolution = GateResolution.Cancelled
 
-            # 按 `request_id`（系统范围内唯一）解析门控，而不是按调用者提供的线程标识符。
-            # HTTP 表面上的线 `req.thread_id` 是通道可见的值——对于 Web 网关，
-            # 是由 `/api/chat/thread/new` 返回的每对话 UUID，在门控上记录为
-            # `scope_thread_id`——而不是键控 `PendingGateStore` 的内部引擎 `ThreadId`。
-            # 在存储的单个互斥锁下按 `request_id` 查找保持查找 + 删除原子性，
-            # 并避免线 vs. 引擎标识符混淆，否则会错过每个通道范围与其引擎线程不同的门控。
+        # 首先尝试对话范围提示快捷路径
+        thread_id = await hinted_pending_gate_thread_id(
+            message.user_id,
+            message.conversation_scope(),
+            request_id,
+            gate_view_is_authentication,
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, gate_resolution)
+
+        # 回退到全量扫描
+        thread_id = await pending_gate_thread_id_for_request(
+            message.user_id, request_id, gate_is_authentication
+        )
+        if thread_id is not None:
+            return await resolve_gate(agent, message, thread_id, request_id, gate_resolution)
+
+        logger.debug(
+            "engine v2: 未找到匹配 request_id 的待处理认证门控, user_id=%s, request_id=%s",
+            message.user_id,
+            request_id,
+        )
+        return BridgeOutcome.Respond("未找到匹配的待处理认证门控。")
+
+    def gate_is_approval(gate: PendingGate) -> bool:
+        """检查门控是否为批准类型。"""
+        return isinstance(gate.resume_kind, ResumeKind.Approval)
+
+    def gate_is_authentication(gate: PendingGate) -> bool:
+        """检查门控是否为认证类型。"""
+        return isinstance(gate.resume_kind, ResumeKind.Authentication)
+
+    def gate_resume_is_external(gate: PendingGate) -> bool:
+        """
+    匹配任何 resume kind 为 `External` 的门控。
+    用作 `handle_external_callback` 中的回退，以恢复非认证工具调用暂停
+    （例如 Responses API 调用者执行的工具结果路径），
+    这些暂停从不经过认证谓词。
+    """
+        return isinstance(gate.resume_kind, ResumeKind.External)
+
+    def gate_view_is_approval(gate: PendingGateView) -> bool:
+        """检查门控视图是否为批准类型。"""
+        return isinstance(gate.resume_kind, ResumeKind.Approval)
+
+    def gate_view_is_authentication(gate: PendingGateView) -> bool:
+        """检查门控视图是否为认证类型。"""
+        return isinstance(gate.resume_kind, ResumeKind.Authentication)
+
+    async def hinted_pending_gate_thread_id(
+            user_id: str,
+            conversation_scope: Optional[str],
+            request_id: uuid.UUID,
+            predicate: Callable[[PendingGateView], bool],
+    ) -> Optional[ThreadId]:
+        """
+    通过对话范围提示查找待处理门控的线程 ID。
+
+    如果对话范围可以解析为线程 ID，则直接在该线程中查找匹配的门控。
+    这是 O(1) 的快捷路径，避免了全量扫描。
+    """
+        thread_id = parse_engine_thread_id(conversation_scope)
+        if thread_id is None:
+            return None
+
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            raise engine_err("init", "引擎状态未初始化")
+        guard = await lock.read()
+        if guard is None:
+            raise engine_err("init", "引擎状态为空")
+
+        gate = await guard.pending_gates.peek(
+            PendingGateKey(user_id=user_id, thread_id=thread_id)
+        )
+        guard.release()
+
+        if gate is not None and str(gate.request_id) == str(request_id) and predicate(gate):
+            return thread_id
+        return None
+
+    async def pending_gate_thread_id_for_request(
+            user_id: str,
+            request_id: uuid.UUID,
+            predicate: Callable[[PendingGate], bool],
+    ) -> Optional[ThreadId]:
+        """
+    按 request_id 和谓词查找待处理门控的线程 ID。
+
+    遍历用户的所有待处理门控，找到第一个匹配 request_id 和谓词的门控。
+    """
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            raise engine_err("init", "引擎状态未初始化")
+        guard = await lock.read()
+        if guard is None:
+            raise engine_err("init", "引擎状态为空")
+
+        pending = None
+        for gate in await guard.pending_gates.list_for_user(user_id):
+            if gate.request_id == request_id and predicate(gate):
+                pending = gate
+                break
+        guard.release()
+
+        return pending.thread_id if pending is not None else None
+
+    class InlineGateOutcome(Enum):
+        """
+    快速路径内联门控解析尝试的结果。
+
+    参见 [`try_resolve_inline_approval_gate`]。
+    """
+        # 解析被直接投递到暂停的引擎 VM。待处理门控已被消费；
+        # SSE `GateResolved` 已广播。
+        Delivered = "delivered"
+        # 没有活动 VM 等待此门控（引擎未初始化、没有匹配的暂停未来、
+        # 或非 Approval 恢复类型）。待处理门控被保留在原位——
+        # 调用者应回退到遗留 mpsc 分派路径，以便代理循环的 `resolve_gate`
+        # 可以正常恢复线程。
+        NoLiveVm = "no_live_vm"
+
+    class InlineGateError(Exception):
+        """
+    [`try_resolve_inline_approval_gate`] 的验证失败，必须作为 4xx HTTP 响应显示，
+    而不是回退到遗留恢复路径。变体映射到 HTTP 边界的特定状态码
+    （参见 `chat_approval_handler`）：
+
+    - [`InlineGateError.ChannelMismatch`] → 403 Forbidden
+    - [`InlineGateError.Stale`] → 409 Conflict（request_id 已解析或与最新的待处理行不匹配）
+    - [`InlineGateError.Expired`] → 409 Conflict（待处理门控的 `expires_at` 已过）
+    - [`InlineGateError.Unauthorized`] → 403 Forbidden
+    - [`InlineGateError.Other`] → 500 Internal Server Error
+
+    在 API 边界进行类型化（而不是依赖 `error.to_string().contains("authorization")`），
+    以便未来对错误格式字符串的更改不会静默地将 403 翻转为 500。
+    """
+
+        def __init__(
+                self,
+                kind: str,
+                message: str,
+                expected: Optional[str] = None,
+                actual: Optional[str] = None,
+        ):
+            self.kind = kind
+            self.expected = expected
+            self.actual = actual
+            super().__init__(message)
+
+        @classmethod
+        def channel_mismatch(cls, expected: str, actual: str) -> "InlineGateError":
+            """解析通道与发起门控的通道不匹配（且不在可信通道允许列表中）。"""
+            return cls(
+                kind="channel_mismatch",
+                message=f"通道 '{actual}' 无法解析来自通道 '{expected}' 的门控",
+                expected=expected,
+                actual=actual,
+            )
+
+        @classmethod
+        def stale(cls) -> "InlineGateError":
+            """request_id 与活动的待处理门控不匹配（已解析、已丢弃或被新门控行替换）。"""
+            return cls(
+                kind="stale",
+                message="批准请求已过时或已被解析",
+            )
+
+        @classmethod
+        def expired(cls) -> "InlineGateError":
+            """待处理门控的 `expires_at` 已过。"""
+            return cls(
+                kind="expired",
+                message="批准请求已过期",
+            )
+
+        @classmethod
+        def unauthorized(cls) -> "InlineGateError":
+            """
+        待处理门控存在但不属于请求用户。
+        显示为 403 以避免跨租户泄漏门控存在性。
+        """
+            return cls(
+                kind="unauthorized",
+                message="无权解析此门控",
+            )
+
+        @classmethod
+        def other(cls, message: str) -> "InlineGateError":
+            """任何其他门控存储故障。"""
+            return cls(
+                kind="other",
+                message=f"门控错误: {message}",
+            )
+
+    async def try_resolve_inline_approval_gate(
+            user_id: str,
+            channel: str,
+            request_id: uuid.UUID,
+            resolution: GateResolution,
+            settings_store: Optional[SettingsStore],
+    ) -> InlineGateOutcome:
+        """
+    尝试通过内联等待快速路径解析批准门控。
+
+    只有 Approval 形状的解析才有资格进行内联等待。
+    `BridgeGateController::pause` 对 Authentication 和 External 恢复类型
+    立即返回 Cancelled 而不暂停，因此没有可投递的目标，
+    我们只需要遗留恢复路径。
+    """
+        # 只有 Approval 形状的解析才有资格进行内联等待
+        if not isinstance(resolution, (GateResolution.Approved, GateResolution.Denied)) and not isinstance(
+                resolution,
+                GateResolution.Cancelled):
+            return InlineGateOutcome.NoLiveVm
+
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return InlineGateOutcome.NoLiveVm
+        guard = await lock.read()
+        if guard is None:
+            return InlineGateOutcome.NoLiveVm
+
+        # 按 `request_id`（系统范围内唯一）解析门控，而不是按调用者提供的线程标识符。
+        # HTTP 表面上的线 `req.thread_id` 是通道可见的值——对于 Web 网关，
+        # 是由 `/api/chat/thread/new` 返回的每对话 UUID，在门控上记录为
+        # `scope_thread_id`——而不是键控 `PendingGateStore` 的内部引擎 `ThreadId`。
+        # 在存储的单个互斥锁下按 `request_id` 查找保持查找 + 删除原子性，
+        # 并避免线 vs. 引擎标识符混淆，否则会错过每个通道范围与其引擎线程不同的门控。
+        try:
+            pending = await guard.pending_gates.take_verified_by_request_id(
+                request_id, user_id, channel
+            )
+        except GateStoreError.NotFound:
+            return InlineGateOutcome.NoLiveVm
+        except GateStoreError.ChannelMismatch as e:
+            raise InlineGateError.channel_mismatch(e.expected, e.actual)
+        except GateStoreError.Unauthorized:
+            raise InlineGateError.unauthorized()
+        except GateStoreError.Expired:
+            raise InlineGateError.expired()
+        except GateStoreError.RequestIdMismatch:
+            raise InlineGateError.stale()
+        except Exception as e:
+            raise InlineGateError.other(str(e))
+
+        thread_id = pending.thread_id
+
+        # 只有 Approval 恢复门控由门控控制器暂停。非 Approval 门控
+        # 命中此处的 take_verified 意味着不同的 resume_kind 碰巧共享了 request_id——
+        # 重新插入并告诉调用者回退到遗留恢复。
+        if not isinstance(pending.resume_kind, ResumeKind.Approval):
             try:
-                pending = await guard.pending_gates.take_verified_by_request_id(
-                    request_id, user_id, channel
-                )
-            except GateStoreError.NotFound:
-                return InlineGateOutcome.NoLiveVm
-            except GateStoreError.ChannelMismatch as e:
-                raise InlineGateError.channel_mismatch(e.expected, e.actual)
-            except GateStoreError.Unauthorized:
-                raise InlineGateError.unauthorized()
-            except GateStoreError.Expired:
-                raise InlineGateError.expired()
-            except GateStoreError.RequestIdMismatch:
-                raise InlineGateError.stale()
+                await guard.pending_gates.insert(pending)
             except Exception as e:
-                raise InlineGateError.other(str(e))
+                logger.debug(
+                    "try_resolve_inline_approval_gate: 重新插入非 Approval 门控失败, user_id=%s, thread_id=%s, error=%s",
+                    user_id,
+                    thread_id,
+                    e,
+                )
+            return InlineGateOutcome.NoLiveVm
 
-            thread_id = pending.thread_id
+        always_for_inline = (
+            clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
+            if isinstance(resolution, GateResolution.Approved)
+            else False
+        )
 
-            # 只有 Approval 恢复门控由门控控制器暂停。非 Approval 门控
-            # 命中此处的 take_verified 意味着不同的 resume_kind 碰巧共享了 request_id——
-            # 重新插入并告诉调用者回退到遗留恢复。
-            if not isinstance(pending.resume_kind, ResumeKind.Approval):
-                try:
-                    await guard.pending_gates.insert(pending)
-                except Exception as e:
-                    logger.debug(
-                        "try_resolve_inline_approval_gate: 重新插入非 Approval 门控失败, user_id=%s, thread_id=%s, error=%s",
-                        user_id,
-                        thread_id,
-                        e,
-                    )
-                return InlineGateOutcome.NoLiveVm
+        legacy_registry_name = legacy_extension_alias(pending.action_name)
+        prior_permission = None
+        if always_for_inline:
+            await guard.effect_adapter.auto_approve_tool(pending.action_name)
+            if legacy_registry_name is not None:
+                await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
+            prior_permission = await persist_always_allow_with_store(
+                settings_store, guard, pending
+            )
 
+        inline_resolution = resolution  # 对于非 Approved 情况保持不变
+        if isinstance(resolution, GateResolution.Approved):
+            inline_resolution = GateResolution.Approved(always=always_for_inline)
+
+        if await guard.gate_controller.try_deliver(request_id, inline_resolution):
+            if guard.sse is not None:
+                if isinstance(resolution, GateResolution.Approved):
+                    label = "approved_always" if always_for_inline else "approved"
+                    status_msg = "门控已批准。正在恢复执行。"
+                elif isinstance(resolution, GateResolution.Denied):
+                    label = "denied"
+                    status_msg = "门控已拒绝。"
+                else:
+                    label = "cancelled"
+                    status_msg = "门控已取消。"
+
+                guard.sse.broadcast_for_user(
+                    user_id,
+                    AppEvent.GateResolved(
+                        request_id=str(pending.request_id),
+                        gate_name=pending.gate_name,
+                        tool_name=pending.action_name,
+                        resolution=label,
+                        message=status_msg,
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
+                )  # 投影豁免：桥接调度器，内联等待快速路径解析事件
+            return InlineGateOutcome.Delivered
+
+        # try_deliver 返回 false：没有为此 request_id 暂停的 future。
+        # 回滚我们安装的自动批准首选项，并重新插入待处理门控，
+        # 以便遗留 mpsc 分派路径可以找到它。
+        if always_for_inline:
+            await guard.effect_adapter.revoke_auto_approve(pending.action_name)
+            if legacy_registry_name is not None:
+                await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
+            await revert_always_allow_with_store(settings_store, pending, prior_permission)
+
+        try:
+            await guard.pending_gates.insert(pending)
+        except Exception as e:
+            logger.debug(
+                "try_resolve_inline_approval_gate: 无活动 VM 后重新插入待处理门控失败, user_id=%s, thread_id=%s, error=%s",
+                user_id,
+                thread_id,
+                e,
+            )
+        return InlineGateOutcome.NoLiveVm
+
+    async def resolve_gate(
+            agent: Agent,
+            message: IncomingMessage,
+            thread_id: ThreadId,
+            request_id: uuid.UUID,
+            resolution: GateResolution,
+    ) -> BridgeOutcome:
+        """
+    解析统一的待处理门控。
+
+    这是解析存储在 [`PendingGateStore`] 中的门控的单一入口点。
+    它在恢复或停止线程之前原子性地验证 request_id、通道授权和过期时间。
+
+    使用统一门控抽象替换了新代码路径的单独批准和认证解析路径。
+    """
+        await init_engine(agent)
+
+        lock = ENGINE_STATE.get()
+        if lock is None:
+            raise engine_err("init", "引擎状态未初始化")
+        guard = await lock.read()
+        if guard is None:
+            raise engine_err("init", "引擎状态为空")
+
+        key = PendingGateKey(user_id=message.user_id, thread_id=thread_id)
+
+        try:
+            pending = await guard.pending_gates.take_verified(
+                key, request_id, message.channel
+            )
+        except GateStoreError.ChannelMismatch as e:
+            raise engine_err(
+                "授权",
+                f"通道 '{e.actual}' 无法解析来自通道 '{e.expected}' 的门控",
+            )
+        except GateStoreError.RequestIdMismatch:
+            raise engine_err("过时", "批准请求已过时或已被解析")
+        except GateStoreError.Expired:
+            raise engine_err("已过期", "批准请求已过期")
+        except Exception as e:
+            raise engine_err("门控", e)
+
+        # 内联门控等待快速路径：如果引擎正在主动等待此门控
+        # （活动 Tier 0 批处理或 Tier 1 CodeAct VM），则通过控制器的
+        # 内存通道将解析返回。引擎从确切的暂停点继续——
+        # 无需重新进入、无需重放、无需双重执行同一步骤中先前的非幂等工具调用。
+        #
+        # 我们仍然在投递之前安装任何自动批准首选项，以便同一执行中的
+        # 后续门控看到策略 `Allow` 而不是再次门控。
+        if isinstance(resolution, (GateResolution.Approved, GateResolution.Denied, GateResolution.Cancelled)):
             always_for_inline = (
                 clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
                 if isinstance(resolution, GateResolution.Approved)
@@ -2801,11 +2924,9 @@ async def has_any_pending_gate(
                 await guard.effect_adapter.auto_approve_tool(pending.action_name)
                 if legacy_registry_name is not None:
                     await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
-                prior_permission = await persist_always_allow_with_store(
-                    settings_store, guard, pending
-                )
+                prior_permission = await persist_always_allow(agent, guard, pending)
 
-            inline_resolution = resolution  # 对于非 Approved 情况保持不变
+            inline_resolution = resolution
             if isinstance(resolution, GateResolution.Approved):
                 inline_resolution = GateResolution.Approved(always=always_for_inline)
 
@@ -2822,7 +2943,7 @@ async def has_any_pending_gate(
                         status_msg = "门控已取消。"
 
                     guard.sse.broadcast_for_user(
-                        user_id,
+                        message.user_id,
                         AppEvent.GateResolved(
                             request_id=str(pending.request_id),
                             gate_name=pending.gate_name,
@@ -2832,1750 +2953,1184 @@ async def has_any_pending_gate(
                             thread_id=pending.effective_wire_thread_id(),
                         ),
                     )  # 投影豁免：桥接调度器，内联等待快速路径解析事件
-                return InlineGateOutcome.Delivered
+                return BridgeOutcome.Pending
 
-            # try_deliver 返回 false：没有为此 request_id 暂停的 future。
-            # 回滚我们安装的自动批准首选项，并重新插入待处理门控，
-            # 以便遗留 mpsc 分派路径可以找到它。
+            # 投递失败——没有活动 VM 在等待（进程重启，或门控是通过未注册
+            # 内联等待接收器的代码路径创建的）。回滚我们刚刚安装的任何自动批准，
+            # 以便后续调用不会看到过时的首选项，然后穿透到下面的遗留重新进入路径。
             if always_for_inline:
                 await guard.effect_adapter.revoke_auto_approve(pending.action_name)
                 if legacy_registry_name is not None:
                     await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
-                await revert_always_allow_with_store(settings_store, pending, prior_permission)
+                await revert_always_allow(agent, pending, prior_permission)
 
+        # 根据解析类型处理
+        if isinstance(resolution, GateResolution.Approved):
+            always = clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
+
+            # 飞行前线程检查，在提交 `AlwaysAllow` 持久化之前 (#2347)：
+            # 如果线程在 `take_verified` 和现在之间被删除，持久化自动批准
+            # 会为从未运行的工具留下永久首选项。此分支底部的回滚仅在 `Err` 上触发，
+            # 因此 `execute_pending_gate_action` 对缺失线程的优雅 `Ok(Respond)` 会绕过它。
+            # 在此处短路。
             try:
-                await guard.pending_gates.insert(pending)
+                thread = await guard.store.load_thread(pending.thread_id)
             except Exception as e:
-                logger.debug(
-                    "try_resolve_inline_approval_gate: 无活动 VM 后重新插入待处理门控失败, user_id=%s, thread_id=%s, error=%s",
-                    user_id,
-                    thread_id,
-                    e,
-                )
-            return InlineGateOutcome.NoLiveVm
+                raise engine_err("加载线程", e)
 
-        async def resolve_gate(
-                agent: Agent,
-                message: IncomingMessage,
-                thread_id: ThreadId,
-                request_id: uuid.UUID,
-                resolution: GateResolution,
-        ) -> BridgeOutcome:
-            """
-        解析统一的待处理门控。
+            if thread is None:
+                return emit_gate_expired_dismissal(guard, message, pending)
 
-        这是解析存储在 [`PendingGateStore`] 中的门控的单一入口点。
-        它在恢复或停止线程之前原子性地验证 request_id、通道授权和过期时间。
-
-        使用统一门控抽象替换了新代码路径的单独批准和认证解析路径。
-        """
-            await init_engine(agent)
-
-            lock = ENGINE_STATE.get()
-            if lock is None:
-                raise engine_err("init", "引擎状态未初始化")
-            guard = await lock.read()
-            if guard is None:
-                raise engine_err("init", "引擎状态为空")
-
-            key = PendingGateKey(user_id=message.user_id, thread_id=thread_id)
-
-            try:
-                pending = await guard.pending_gates.take_verified(
-                    key, request_id, message.channel
-                )
-            except GateStoreError.ChannelMismatch as e:
-                raise engine_err(
-                    "授权",
-                    f"通道 '{e.actual}' 无法解析来自通道 '{e.expected}' 的门控",
-                )
-            except GateStoreError.RequestIdMismatch:
-                raise engine_err("过时", "批准请求已过时或已被解析")
-            except GateStoreError.Expired:
-                raise engine_err("已过期", "批准请求已过期")
-            except Exception as e:
-                raise engine_err("门控", e)
-
-            # 内联门控等待快速路径：如果引擎正在主动等待此门控
-            # （活动 Tier 0 批处理或 Tier 1 CodeAct VM），则通过控制器的
-            # 内存通道将解析返回。引擎从确切的暂停点继续——
-            # 无需重新进入、无需重放、无需双重执行同一步骤中先前的非幂等工具调用。
-            #
-            # 我们仍然在投递之前安装任何自动批准首选项，以便同一执行中的
-            # 后续门控看到策略 `Allow` 而不是再次门控。
-            if isinstance(resolution, (GateResolution.Approved, GateResolution.Denied, GateResolution.Cancelled)):
-                always_for_inline = (
-                    clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
-                    if isinstance(resolution, GateResolution.Approved)
-                    else False
-                )
-
-                legacy_registry_name = legacy_extension_alias(pending.action_name)
-                prior_permission = None
-                if always_for_inline:
-                    await guard.effect_adapter.auto_approve_tool(pending.action_name)
-                    if legacy_registry_name is not None:
-                        await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
-                    prior_permission = await persist_always_allow(agent, guard, pending)
-
-                inline_resolution = resolution
-                if isinstance(resolution, GateResolution.Approved):
-                    inline_resolution = GateResolution.Approved(always=always_for_inline)
-
-                if await guard.gate_controller.try_deliver(request_id, inline_resolution):
-                    if guard.sse is not None:
-                        if isinstance(resolution, GateResolution.Approved):
-                            label = "approved_always" if always_for_inline else "approved"
-                            status_msg = "门控已批准。正在恢复执行。"
-                        elif isinstance(resolution, GateResolution.Denied):
-                            label = "denied"
-                            status_msg = "门控已拒绝。"
-                        else:
-                            label = "cancelled"
-                            status_msg = "门控已取消。"
-
-                        guard.sse.broadcast_for_user(
-                            message.user_id,
-                            AppEvent.GateResolved(
-                                request_id=str(pending.request_id),
-                                gate_name=pending.gate_name,
-                                tool_name=pending.action_name,
-                                resolution=label,
-                                message=status_msg,
-                                thread_id=pending.effective_wire_thread_id(),
-                            ),
-                        )  # 投影豁免：桥接调度器，内联等待快速路径解析事件
-                    return BridgeOutcome.Pending
-
-                # 投递失败——没有活动 VM 在等待（进程重启，或门控是通过未注册
-                # 内联等待接收器的代码路径创建的）。回滚我们刚刚安装的任何自动批准，
-                # 以便后续调用不会看到过时的首选项，然后穿透到下面的遗留重新进入路径。
-                if always_for_inline:
-                    await guard.effect_adapter.revoke_auto_approve(pending.action_name)
-                    if legacy_registry_name is not None:
-                        await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
-                    await revert_always_allow(agent, pending, prior_permission)
-
-            # 根据解析类型处理
-            if isinstance(resolution, GateResolution.Approved):
-                always = clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
-
-                # 飞行前线程检查，在提交 `AlwaysAllow` 持久化之前 (#2347)：
-                # 如果线程在 `take_verified` 和现在之间被删除，持久化自动批准
-                # 会为从未运行的工具留下永久首选项。此分支底部的回滚仅在 `Err` 上触发，
-                # 因此 `execute_pending_gate_action` 对缺失线程的优雅 `Ok(Respond)` 会绕过它。
-                # 在此处短路。
-                try:
-                    thread = await guard.store.load_thread(pending.thread_id)
-                except Exception as e:
-                    raise engine_err("加载线程", e)
-
-                if thread is None:
-                    return emit_gate_expired_dismissal(guard, message, pending)
-
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
-                        message.user_id,
-                        AppEvent.GateResolved(
-                            request_id=str(pending.request_id),
-                            gate_name=pending.gate_name,
-                            tool_name=pending.action_name,
-                            resolution="approved_always" if always else "approved",
-                            message="门控已批准。正在恢复执行。",
-                            thread_id=pending.effective_wire_thread_id(),
-                        ),
-                    )
-
-                legacy_registry_name = legacy_extension_alias(pending.action_name)
-                prior_permission = None
-                if always:
-                    await guard.effect_adapter.auto_approve_tool(pending.action_name)
-                    if legacy_registry_name is not None:
-                        await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
-                    prior_permission = await persist_always_allow(agent, guard, pending)
-
-                result = await execute_pending_gate_action(
-                    agent,
-                    guard,
-                    message,
-                    pending,
-                    True,
-                    (pending.call_id, True),
-                )
-
-                if always and isinstance(result, Exception):
-                    await guard.effect_adapter.revoke_auto_approve(pending.action_name)
-                    if legacy_registry_name is not None:
-                        await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
-                    await revert_always_allow(agent, pending, prior_permission)
-
-                return result
-
-            elif isinstance(resolution, GateResolution.Denied):
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
-                        message.user_id,
-                        AppEvent.GateResolved(
-                            request_id=str(pending.request_id),
-                            gate_name=pending.gate_name,
-                            tool_name=pending.action_name,
-                            resolution="denied",
-                            message="门控已拒绝。",
-                            thread_id=pending.effective_wire_thread_id(),
-                        ),
-                    )
-
-                try:
-                    await agent.channels.send_status(
-                        message.channel,
-                        StatusUpdate.Status("工具调用已拒绝。"),
-                        message.metadata,
-                    )
-                except Exception:
-                    pass
-
-                reason_text = f" 原因: {resolution.reason}" if resolution.reason else ""
-                deny_msg = ThreadMessage.user(
-                    f"用户拒绝了操作 '{pending.action_name}'。不要重试；选择不同的方法。{reason_text}"
-                )
-
-                guard.effect_adapter.reset_call_count()
-                await guard.thread_manager.resume_thread(
-                    pending.thread_id,
+            if guard.sse is not None:
+                guard.sse.broadcast_for_user(
                     message.user_id,
-                    deny_msg,
-                    (pending.call_id, False),
-                    None,
+                    AppEvent.GateResolved(
+                        request_id=str(pending.request_id),
+                        gate_name=pending.gate_name,
+                        tool_name=pending.action_name,
+                        resolution="approved_always" if always else "approved",
+                        message="门控已批准。正在恢复执行。",
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
                 )
 
-            elif isinstance(resolution, GateResolution.Cancelled):
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
-                        message.user_id,
-                        AppEvent.GateResolved(
-                            request_id=str(pending.request_id),
-                            gate_name=pending.gate_name,
-                            tool_name=pending.action_name,
-                            resolution="cancelled",
-                            message="门控已取消。",
-                            thread_id=pending.effective_wire_thread_id(),
-                        ),
-                    )
+            legacy_registry_name = legacy_extension_alias(pending.action_name)
+            prior_permission = None
+            if always:
+                await guard.effect_adapter.auto_approve_tool(pending.action_name)
+                if legacy_registry_name is not None:
+                    await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
+                prior_permission = await persist_always_allow(agent, guard, pending)
 
-                try:
-                    await guard.thread_manager.stop_thread(pending.thread_id, message.user_id)
-                except Exception as e:
-                    logger.debug("取消时停止线程失败: %s", e)
-
-                return BridgeOutcome.Respond("已取消。")
-
-            elif isinstance(resolution, GateResolution.CredentialProvided):
-                if not isinstance(pending.resume_kind, ResumeKind.Authentication):
-                    raise engine_err(
-                        "解析不匹配",
-                        "为非认证门控发送了 CredentialProvided",
-                    )
-
-                credential_name = pending.resume_kind.credential_name
-
-                submit_target = await resolve_extension_for_action(
-                    guard.auth_manager,
-                    guard.extension_manager,
-                    guard.effect_adapter.tools(),
-                    pending.action_name,
-                    pending.parameters,
-                    credential_name,
-                    message.user_id,
-                )
-                display_name = submit_target
-
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
-                        message.user_id,
-                        AppEvent.GateResolved(
-                            request_id=str(pending.request_id),
-                            gate_name=pending.gate_name,
-                            tool_name=pending.action_name,
-                            resolution="credential_provided",
-                            message="凭证已收到。正在恢复执行。",
-                            thread_id=pending.effective_wire_thread_id(),
-                        ),
-                    )
-
-                submission = await submit_pending_auth_credential(
-                    guard,
-                    str(submit_target),
-                    credential_name,
-                    resolution.token,
-                    message.user_id,
-                )
-
-                # 根据提交结果处理
-                if isinstance(submission, PendingAuthCredentialSubmission.Stored):
-                    result = submission.result
-                    if classify_configure_result(result) == ConfigureFlowOutcome.Ready:
-                        try:
-                            await agent.channels.send_status(
-                                message.channel,
-                                StatusUpdate.AuthCompleted(
-                                    extension_name=display_name,
-                                    success=True,
-                                    message=format_auth_completed_resuming(result.message),
-                                ),
-                                message.metadata,
-                            )
-                        except Exception:
-                            pass
-                    elif classify_configure_result(result) == ConfigureFlowOutcome.PairingRequired:
-                        next_pending = await requeue_pairing_pending_gate(
-                            guard, pending, str(display_name)
-                        )
-                        if guard.sse is not None:
-                            guard.sse.broadcast_for_user(
-                                message.user_id,
-                                OnboardingStateDto.pairing_required(
-                                    display_name,
-                                    str(next_pending.request_id),
-                                    pending.effective_wire_thread_id(),
-                                    result.message,
-                                    result.instructions,
-                                    result.onboarding,
-                                ),
-                            )
-                        return BridgeOutcome.Pending
-                    elif classify_configure_result(result) in (
-                            ConfigureFlowOutcome.AuthRequired,
-                            ConfigureFlowOutcome.RetryAuth,
-                    ):
-                        return await requeue_auth_pending_gate(
-                            agent,
-                            guard,
-                            message,
-                            pending,
-                            result.message,
-                            result.auth_url,
-                        )
-                elif isinstance(submission, PendingAuthCredentialSubmission.SkippedNoBackend):
-                    if pending.resume_output is not None:
-                        logger.debug(
-                            "认证门控恢复：无后端，令牌已丢弃，因为 resume_output 已准备, user_id=%s, thread_id=%s, request_id=%s",
-                            message.user_id,
-                            pending.thread_id,
-                            pending.request_id,
-                        )
-                    else:
-                        msg = "没有可用的认证管理器、扩展管理器或密钥存储来存储凭证。"
-                        await fail_waiting_thread(guard, message.user_id, pending.thread_id, msg)
-                        try:
-                            await agent.channels.send_status(
-                                message.channel,
-                                StatusUpdate.AuthCompleted(
-                                    extension_name=display_name,
-                                    success=False,
-                                    message=msg,
-                                ),
-                                message.metadata,
-                            )
-                        except Exception:
-                            pass
-                        return BridgeOutcome.Respond(msg)
-
-                # 处理认证回退重放
-                if pending.action_name == "authentication_fallback" and pending.original_message is not None:
-                    retry_content = pending.original_message
-                    retry_msg = IncomingMessage(
-                        content=retry_content,
-                        channel=pending.source_channel,
-                        user_id=pending.user_id,
-                        metadata=message.metadata,
-                    )
-                    guard.release()
-                    return await handle_with_engine_inner(agent, retry_msg, retry_content, 1)
-
-                # 使用 resume_output 或执行待处理操作
-                if pending.resume_output is not None:
-                    resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(
-                        guard, pending
-                    )
-                    await guard.thread_manager.resume_thread(
-                        pending.thread_id,
-                        message.user_id,
-                        resumed_action_result_message(
-                            resolved_call_id,
-                            pending.action_name,
-                            pending.resume_output,
-                        ),
-                        None,
-                        resolved_call_id,
-                    )
-                else:
-                    return await execute_pending_gate_action(
-                        agent,
-                        guard,
-                        message,
-                        pending,
-                        pending.approval_already_granted,
-                        None,
-                    )
-
-            elif isinstance(resolution, GateResolution.ExternalCallback):
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
-                        message.user_id,
-                        AppEvent.GateResolved(
-                            request_id=str(pending.request_id),
-                            gate_name=pending.gate_name,
-                            tool_name=pending.action_name,
-                            resolution="external_callback",
-                            message="外部回调已收到。正在恢复执行。",
-                            thread_id=pending.effective_wire_thread_id(),
-                        ),
-                    )
-
-                is_external_tool_callback = (
-                        isinstance(pending.resume_kind, ResumeKind.External)
-                        and is_external_tool_callback_id(pending.resume_kind.callback_id)
-                )
-
-                if is_external_tool_callback:
-                    resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(
-                        guard, pending
-                    )
-                    synthesized_output = extract_external_tool_output(
-                        resolution.payload, resolved_call_id
-                    )
-                    raw_rendered = json.dumps(synthesized_output, indent=2, ensure_ascii=False)
-                    sanitized = guard.effect_adapter.safety().sanitize_tool_output(
-                        pending.action_name, raw_rendered
-                    )
-                    await guard.thread_manager.resume_thread(
-                        pending.thread_id,
-                        message.user_id,
-                        ThreadMessage.action_result(
-                            resolved_call_id,
-                            pending.action_name,
-                            sanitized.content,
-                        ),
-                        None,
-                        resolved_call_id,
-                    )
-                elif pending.resume_output is not None:
-                    resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(
-                        guard, pending
-                    )
-                    await guard.thread_manager.resume_thread(
-                        pending.thread_id,
-                        message.user_id,
-                        resumed_action_result_message(
-                            resolved_call_id,
-                            pending.action_name,
-                            pending.resume_output,
-                        ),
-                        None,
-                        resolved_call_id,
-                    )
-                else:
-                    return await execute_pending_gate_action(
-                        agent,
-                        guard,
-                        message,
-                        pending,
-                        pending.approval_already_granted,
-                        None,
-                    )
-
-            return await await_thread_outcome(
+            result = await execute_pending_gate_action(
                 agent,
                 guard,
                 message,
-                pending.conversation_id,
-                pending.thread_id,
+                pending,
+                True,
+                (pending.call_id, True),
             )
 
-        async def handle_interrupt(
-                agent: Agent,
-                message: IncomingMessage,
-        ) -> BridgeOutcome:
-            """处理中断提交——停止活动引擎线程。"""
-            await init_engine(agent)
+            if always and isinstance(result, Exception):
+                await guard.effect_adapter.revoke_auto_approve(pending.action_name)
+                if legacy_registry_name is not None:
+                    await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
+                await revert_always_allow(agent, pending, prior_permission)
 
-            lock = ENGINE_STATE.get()
-            if lock is None:
-                raise engine_err("init", "引擎状态未初始化")
-            guard = await lock.read()
-            if guard is None:
-                raise engine_err("init", "引擎状态为空")
+            return result
 
-            conv_id = await guard.conversation_manager.get_or_create_conversation(
-                message.channel, message.user_id
-            )
-
-            conv = await guard.conversation_manager.get_conversation(conv_id)
-            active_threads = conv.active_threads if conv is not None else []
-
-            stopped = 0
-            for tid in active_threads:
-                if await guard.thread_manager.is_running(tid):
-                    try:
-                        await guard.thread_manager.stop_thread(tid, message.user_id)
-                        stopped += 1
-                    except Exception as e:
-                        logger.debug("engine v2: 停止线程失败, thread_id=%s, error=%s", tid, e)
-
-            if stopped > 0:
-                logger.debug("engine v2: 中断了 %d 个运行中的线程", stopped)
-                return BridgeOutcome.Respond("已中断。")
-            else:
-                return BridgeOutcome.Respond("没有可中断的内容。")
-
-        async def handle_new_thread(
-                agent: Agent,
-                message: IncomingMessage,
-        ) -> BridgeOutcome:
-            """处理新线程提交——清除对话以重新开始。"""
-            await clear_engine_conversation(agent, message)
-            return BridgeOutcome.Respond("已开始新对话。")
-
-        async def handle_clear(
-                agent: Agent,
-                message: IncomingMessage,
-        ) -> BridgeOutcome:
-            """处理清除提交——停止线程并重置对话。"""
-            await clear_engine_conversation(agent, message)
-            return BridgeOutcome.Respond("对话已清除。")
-
-        async def clear_engine_conversation(
-                agent: Agent,
-                message: IncomingMessage,
-        ) -> None:
-            """停止所有活动线程并清除对话条目。"""
-            await init_engine(agent)
-
-            lock = ENGINE_STATE.get()
-            if lock is None:
-                raise engine_err("init", "引擎状态未初始化")
-            guard = await lock.read()
-            if guard is None:
-                raise engine_err("init", "引擎状态为空")
-
-            conv_id = await guard.conversation_manager.get_or_create_conversation(
-                message.channel, message.user_id
-            )
-
-            # 先停止所有活动线程
-            conv = await guard.conversation_manager.get_conversation(conv_id)
-            if conv is not None:
-                for tid in conv.active_threads:
-                    if await guard.thread_manager.is_running(tid):
-                        try:
-                            await guard.thread_manager.stop_thread(tid, message.user_id)
-                        except Exception:
-                            pass
-                    # 丢弃此线程的所有待处理门控，无论用户是谁，
-                    # 防止产生永远无法解析的孤立门控 (#2323)
-                    await guard.pending_gates.discard_for_thread(tid)
-
-            # 清除此用户的进行中 OAuth 流 (#3320)
-            if agent.deps.extension_manager is not None:
-                flows = agent.deps.extension_manager.pending_oauth_flows()
-                async with flows.write() as flow_dict:
-                    before = len(flow_dict)
-                    flow_dict.retain(lambda state, flow: flow.user_id != message.user_id)
-                    removed = before - len(flow_dict)
-                    if removed > 0:
-                        logger.debug(
-                            "engine v2: /clear 时清除了 %d 个待处理 OAuth 流, user_id=%s",
-                            removed,
-                            message.user_id,
-                        )
-
-            # 清除对话条目和活动线程列表
-            await guard.conversation_manager.clear_conversation(conv_id, message.user_id)
-
-            logger.debug(
-                "engine v2: 对话已清除, user_id=%s, conversation_id=%s",
-                message.user_id,
-                conv_id,
-            )
-
-        async def has_pending_auth(user_id: str) -> bool:
-            """检查用户是否有待处理的认证门控。"""
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return False
-            try:
-                guard = await lock.read()
-            except Exception:
-                return False
-            if guard is None:
-                return False
-
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if isinstance(gate.resume_kind, ResumeKind.Authentication):
-                    return True
-            return False
-
-        async def clear_engine_pending_auth(
-                user_id: str,
-                thread_id: Optional[str],
-        ) -> None:
-            """
-        在 v2 引擎中清除用户的待处理认证状态。
-
-        从网关端认证清理路径调用，以确保在浏览器放弃提示或
-        OAuth 回调在正常聊天消息路径之外完成时清除待处理认证门控。
-        """
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return
-            guard = await lock.read()
-            if guard is None:
-                return
-
-            if thread_id is not None:
-                resolution = await resolve_pending_gate_for_user(
-                    guard.pending_gates, user_id, thread_id
-                )
-                if isinstance(resolution, PendingGateResolution.Resolved):
-                    gate = resolution.gate
-                    if isinstance(gate.resume_kind, ResumeKind.Authentication):
-                        await guard.pending_gates.discard(gate.key())
-                return
-
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if isinstance(gate.resume_kind, ResumeKind.Authentication):
-                    await guard.pending_gates.discard(gate.key())
-
-        async def clear_engine_pending_auth_for_credential(
-                user_id: str,
-                credential_name: str,
-        ) -> None:
-            """按凭证名称清除用户的待处理认证门控。"""
-            cred = CredentialName.new(credential_name)
-            if cred is None:
-                return
-
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return
-            guard = await lock.read()
-            if guard is None:
-                return
-
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if (
-                        isinstance(gate.resume_kind, ResumeKind.Authentication)
-                        and gate.resume_kind.credential_name == cred
-                ):
-                    await guard.pending_gates.discard(gate.key())
-
-        async def discard_engine_pending_auth_request(
-                user_id: str,
-                request_id: uuid.UUID,
-                thread_id: Optional[str],
-        ) -> bool:
-            """
-        丢弃匹配 request_id 和可选 thread_id 的待处理认证门控。
-
-        返回 True 表示找到并丢弃了门控，False 表示未找到匹配的门控。
-        """
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return False
-            guard = await lock.read()
-            if guard is None:
-                return False
-
-            hinted_uuid = parse_scope_uuid(thread_id)
-            hinted_scope = thread_id
-
-            matching_gate = None
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if gate.request_id != request_id:
-                    continue
-                if not isinstance(gate.resume_kind, ResumeKind.Authentication):
-                    continue
-
-                # 检查 thread_id 提示匹配
-                if hinted_scope is None:
-                    matching_gate = gate
-                    break
-                if gate.scope_thread_id == hinted_scope:
-                    matching_gate = gate
-                    break
-                if hinted_uuid is not None and (
-                        gate.thread_id == hinted_uuid or gate.conversation_id == hinted_uuid
-                ):
-                    matching_gate = gate
-                    break
-
-            if matching_gate is None:
-                return False
-
-            try:
-                await guard.pending_gates.discard(matching_gate.key())
-                return True
-            except Exception:
-                return False
-
-        async def transition_engine_pending_auth_request_to_pairing(
-                user_id: str,
-                request_id: uuid.UUID,
-                thread_id: Optional[str],
-                extension_name: str,
-        ) -> Optional[str]:
-            """
-        将待处理认证门控转换为配对门控。
-
-        返回新配对门控的 request_id，如果未找到匹配的门控则返回 None。
-        """
-            lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-            if lock is None:
-                return None
-            guard = await lock.read()
-            if guard is None:
-                return None
-
-            hinted_uuid = parse_scope_uuid(thread_id)
-            hinted_scope = thread_id
-
-            matching_gate = None
-            for gate in await guard.pending_gates.list_for_user(user_id):
-                if gate.request_id != request_id:
-                    continue
-                if not isinstance(gate.resume_kind, ResumeKind.Authentication):
-                    continue
-
-                # 检查 thread_id 提示匹配
-                if hinted_scope is None:
-                    matching_gate = gate
-                    break
-                if gate.scope_thread_id == hinted_scope:
-                    matching_gate = gate
-                    break
-                if hinted_uuid is not None and (
-                        gate.thread_id == hinted_uuid or gate.conversation_id == hinted_uuid
-                ):
-                    matching_gate = gate
-                    break
-
-            if matching_gate is None:
-                return None
-
-            await guard.pending_gates.discard(matching_gate.key())
-
-            next_pending = pairing_pending_gate_from_auth(matching_gate, extension_name)
-            await guard.pending_gates.insert(next_pending)
-
-            return str(next_pending.request_id)
-
-    async def handle_with_engine(
-            agent: Agent,
-            message: IncomingMessage,
-            content: str,
-    ) -> BridgeOutcome:
-        """通过引擎 v2 管道处理用户消息。"""
-        return await handle_with_engine_inner(agent, message, content, 0)
-
-    # 认证重试递归的最大深度（存储凭证 → 重试原始消息）
-    MAX_AUTH_RETRY_DEPTH: int = 2
-
-    async def handle_with_engine_inner(
-            agent: Agent,
-            message: IncomingMessage,
-            content: str,
-            depth: int,
-    ) -> BridgeOutcome:
-        """通过引擎 v2 管道处理用户消息的内部实现。"""
-
-        # 防止认证重试无限递归，最大深度为 2
-        if depth > MAX_AUTH_RETRY_DEPTH:
-            return BridgeRespondOutcome(
-                "凭证已存储，但认证重试次数过多。请重新发送您的消息。"
-            )
-
-        # --------Step1: 确保引擎已初始化--------
-        await init_engine(agent)
-
-        lock = ENGINE_STATE.get()
-        if lock is None:
-            raise engine_err("init", "引擎状态未初始化")
-
-        async with lock.read() as guard:
-            state = guard
-            if state is None:
-                raise engine_err("init", "引擎状态为空")
-
-            logger.debug(
-                "engine v2: 正在处理消息, user_id=%s, channel=%s",
-                message.user_id,
-                message.channel,
-            )
-
-            thread_scope = message.conversation_scope
-            # 解析引擎线程 ID
-            scoped_thread_id = parse_engine_thread_id(thread_scope)
-
-            # --------Step2: 检查是否有待处理的gate，并按优先级处理--------
-            # --------Step2.1: 解析用户的待处理门控--------
-            resolution = await resolve_pending_gate_for_user(
-                state.pending_gates, message.user_id, thread_scope
-            )
-            # --------Step2.2: 处理gate--------
-            match resolution:
-                case PendingGateResolutionResolved(gate):
-                    # 用户必须提供凭证（令牌、API 密钥、OAuth 流）
-                    if gate.resume_kind == ResumeKind.Authentication:
-                        request_id = gate.request_id
-                        if content.strip() == "" or content.strip().lower() == "cancel":
-                            gate_resolution = GateResolution.Cancelled
-                        else:
-                            gate_resolution = GateResolution.CredentialProvided(
-                                token=content.strip()
-                            )
-                        # 释放读取锁后再调用 resolve_gate
-                        guard.release()
-                        return await resolve_gate(
-                            agent, message, gate.thread_id, request_id, gate_resolution
-                        )
-
-                    # 用户必须批准或拒绝工具调用
-                    elif gate.resume_kind == ResumeKind.Approval:
-                        pending = gate.clone()
-                        # 从状态中克隆 SSE arc 和工具注册表，
-                        # 然后在等待 broadcast + channel I/O 之前释放引擎读取锁。
-                        # 上面的认证分支执行相同操作，`notify_pending_gate` 的签名
-                        # 接受 owned Option<Arc<SseManager>>，正是为了让此
-                        # 终端返回分支可以释放锁。`notify_pending_gate` 需要
-                        # 工具注册表句柄来解析认证门控显示名称，而无需持有
-                        # 引擎状态锁。
-                        sse = state.sse.clone()
-                        tools = state.effect_adapter.tools()
-                        auth_manager = state.auth_manager.clone()
-                        extension_manager = state.extension_manager.clone()
-                        guard.release()
-                        return await notify_pending_gate(
-                            agent,
-                            sse,
-                            tools,
-                            auth_manager,
-                            extension_manager,
-                            message,
-                            pending,
-                        )
-
-                case PendingGateResolutionAmbiguous():
-                    return BridgeRespondOutcome(
-                        text="多个待处理的批准或认证提示正在等待。请从原始线程回复。"
-                    )
-
-            # --------Step3: 孤儿线程检查--------
-            # 检查线程是否在等待批准或认证但状态丢失，如果是则标记为失败
-            if scoped_thread_id is not None:
-                orphaned = await fail_orphaned_waiting_thread_if_needed(
-                    state, message.user_id, scoped_thread_id
-                )
-                if orphaned:
-                    return BridgeRespondOutcome(
-                        text="此线程正在等待批准或认证，但该待处理状态已丢失。"
-                             "线程已标记为失败；请重新发送您的请求。"
-                    )
-
-            # --------Step4: 对输入内容进行安全验证--------
-
-            # 安全检查——在线程操作 ::process_user_input 中镜像 v1 管道，
-            # 确保两条引擎路径执行相同的入站保护措施。
-            # 当消息带有附件时，空的文本正文是合法的（附件即为有效载荷）；
-            # 跳过验证器对空输入的拒绝，但仍对文本应用长度/策略检查。
-            trimmed_content = content.strip()
-            skip_empty_check = trimmed_content == "" and len(message.attachments) > 0
-
-            # --------Step4.1: 验证content是否合法--------
-            if not skip_empty_check:
-
-                validation = agent.safety().validate_input(content)
-                if not validation.is_valid:
-                    details = "; ".join(
-                        f"{e.field}: {e.message}" for e in validation.errors
-                    )
-                    return BridgeOutcome.Respond(
-                        f"输入被安全验证拒绝: {details}"
-                    )
-
-            # --------Step4.2: 验证content否违反任何策略规则--------
-            violations = agent.safety().check_policy(content)
-            if any(rule.action == PolicyAction.Block for rule in violations):
-                return BridgeOutcome.Respond(
-                    "输入被安全策略拒绝。"
-                )
-
-            # --------Step4.3: 输入中是否包含泄漏的密钥--------
-
-            # 扫描入站消息中的密钥（API 密钥、令牌）。
-            # 在此处捕获它们可以防止大语言模型将其回显，
-            # 否则会触发外发泄漏检测器并造成错误循环。
-            warning = agent.safety().scan_inbound_for_secrets(content)
-            if warning is not None:
-                logger.warning(
-                    "engine v2: 入站消息被阻止——包含泄漏的密钥, user_id=%s, channel=%s",
+        elif isinstance(resolution, GateResolution.Denied):
+            if guard.sse is not None:
+                guard.sse.broadcast_for_user(
                     message.user_id,
-                    message.channel,
+                    AppEvent.GateResolved(
+                        request_id=str(pending.request_id),
+                        gate_name=pending.gate_name,
+                        tool_name=pending.action_name,
+                        resolution="denied",
+                        message="门控已拒绝。",
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
                 )
-                return BridgeOutcome.Respond(warning)
 
-            # 解析每用户项目（如果需要则创建）
-            project_id = await resolve_user_project(
-                state.store, message.user_id, state.default_project_id
-            )
-
-            # --------Step5: 处理消息附件--------
-
-            persisted_attachments = list(message.attachments)
-            # --------Step5.1: 保存附件内容--------
-            attachment_notes = await persist_project_attachments(
-                state.project_root,
-                message,
-                project_id,
-                persisted_attachments,
-            )
-
-            # --------Step5.2: 将附件内容处理为标准化信息--------
-
-            # 引擎 v2 线程目前仅支持文本，因此附件必须在路由到引擎之前合并到有效的用户内容中。
-            # 这样可以在引擎线程和双写的网关历史记录中保留提取的文档文本、项目本地文件路径以及附件元数据。
-            augmented = augment_with_attachments(content, persisted_attachments)
-            effective_content = augmented.text if augmented is not None else content
-
-            # --------Step6: 触发OnEvent 任务--------
-
-            # 触发所有处于活动状态的 OnEvent 任务，其模式（以及可选的频道过滤器）与此入站消息匹配。
-            # 此处触发的任务是消息的副作用——独立于下方生成的常规对话线程，且与之并行执行。
-            # 错误会被记录，但绝不会阻塞面向用户的消息处理。
-            #
-            # 此路径不会触及 v1 创建的例程：它们存在于 v1 例程存储中，并由后台的 v1 RoutineEngine 触发。
-            # 通过 routine_create 别名创建的任务存在于引擎存储中，并在此处触发。
-            await fire_event_missions_for_message(state, message, effective_content)
-
-            # 向通道发送"思考中..."状态
             try:
                 await agent.channels.send_status(
                     message.channel,
-                    StatusUpdate.Thinking("处理中..."),
+                    StatusUpdate.Status("工具调用已拒绝。"),
                     message.metadata,
                 )
             except Exception:
                 pass
 
-            # 重置每步调用计数器，以便每个线程从头开始
-            state.effect_adapter.reset_call_count()
-
-            # --------Step7: 创建对话--------
-
-            # --------Step7.1: 限定引擎对话的范围--------
-            # 按（频道、用户、线程）限定引擎对话的范围。
-            # 当前端发送 thread_id 时（用户创建了新对话），将其作为频道键的一部分，
-            # 以便每个 v1 线程映射到独立的引擎对话。
-            # 若不这样做，所有线程将共享同一个对话，消息会出现在错误的位置。
-            scope = message.conversation_scope
-            channel_key = (
-                f"{message.channel}:{scope}" if scope is not None else message.channel
+            reason_text = f" 原因: {resolution.reason}" if resolution.reason else ""
+            deny_msg = ThreadMessage.user(
+                f"用户拒绝了操作 '{pending.action_name}'。不要重试；选择不同的方法。{reason_text}"
             )
 
-            # --------Step7.2: 创建对话--------
-            # 获取或创建频道+用户对对应的对话。
-            conv_id = await state.conversation_manager.get_or_create_conversation(
-                channel_key, message.user_id
+            guard.effect_adapter.reset_call_count()
+            await guard.thread_manager.resume_thread(
+                pending.thread_id,
+                message.user_id,
+                deny_msg,
+                (pending.call_id, False),
+                None,
             )
 
-            # 在将频道提供的时区传递给引擎之前进行验证。
-            # ValidTimezone::parse 会拒绝空字符串/无效字符串；
-            # 我们发送规范的 IANA 时区名称（而非原始输入），以便下游消费者看到一个已知正确的值。
-            # 必须在 spawn 时*传入*——线程启动后设置元数据对于首轮对话的内存执行器是不可见的。
-            validated_tz = ValidTimezone.parse(message.timezone) if message.timezone else None
+        elif isinstance(resolution, GateResolution.Cancelled):
+            if guard.sse is not None:
+                guard.sse.broadcast_for_user(
+                    message.user_id,
+                    AppEvent.GateResolved(
+                        request_id=str(pending.request_id),
+                        gate_name=pending.gate_name,
+                        tool_name=pending.action_name,
+                        resolution="cancelled",
+                        message="门控已取消。",
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
+                )
 
-            # --------Step8: 规则检测显式执行意图--------
-            # 检测执行意图并相应地配置义务
-            thread_config = ThreadConfig.default()
-            if user_signals_execution_intent(content):
-                thread_config.require_action_attempt = True
-
-            # --------Step9: 处理首轮对话丢失调用方工具的问题--------
-
-            # 将对话范围（可解析为 Uuid）写入线程的 `initial_metadata` 中。
-            # 引擎会将其读回到 `ThreadExecutionContext.conversation_scope` 中，
-            # 这使得桥接器的 `EffectBridgeAdapter` 能够通过引擎 `thread_id` 或调用方范围来解析每个对话的状态
-            # （目前为调用方提供的外部工具目录）。
-            # 若不这样做，在 spawn 后立即启动的执行器任务将与桥接器 spawn 后的 `transfer` 产生竞态条件，
-            # 从而导致首轮对话丢失调用方工具。
-            scope_uuid = parse_engine_thread_id(scope)
-            extra_metadata = None
-            if scope_uuid is not None:
-                extra_metadata = {
-                    "conversation_scope": str(scope_uuid),
-                }
-
-            # --------Step10: 为线程绑定每次执行的上下文--------
-
-            # 在引擎生成线程之前预先绑定每次执行的上下文。
-            # `handle_user_message` 在内部分配并启动引擎任务；
-            # 如果快速工具门控在 `set_execution_context` 落地之前触发，
-            # 则控制器的 `pause()` 将找不到对应条目并静默取消门控。
-            # 预执行插槽以 user_id 为键，上游的每个对话锁确保每个对话最多只有一个桥接轮次正在执行。
-            scope_thread_id = ExternalThreadId.new(scope) if scope else None
-            per_exec_context = PerExecutionContext(
-                conversation_id=conv_id,
-                source_channel=message.channel,
-                scope_thread_id=scope_thread_id,
-                channel_metadata=message.metadata,
-                original_message=message.content,
-            )
-            await state.gate_controller.set_pre_execution_context(
-                message.user_id, conv_id, per_exec_context
-            )
-
-            # --------Step11: 处理用户消息--------
-
-            # 处理消息——生成新线程或注入到活动线程中。
-            # 出错时我们必须清除刚刚安装的预执行插槽：
-            # 若不这样做，失败的 `handle_user_message`（在分配任何 thread_id 之前引擎生成/注入失败）
-            # 会留下一个以 user_id 为键的过时条目，
-            # 这将导致同一用户的下一个门控提示被错误路由。
             try:
-                thread_id = await state.conversation_manager.handle_user_message(
-                    conv_id,
-                    effective_content,
-                    project_id,
-                    message.user_id,
-                    thread_config,
-                    validated_tz.name() if validated_tz else None,
-                    extra_metadata,
-                )
+                await guard.thread_manager.stop_thread(pending.thread_id, message.user_id)
             except Exception as e:
-                await state.gate_controller.clear_pre_execution_context(
-                    message.user_id, conv_id
+                logger.debug("取消时停止线程失败: %s", e)
+
+            return BridgeOutcome.Respond("已取消。")
+
+        elif isinstance(resolution, GateResolution.CredentialProvided):
+            if not isinstance(pending.resume_kind, ResumeKind.Authentication):
+                raise engine_err(
+                    "解析不匹配",
+                    "为非认证门控发送了 CredentialProvided",
                 )
-                raise engine_err("线程错误", e)
 
-            # 将预执行条目提升为以（用户、线程）为键的条目。
-            # 此后，来自此线程的门控将首先落在线线程键的条目上；
-            # 每用户回退覆盖在此提升落地之前触发的任何门控。
-            await state.gate_controller.set_execution_context(
-                message.user_id, thread_id, per_exec_context
+            credential_name = pending.resume_kind.credential_name
+
+            submit_target = await resolve_extension_for_action(
+                guard.auth_manager,
+                guard.extension_manager,
+                guard.effect_adapter.tools(),
+                pending.action_name,
+                pending.parameters,
+                credential_name,
+                message.user_id,
             )
+            display_name = submit_target
 
-            # 将目录重新键控到引擎分配的 `thread_id` 上，
-            # 以便 `await_thread_outcome` 中的终端状态清理钩子
-            # 在规范键下找到条目。竞争窗口保护是上面的
-            # conversation_scope 管道；此 transfer 是记账部分。
-            if scope_uuid is not None:
-                await state.external_tool_catalog.transfer(scope_uuid, thread_id)
-
-            if attachment_notes:
-                await save_attachment_index_notes(
-                    state.store,
-                    project_id,
+            if guard.sse is not None:
+                guard.sse.broadcast_for_user(
                     message.user_id,
-                    thread_id,
-                    attachment_notes,
+                    AppEvent.GateResolved(
+                        request_id=str(pending.request_id),
+                        gate_name=pending.gate_name,
+                        tool_name=pending.action_name,
+                        resolution="credential_provided",
+                        message="凭证已收到。正在恢复执行。",
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
                 )
 
-            # 双重写入 v1 数据库，以便网关历史 API 显示消息。
-            # 在可用时使用限定范围的对话，回退到默认的助手对话。
-            # 外部通道范围（例如 `wecom:group:*`）不是 UUID，
-            # 因此它们被映射到稳定的 UUID 对话 ID，同时在
-            # `conversations.thread_id` 中保留原始范围。
-            if state.db is not None:
-                try:
-                    cid = await resolve_v1_conversation_for_message(state.db, message)
-                    await state.db.add_conversation_message(cid, "user", effective_content)
-                except Exception as e:
-                    logger.warning(
-                        "无法为用户消息持久化解析 v1 对话, message_id=%s: %s",
-                        message.id,
-                        e,
-                    )
-
-            logger.debug("engine v2: 线程已生成, thread_id=%s", thread_id)
-            outcome = await await_thread_outcome(
-                agent, state, message, conv_id, thread_id
+            submission = await submit_pending_auth_credential(
+                guard,
+                str(submit_target),
+                credential_name,
+                resolution.token,
+                message.user_id,
             )
 
-            # 删除每执行上下文。`PendingGate` 行（如果门控触发）
-            # 携带了解析器从此处开始所需的一切。
-            #
-            # BridgeOutcome.Pending 意味着请求处理程序在引擎仍在运行时
-            # 达到了截止时间（通常停在 `BridgeGateController::pause` 中等待批准）。
-            # 在此处清除上下文会使暂停的线程搁浅——其最终解析将对任何后续门控
-            # 调用 `pause()`，而没有注册的上下文，表现为静默的 `Cancelled`。
-            # 将清理推迟到监视线程完成并在引擎实际完成后清除的后台任务。
-            if (
-                    isinstance(outcome, BridgeOutcome)
-                    and outcome.is_pending()
-                    and await state.thread_manager.is_running(thread_id)
-            ):
-                spawn_deferred_context_cleanup(
-                    state.gate_controller,
-                    state.thread_manager,
-                    message.user_id,
-                    thread_id,
-                    conv_id,
-                )
-            else:
-                await state.gate_controller.clear_execution_context(
-                    message.user_id, thread_id, conv_id
-                )
-
-            return outcome
-
-    def spawn_deferred_context_cleanup(
-            gate_controller: BridgeGateController,
-            thread_manager: ThreadManager,
-            user_id: str,
-            thread_id: ThreadId,
-            conv_id: ConversationId,
-    ) -> None:
-        """
-    生成一个后台任务，等待线程完成或超时后清除执行上下文。
-
-    轮询频率：30 秒（廉价；一旦用户解析，线程完成时间为秒到分钟级）。
-    上限为一小时——远超限制任何 pause() 调用的 30 分钟 PendingGate 过期时间。
-    """
-
-        async def _cleanup():
-            poll_interval = 30  # 秒
-            max_wait = 60 * 60  # 秒
-            elapsed = 0
-
-            while True:
-                if not await thread_manager.is_running(thread_id):
-                    break
-                if elapsed >= max_wait:
-                    logger.warning(
-                        "延迟上下文清理达到一小时上限；仍将清除上下文, thread_id=%s",
-                        thread_id,
-                    )
-                    break
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-
-            await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
-            logger.debug(
-                "engine v2: 延迟上下文清理已运行, thread_id=%s",
-                thread_id,
-            )
-
-        asyncio.create_task(_cleanup())
-
-    GATEWAY_CHANNEL_NAME = "gateway"
-
-    def spawn_post_park_continuation(
-            state: EngineState,
-            channels: ChannelManager,
-            message: IncomingMessage,
-            conv_id: ConversationId,
-            thread_id: ThreadId,
-    ) -> None:
-        """
-    生成一个后台任务，在门控暂停后接管事件转发和最终响应投递。
-
-    当线程在内联门控处暂停时，前台返回 Pending，此后台任务负责：
-    - 转发线程事件到通道和 SSE
-    - 在线程完成时投递最终响应
-    - 清理执行上下文
-    """
-        thread_manager = state.thread_manager
-        conversation_manager = state.conversation_manager
-        effect_adapter = state.effect_adapter
-        store = state.store
-        gate_controller = state.gate_controller
-        pending_gates = state.pending_gates
-        sse = state.sse
-        db = state.db
-        auth_manager = state.auth_manager
-        extension_manager = state.extension_manager
-        user_id = message.user_id
-        channel_name = message.channel
-        metadata = message.metadata
-        tid_str = str(thread_id)
-
-        async def _continuation():
-            event_rx = thread_manager.subscribe_events()
-            max_wait = 60 * 60  # 一小时上限
-            elapsed = 0
-            poll_interval = 0.5  # 500 毫秒
-
-            # 事件转发循环
-            while True:
-                try:
-                    # 尝试接收事件
+            # 根据提交结果处理
+            if isinstance(submission, PendingAuthCredentialSubmission.Stored):
+                result = submission.result
+                if classify_configure_result(result) == ConfigureFlowOutcome.Ready:
                     try:
-                        event = await asyncio.wait_for(event_rx.recv(), timeout=poll_interval)
-                        if getattr(event, 'thread_id', None) == thread_id:
-                            await forward_event_to_channel(event, channels, channel_name, metadata)
-                            if sse is not None:
-                                skip_verbose = not sse.has_verbose_receivers()
-                                leak_detector = effect_adapter.safety().leak_detector()
-                                for app_event in thread_event_to_app_events(event, tid_str):
-                                    if skip_verbose and app_event.is_verbose_only():
-                                        continue
-                                    redact_code_executed_secrets(app_event, leak_detector)
-                                    sse.broadcast_for_user(user_id, app_event)
-                    except asyncio.TimeoutError:
-                        pass
-
-                    # 检查线程是否仍在运行
-                    if not await thread_manager.is_running(thread_id):
-                        break
-
-                    elapsed += poll_interval
-                    if elapsed >= max_wait:
-                        logger.warning(
-                            "暂停后继续任务达到一小时上限；放弃, thread_id=%s",
-                            thread_id,
+                        await agent.channels.send_status(
+                            message.channel,
+                            StatusUpdate.AuthCompleted(
+                                extension_name=display_name,
+                                success=True,
+                                message=format_auth_completed_resuming(result.message),
+                            ),
+                            message.metadata,
                         )
-                        await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
-                        return
-
-                except Exception:
-                    break
-
-            # 线程已完成。镜像 `await_thread_outcome` 的循环后
-            # outcome → BridgeOutcome 路径，但直接通过 channel + SSE 投递响应，
-            # 而不是通过桥接返回值返回（前台调用很久以前就返回了 Pending）。
-            try:
-                outcome = await thread_manager.join_thread(thread_id)
-            except Exception as e:
-                logger.debug(
-                    "暂停后继续: join_thread 失败, thread_id=%s, error=%s",
-                    thread_id,
-                    e,
-                )
-                await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
-                return
-
-            try:
-                await conversation_manager.record_thread_outcome(conv_id, thread_id, outcome)
-            except Exception as e:
-                logger.debug(
-                    "暂停后继续: record_thread_outcome 失败, thread_id=%s, error=%s",
-                    thread_id,
-                    e,
-                )
-
-            response_text: Optional[str] = None
-
-            if isinstance(outcome, ThreadOutcome.Completed):
-                if db is not None:
-                    await persist_v2_tool_calls(store, db, thread_id, message)
-                response_text = outcome.response
-
-            elif isinstance(outcome, ThreadOutcome.Stopped):
-                response_text = "线程已停止。"
-
-            elif isinstance(outcome, ThreadOutcome.MaxIterations):
-                response_text = "达到最大迭代次数但未完成。"
-
-            elif isinstance(outcome, ThreadOutcome.Failed):
-                sanitized = user_facing_thread_failure(outcome.error)
-                sse_will_deliver_to_user = sse is not None and channel_name == GATEWAY_CHANNEL_NAME
-                if sse is not None:
-                    sse.broadcast_for_user(
-                        user_id,
-                        AppEvent.Error(
-                            message=sanitized,
-                            thread_id=tid_str,
-                        ),
+                    except Exception:
+                        pass
+                elif classify_configure_result(result) == ConfigureFlowOutcome.PairingRequired:
+                    next_pending = await requeue_pairing_pending_gate(
+                        guard, pending, str(display_name)
                     )
-                bridge_outcome = bridge_outcome_for_failed_thread(
-                    outcome.error,
-                    outcome.debug_detail,
-                    user_id,
-                    channel_name,
-                    sse_will_deliver_to_user,
-                )
-                if isinstance(bridge_outcome, BridgeOutcome.Respond):
-                    response_text = bridge_outcome.text
-
-            elif isinstance(outcome, ThreadOutcome.GatePaused):
-                # 恢复后的引擎遇到了另一个（遗留）GatePaused 结果——
-                # 通常是 Authentication 或 External。构建新的待处理门控行
-                # 并显示提示；目前没有响应文本要投递。
-                tool = await effect_adapter.tools().get(outcome.action_name)
-                redacted_params = (
-                    redact_params(outcome.parameters, tool.sensitive_params())
-                    if tool
-                    else outcome.parameters
-                )
-
-                pending = PendingGate(
-                    request_id=uuid.uuid4(),
-                    gate_name=outcome.gate_name,
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    scope_thread_id=(
-                        ExternalThreadId.new(scope)
-                        if (scope := message.conversation_scope())
-                        else None
-                    ),
-                    conversation_id=conv_id,
-                    source_channel=channel_name,
-                    action_name=outcome.action_name,
-                    call_id=outcome.call_id,
-                    parameters=outcome.parameters,
-                    display_parameters=redacted_params,
-                    description=(
-                        f"工具 '{outcome.action_name}' 需要 {outcome.resume_kind.kind_name()}"
-                        f" (门控: {outcome.gate_name})"
-                    ),
-                    resume_kind=outcome.resume_kind,
-                    created_at=datetime.now(timezone.utc),
-                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-                    original_message=message.content,
-                    resume_output=outcome.resume_output,
-                    paused_lease=outcome.paused_lease,
-                    approval_already_granted=False,
-                )
-
-                try:
-                    await pending_gates.insert(pending)
-                except Exception as e:
+                    if guard.sse is not None:
+                        guard.sse.broadcast_for_user(
+                            message.user_id,
+                            OnboardingStateDto.pairing_required(
+                                display_name,
+                                str(next_pending.request_id),
+                                pending.effective_wire_thread_id(),
+                                result.message,
+                                result.instructions,
+                                result.onboarding,
+                            ),
+                        )
+                    return BridgeOutcome.Pending
+                elif classify_configure_result(result) in (
+                        ConfigureFlowOutcome.AuthRequired,
+                        ConfigureFlowOutcome.RetryAuth,
+                ):
+                    return await requeue_auth_pending_gate(
+                        agent,
+                        guard,
+                        message,
+                        pending,
+                        result.message,
+                        result.auth_url,
+                    )
+            elif isinstance(submission, PendingAuthCredentialSubmission.SkippedNoBackend):
+                if pending.resume_output is not None:
                     logger.debug(
-                        "暂停后继续: 存储后续待处理门控失败, gate=%s, error=%s",
-                        outcome.gate_name,
-                        e,
+                        "认证门控恢复：无后端，令牌已丢弃，因为 resume_output 已准备, user_id=%s, thread_id=%s, request_id=%s",
+                        message.user_id,
+                        pending.thread_id,
+                        pending.request_id,
                     )
                 else:
-                    extension_name = await resolve_auth_gate_extension_name(
+                    msg = "没有可用的认证管理器、扩展管理器或密钥存储来存储凭证。"
+                    await fail_waiting_thread(guard, message.user_id, pending.thread_id, msg)
+                    try:
+                        await agent.channels.send_status(
+                            message.channel,
+                            StatusUpdate.AuthCompleted(
+                                extension_name=display_name,
+                                success=False,
+                                message=msg,
+                            ),
+                            message.metadata,
+                        )
+                    except Exception:
+                        pass
+                    return BridgeOutcome.Respond(msg)
+
+            # 处理认证回退重放
+            if pending.action_name == "authentication_fallback" and pending.original_message is not None:
+                retry_content = pending.original_message
+                retry_msg = IncomingMessage(
+                    content=retry_content,
+                    channel=pending.source_channel,
+                    user_id=pending.user_id,
+                    metadata=message.metadata,
+                )
+                guard.release()
+                return await handle_with_engine_inner(agent, retry_msg, retry_content, 1)
+
+            # 使用 resume_output 或执行待处理操作
+            if pending.resume_output is not None:
+                resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(
+                    guard, pending
+                )
+                await guard.thread_manager.resume_thread(
+                    pending.thread_id,
+                    message.user_id,
+                    resumed_action_result_message(
+                        resolved_call_id,
+                        pending.action_name,
+                        pending.resume_output,
+                    ),
+                    None,
+                    resolved_call_id,
+                )
+            else:
+                return await execute_pending_gate_action(
+                    agent,
+                    guard,
+                    message,
+                    pending,
+                    pending.approval_already_granted,
+                    None,
+                )
+
+        elif isinstance(resolution, GateResolution.ExternalCallback):
+            if guard.sse is not None:
+                guard.sse.broadcast_for_user(
+                    message.user_id,
+                    AppEvent.GateResolved(
+                        request_id=str(pending.request_id),
+                        gate_name=pending.gate_name,
+                        tool_name=pending.action_name,
+                        resolution="external_callback",
+                        message="外部回调已收到。正在恢复执行。",
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
+                )
+
+            is_external_tool_callback = (
+                    isinstance(pending.resume_kind, ResumeKind.External)
+                    and is_external_tool_callback_id(pending.resume_kind.callback_id)
+            )
+
+            if is_external_tool_callback:
+                resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(
+                    guard, pending
+                )
+                synthesized_output = extract_external_tool_output(
+                    resolution.payload, resolved_call_id
+                )
+                raw_rendered = json.dumps(synthesized_output, indent=2, ensure_ascii=False)
+                sanitized = guard.effect_adapter.safety().sanitize_tool_output(
+                    pending.action_name, raw_rendered
+                )
+                await guard.thread_manager.resume_thread(
+                    pending.thread_id,
+                    message.user_id,
+                    ThreadMessage.action_result(
+                        resolved_call_id,
+                        pending.action_name,
+                        sanitized.content,
+                    ),
+                    None,
+                    resolved_call_id,
+                )
+            elif pending.resume_output is not None:
+                resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(
+                    guard, pending
+                )
+                await guard.thread_manager.resume_thread(
+                    pending.thread_id,
+                    message.user_id,
+                    resumed_action_result_message(
+                        resolved_call_id,
+                        pending.action_name,
+                        pending.resume_output,
+                    ),
+                    None,
+                    resolved_call_id,
+                )
+            else:
+                return await execute_pending_gate_action(
+                    agent,
+                    guard,
+                    message,
+                    pending,
+                    pending.approval_already_granted,
+                    None,
+                )
+
+        return await await_thread_outcome(
+            agent,
+            guard,
+            message,
+            pending.conversation_id,
+            pending.thread_id,
+        )
+
+    async def handle_interrupt(
+            agent: Agent,
+            message: IncomingMessage,
+    ) -> BridgeOutcome:
+        """处理中断提交——停止活动引擎线程。"""
+        await init_engine(agent)
+
+        lock = ENGINE_STATE.get()
+        if lock is None:
+            raise engine_err("init", "引擎状态未初始化")
+        guard = await lock.read()
+        if guard is None:
+            raise engine_err("init", "引擎状态为空")
+
+        conv_id = await guard.conversation_manager.get_or_create_conversation(
+            message.channel, message.user_id
+        )
+
+        conv = await guard.conversation_manager.get_conversation(conv_id)
+        active_threads = conv.active_threads if conv is not None else []
+
+        stopped = 0
+        for tid in active_threads:
+            if await guard.thread_manager.is_running(tid):
+                try:
+                    await guard.thread_manager.stop_thread(tid, message.user_id)
+                    stopped += 1
+                except Exception as e:
+                    logger.debug("engine v2: 停止线程失败, thread_id=%s, error=%s", tid, e)
+
+        if stopped > 0:
+            logger.debug("engine v2: 中断了 %d 个运行中的线程", stopped)
+            return BridgeOutcome.Respond("已中断。")
+        else:
+            return BridgeOutcome.Respond("没有可中断的内容。")
+
+    async def handle_new_thread(
+            agent: Agent,
+            message: IncomingMessage,
+    ) -> BridgeOutcome:
+        """处理新线程提交——清除对话以重新开始。"""
+        await clear_engine_conversation(agent, message)
+        return BridgeOutcome.Respond("已开始新对话。")
+
+    async def handle_clear(
+            agent: Agent,
+            message: IncomingMessage,
+    ) -> BridgeOutcome:
+        """处理清除提交——停止线程并重置对话。"""
+        await clear_engine_conversation(agent, message)
+        return BridgeOutcome.Respond("对话已清除。")
+
+    async def clear_engine_conversation(
+            agent: Agent,
+            message: IncomingMessage,
+    ) -> None:
+        """停止所有活动线程并清除对话条目。"""
+        await init_engine(agent)
+
+        lock = ENGINE_STATE.get()
+        if lock is None:
+            raise engine_err("init", "引擎状态未初始化")
+        guard = await lock.read()
+        if guard is None:
+            raise engine_err("init", "引擎状态为空")
+
+        conv_id = await guard.conversation_manager.get_or_create_conversation(
+            message.channel, message.user_id
+        )
+
+        # 先停止所有活动线程
+        conv = await guard.conversation_manager.get_conversation(conv_id)
+        if conv is not None:
+            for tid in conv.active_threads:
+                if await guard.thread_manager.is_running(tid):
+                    try:
+                        await guard.thread_manager.stop_thread(tid, message.user_id)
+                    except Exception:
+                        pass
+                # 丢弃此线程的所有待处理门控，无论用户是谁，
+                # 防止产生永远无法解析的孤立门控 (#2323)
+                await guard.pending_gates.discard_for_thread(tid)
+
+        # 清除此用户的进行中 OAuth 流 (#3320)
+        if agent.deps.extension_manager is not None:
+            flows = agent.deps.extension_manager.pending_oauth_flows()
+            async with flows.write() as flow_dict:
+                before = len(flow_dict)
+                flow_dict.retain(lambda state, flow: flow.user_id != message.user_id)
+                removed = before - len(flow_dict)
+                if removed > 0:
+                    logger.debug(
+                        "engine v2: /clear 时清除了 %d 个待处理 OAuth 流, user_id=%s",
+                        removed,
+                        message.user_id,
+                    )
+
+        # 清除对话条目和活动线程列表
+        await guard.conversation_manager.clear_conversation(conv_id, message.user_id)
+
+        logger.debug(
+            "engine v2: 对话已清除, user_id=%s, conversation_id=%s",
+            message.user_id,
+            conv_id,
+        )
+
+    async def has_pending_auth(user_id: str) -> bool:
+        """检查用户是否有待处理的认证门控。"""
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return False
+        try:
+            guard = await lock.read()
+        except Exception:
+            return False
+        if guard is None:
+            return False
+
+        for gate in await guard.pending_gates.list_for_user(user_id):
+            if isinstance(gate.resume_kind, ResumeKind.Authentication):
+                return True
+        return False
+
+    async def clear_engine_pending_auth(
+            user_id: str,
+            thread_id: Optional[str],
+    ) -> None:
+        """
+    在 v2 引擎中清除用户的待处理认证状态。
+
+    从网关端认证清理路径调用，以确保在浏览器放弃提示或
+    OAuth 回调在正常聊天消息路径之外完成时清除待处理认证门控。
+    """
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return
+        guard = await lock.read()
+        if guard is None:
+            return
+
+        if thread_id is not None:
+            resolution = await resolve_pending_gate_for_user(
+                guard.pending_gates, user_id, thread_id
+            )
+            if isinstance(resolution, PendingGateResolution.Resolved):
+                gate = resolution.gate
+                if isinstance(gate.resume_kind, ResumeKind.Authentication):
+                    await guard.pending_gates.discard(gate.key())
+            return
+
+        for gate in await guard.pending_gates.list_for_user(user_id):
+            if isinstance(gate.resume_kind, ResumeKind.Authentication):
+                await guard.pending_gates.discard(gate.key())
+
+    async def clear_engine_pending_auth_for_credential(
+            user_id: str,
+            credential_name: str,
+    ) -> None:
+        """按凭证名称清除用户的待处理认证门控。"""
+        cred = CredentialName.new(credential_name)
+        if cred is None:
+            return
+
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return
+        guard = await lock.read()
+        if guard is None:
+            return
+
+        for gate in await guard.pending_gates.list_for_user(user_id):
+            if (
+                    isinstance(gate.resume_kind, ResumeKind.Authentication)
+                    and gate.resume_kind.credential_name == cred
+            ):
+                await guard.pending_gates.discard(gate.key())
+
+    async def discard_engine_pending_auth_request(
+            user_id: str,
+            request_id: uuid.UUID,
+            thread_id: Optional[str],
+    ) -> bool:
+        """
+    丢弃匹配 request_id 和可选 thread_id 的待处理认证门控。
+
+    返回 True 表示找到并丢弃了门控，False 表示未找到匹配的门控。
+    """
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return False
+        guard = await lock.read()
+        if guard is None:
+            return False
+
+        hinted_uuid = parse_scope_uuid(thread_id)
+        hinted_scope = thread_id
+
+        matching_gate = None
+        for gate in await guard.pending_gates.list_for_user(user_id):
+            if gate.request_id != request_id:
+                continue
+            if not isinstance(gate.resume_kind, ResumeKind.Authentication):
+                continue
+
+            # 检查 thread_id 提示匹配
+            if hinted_scope is None:
+                matching_gate = gate
+                break
+            if gate.scope_thread_id == hinted_scope:
+                matching_gate = gate
+                break
+            if hinted_uuid is not None and (
+                    gate.thread_id == hinted_uuid or gate.conversation_id == hinted_uuid
+            ):
+                matching_gate = gate
+                break
+
+        if matching_gate is None:
+            return False
+
+        try:
+            await guard.pending_gates.discard(matching_gate.key())
+            return True
+        except Exception:
+            return False
+
+    async def transition_engine_pending_auth_request_to_pairing(
+            user_id: str,
+            request_id: uuid.UUID,
+            thread_id: Optional[str],
+            extension_name: str,
+    ) -> Optional[str]:
+        """
+    将待处理认证门控转换为配对门控。
+
+    返回新配对门控的 request_id，如果未找到匹配的门控则返回 None。
+    """
+        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+        if lock is None:
+            return None
+        guard = await lock.read()
+        if guard is None:
+            return None
+
+        hinted_uuid = parse_scope_uuid(thread_id)
+        hinted_scope = thread_id
+
+        matching_gate = None
+        for gate in await guard.pending_gates.list_for_user(user_id):
+            if gate.request_id != request_id:
+                continue
+            if not isinstance(gate.resume_kind, ResumeKind.Authentication):
+                continue
+
+            # 检查 thread_id 提示匹配
+            if hinted_scope is None:
+                matching_gate = gate
+                break
+            if gate.scope_thread_id == hinted_scope:
+                matching_gate = gate
+                break
+            if hinted_uuid is not None and (
+                    gate.thread_id == hinted_uuid or gate.conversation_id == hinted_uuid
+            ):
+                matching_gate = gate
+                break
+
+        if matching_gate is None:
+            return None
+
+        await guard.pending_gates.discard(matching_gate.key())
+
+        next_pending = pairing_pending_gate_from_auth(matching_gate, extension_name)
+        await guard.pending_gates.insert(next_pending)
+
+        return str(next_pending.request_id)
+
+
+async def handle_with_engine(
+        agent: Agent,
+        message: IncomingMessage,
+        content: str,
+) -> BridgeOutcome:
+    """
+    通过引擎 v2 管道处理用户消息。
+    :param agent: 处理消息的Agent
+    :param message: 要处理的用户消息
+    :param content: 解析的文本消息
+    :return:
+    """
+    return await handle_with_engine_inner(agent, message, content, 0)
+
+
+# 认证重试递归的最大深度（存储凭证 → 重试原始消息）
+MAX_AUTH_RETRY_DEPTH: int = 2
+
+
+async def handle_with_engine_inner(
+        agent: Agent,
+        message: IncomingMessage,
+        content: str,
+        depth: int,
+) -> BridgeOutcome:
+    """通过引擎 v2 管道处理用户消息的内部实现。"""
+
+    # 防止认证重试无限递归，最大深度为 2
+    if depth > MAX_AUTH_RETRY_DEPTH:
+        return BridgeRespondOutcome(
+            "凭证已存储，但认证重试次数过多。请重新发送您的消息。"
+        )
+
+    # --------Step1: 确保引擎已初始化--------
+    await init_engine(agent)
+
+    lock = ENGINE_STATE.get()
+    if lock is None:
+        raise engine_err("init", "引擎状态未初始化")
+
+    async with lock.read() as guard:
+        state = guard
+        if state is None:
+            raise engine_err("init", "引擎状态为空")
+
+        logger.debug(
+            "engine v2: 正在处理消息, user_id=%s, channel=%s",
+            message.user_id,
+            message.channel,
+        )
+
+        thread_scope = message.conversation_scope
+        # 解析引擎线程 ID
+        scoped_thread_id = parse_engine_thread_id(thread_scope)
+
+        # --------Step2: 检查是否有待处理的gate，并按优先级处理--------
+        # --------Step2.1: 解析用户的待处理门控--------
+        resolution = await resolve_pending_gate_for_user(
+            state.pending_gates, message.user_id, thread_scope
+        )
+        # --------Step2.2: 处理gate--------
+        match resolution:
+            case PendingGateResolutionResolved(gate):
+                # 用户必须提供凭证（令牌、API 密钥、OAuth 流）
+                if gate.resume_kind == ResumeKind.Authentication:
+                    request_id = gate.request_id
+                    if content.strip() == "" or content.strip().lower() == "cancel":
+                        gate_resolution = GateResolution.Cancelled
+                    else:
+                        gate_resolution = GateResolution.CredentialProvided(
+                            token=content.strip()
+                        )
+                    # 释放读取锁后再调用 resolve_gate
+                    guard.release()
+                    return await resolve_gate(
+                        agent, message, gate.thread_id, request_id, gate_resolution
+                    )
+
+                # 用户必须批准或拒绝工具调用
+                elif gate.resume_kind == ResumeKind.Approval:
+                    pending = gate.clone()
+                    # 从状态中克隆 SSE arc 和工具注册表，
+                    # 然后在等待 broadcast + channel I/O 之前释放引擎读取锁。
+                    # 上面的认证分支执行相同操作，`notify_pending_gate` 的签名
+                    # 接受 owned Option<Arc<SseManager>>，正是为了让此
+                    # 终端返回分支可以释放锁。`notify_pending_gate` 需要
+                    # 工具注册表句柄来解析认证门控显示名称，而无需持有
+                    # 引擎状态锁。
+                    sse = state.sse.clone()
+                    tools = state.effect_adapter.tools()
+                    auth_manager = state.auth_manager.clone()
+                    extension_manager = state.extension_manager.clone()
+                    guard.release()
+                    return await notify_pending_gate(
+                        agent,
+                        sse,
+                        tools,
                         auth_manager,
                         extension_manager,
-                        effect_adapter.tools(),
+                        message,
                         pending,
                     )
 
-                    status_update = None
-                    if isinstance(pending.resume_kind, ResumeKind.Approval):
-                        status_update = StatusUpdate.ApprovalNeeded(
-                            request_id=str(pending.request_id),
-                            tool_name=pending.action_name,
-                            description=pending.description,
-                            parameters=(
-                                pending.display_parameters
-                                if pending.display_parameters is not None
-                                else pending.parameters
-                            ),
-                            allow_always=pending.resume_kind.allow_always,
-                        )
-                    elif isinstance(pending.resume_kind, ResumeKind.Authentication):
-                        status_update = StatusUpdate.AuthRequired(
-                            extension_name=(
-                                extension_name
-                                if extension_name is not None
-                                else ExtensionName.from_trusted(pending.action_name)
-                            ),
-                            instructions=pending.resume_kind.instructions,
-                            auth_url=pending.resume_kind.auth_url,
-                            setup_url=None,
-                            request_id=str(pending.request_id),
-                        )
-
-                    if status_update is not None:
-                        try:
-                            await channels.send_status(channel_name, status_update, metadata)
-                        except Exception:
-                            pass
-
-            # 投递最终响应
-            if response_text is not None:
-                if sse is not None:
-                    sse.broadcast_for_user(
-                        user_id,
-                        AppEvent.Response(
-                            content=response_text,
-                            thread_id=tid_str,
-                        ),
-                    )
-                try:
-                    await channels.respond(message, OutgoingResponse.text(response_text))
-                except Exception as e:
-                    logger.debug(
-                        "暂停后继续: 通道响应失败, channel=%s, error=%s",
-                        channel_name,
-                        e,
-                    )
-                try:
-                    await channels.send_status(
-                        channel_name,
-                        StatusUpdate.Status("完成"),
-                        metadata,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "暂停后继续: 完成状态发送失败, channel=%s, error=%s",
-                        channel_name,
-                        e,
-                    )
-                if db is not None:
-                    try:
-                        cid = await resolve_v1_conversation_for_message(db, message)
-                        await db.add_conversation_message(cid, "assistant", response_text)
-                    except Exception as e:
-                        logger.warning(
-                            "暂停后继续: 解析 v1 对话以持久化助手响应失败, thread_id=%s: %s",
-                            thread_id,
-                            e,
-                        )
-
-            await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
-            logger.debug(
-                "engine v2: 暂停后继续任务已运行, thread_id=%s",
-                thread_id,
-            )
-
-        asyncio.create_task(_continuation())
-
-    async def fire_event_missions_for_message(
-            state: EngineState,
-            message: IncomingMessage,
-            content: str,
-    ) -> None:
-        """
-    触发其模式匹配入站消息的活动 OnEvent 任务。
-
-    构建包含消息元数据的负载，任务线程可以通过 `state["trigger_payload"]` 读取。
-    跳过空内容和系统通道消息。错误以 debug 级别记录——
-    此处的失败绝不能阻塞面向用户的消息流。
-    """
-        trimmed = content.strip()
-        if not trimmed:
-            return
-
-        # 递归守卫。将代理自己的出站文本作为入站事件回显的通道适配器
-        # 必须设置 is_agent_broadcast（Slack/Discord 风格）；
-        # 作为任务触发副作用产生的消息必须设置 triggering_mission_id
-        # （跨不同任务的链式递归）。任一标志意味着：不要重新触发。
-        if message.is_agent_broadcast:
-            logger.debug(
-                "engine v2: 跳过任务触发——消息是代理广播回显, channel=%s",
-                message.channel,
-            )
-            return
-        if message.triggering_mission_id is not None:
-            logger.debug(
-                "engine v2: 跳过任务触发——消息源自任务, channel=%s, upstream_mission_id=%s",
-                message.channel,
-                message.triggering_mission_id,
-            )
-            return
-
-        mission_manager = await state.effect_adapter.mission_manager()
-        if mission_manager is None:
-            return
-
-        payload = {
-            "channel": message.channel,
-            "user_id": message.user_id,
-            "content": content,
-            "metadata": message.metadata,
-        }
-
-        try:
-            spawned = await mission_manager.fire_on_message_event(
-                message.channel, content, message.user_id, payload
-            )
-            if spawned:
-                logger.debug(
-                    "engine v2: 从入站消息触发了 %d 个 OnEvent 任务, channel=%s, user_id=%s",
-                    len(spawned),
-                    message.channel,
-                    message.user_id,
+            case PendingGateResolutionAmbiguous():
+                return BridgeRespondOutcome(
+                    text="多个待处理的批准或认证提示正在等待。请从原始线程回复。"
                 )
-        except Exception as error:
-            logger.debug(
-                "engine v2: fire_on_message_event 失败；继续正常处理, channel=%s, error=%s",
-                message.channel,
-                error,
+
+        # --------Step3: 孤儿线程检查--------
+        # 检查线程是否在等待批准或认证但状态丢失，如果是则标记为失败
+        if scoped_thread_id is not None:
+            orphaned = await fail_orphaned_waiting_thread_if_needed(
+                state, message.user_id, scoped_thread_id
+            )
+            if orphaned:
+                return BridgeRespondOutcome(
+                    text="此线程正在等待批准或认证，但该待处理状态已丢失。"
+                         "线程已标记为失败；请重新发送您的请求。"
+                )
+
+        # --------Step4: 对输入内容进行安全验证--------
+
+        # 安全检查——在线程操作 ::process_user_input 中镜像 v1 管道，
+        # 确保两条引擎路径执行相同的入站保护措施。
+        # 当消息带有附件时，空的文本正文是合法的（附件即为有效载荷）；
+        # 跳过验证器对空输入的拒绝，但仍对文本应用长度/策略检查。
+        trimmed_content = content.strip()
+        skip_empty_check = trimmed_content == "" and len(message.attachments) > 0
+
+        # --------Step4.1: 验证content是否合法--------
+        if not skip_empty_check:
+
+            validation = agent.safety().validate_input(content)
+            if not validation.is_valid:
+                details = "; ".join(
+                    f"{e.field}: {e.message}" for e in validation.errors
+                )
+                return BridgeOutcome.Respond(
+                    f"输入被安全验证拒绝: {details}"
+                )
+
+        # --------Step4.2: 验证content否违反任何策略规则--------
+        violations = agent.safety().check_policy(content)
+        if any(rule.action == PolicyAction.Block for rule in violations):
+            return BridgeOutcome.Respond(
+                "输入被安全策略拒绝。"
             )
 
-    async def await_thread_outcome(
-            agent: Agent,
-            state: EngineState,
-            message: IncomingMessage,
-            conv_id: ConversationId,
-            thread_id: ThreadId,
-    ) -> BridgeOutcome:
-        """
-    等待线程完成并返回桥接结果。
+        # --------Step4.3: 输入中是否包含泄漏的密钥--------
 
-    处理事件转发、内联门控检测、超时和所有线程结果类型。
+        # 扫描入站消息中的密钥（API 密钥、令牌）。
+        # 在此处捕获它们可以防止大语言模型将其回显，
+        # 否则会触发外发泄漏检测器并造成错误循环。
+        warning = agent.safety().scan_inbound_for_secrets(content)
+        if warning is not None:
+            logger.warning(
+                "engine v2: 入站消息被阻止——包含泄漏的密钥, user_id=%s, channel=%s",
+                message.user_id,
+                message.channel,
+            )
+            return BridgeOutcome.Respond(warning)
+
+        # 解析每用户项目（如果需要则创建）
+        project_id = await resolve_user_project(
+            state.store, message.user_id, state.default_project_id
+        )
+
+        # --------Step5: 处理消息附件--------
+
+        persisted_attachments = list(message.attachments)
+        # --------Step5.1: 保存附件内容--------
+        attachment_notes = await persist_project_attachments(
+            state.project_root,
+            message,
+            project_id,
+            persisted_attachments,
+        )
+
+        # --------Step5.2: 将附件内容处理为标准化信息--------
+
+        # 引擎 v2 线程目前仅支持文本，因此附件必须在路由到引擎之前合并到有效的用户内容中。
+        # 这样可以在引擎线程和双写的网关历史记录中保留提取的文档文本、项目本地文件路径以及附件元数据。
+        augmented = augment_with_attachments(content, persisted_attachments)
+        effective_content = augmented.text if augmented is not None else content
+
+        # --------Step6: 触发OnEvent 任务--------
+
+        # 触发所有处于活动状态的 OnEvent 任务，其模式（以及可选的频道过滤器）与此入站消息匹配。
+        # 此处触发的任务是消息的副作用——独立于下方生成的常规对话线程，且与之并行执行。
+        # 错误会被记录，但绝不会阻塞面向用户的消息处理。
+        #
+        # 此路径不会触及 v1 创建的例程：它们存在于 v1 例程存储中，并由后台的 v1 RoutineEngine 触发。
+        # 通过 routine_create 别名创建的任务存在于引擎存储中，并在此处触发。
+        await fire_event_missions_for_message(state, message, effective_content)
+
+        # 向通道发送"思考中..."状态
+        try:
+            await agent.channels.send_status(
+                message.channel,
+                StatusUpdate.Thinking("处理中..."),
+                message.metadata,
+            )
+        except Exception:
+            pass
+
+        # 重置每步调用计数器，以便每个线程从头开始
+        state.effect_adapter.reset_call_count()
+
+        # --------Step7: 创建对话--------
+
+        # --------Step7.1: 限定引擎对话的范围--------
+        # 按（频道、用户、线程）限定引擎对话的范围。
+        # 当前端发送 thread_id 时（用户创建了新对话），将其作为频道键的一部分，
+        # 以便每个 v1 线程映射到独立的引擎对话。
+        # 若不这样做，所有线程将共享同一个对话，消息会出现在错误的位置。
+        scope = message.conversation_scope
+        channel_key = (
+            f"{message.channel}:{scope}" if scope is not None else message.channel
+        )
+
+        # --------Step7.2: 创建对话--------
+        # 获取或创建频道+用户对对应的对话。
+        conv_id = await state.conversation_manager.get_or_create_conversation(
+            channel_key, message.user_id
+        )
+
+        # 在将频道提供的时区传递给引擎之前进行验证。
+        # ValidTimezone::parse 会拒绝空字符串/无效字符串；
+        # 我们发送规范的 IANA 时区名称（而非原始输入），以便下游消费者看到一个已知正确的值。
+        # 必须在 spawn 时*传入*——线程启动后设置元数据对于首轮对话的内存执行器是不可见的。
+        validated_tz = ValidTimezone.parse(message.timezone) if message.timezone else None
+
+        # --------Step8: 规则检测显式执行意图--------
+        # 检测执行意图并相应地配置义务
+        thread_config = ThreadConfig.default()
+        if user_signals_execution_intent(content):
+            thread_config.require_action_attempt = True
+
+        # --------Step9: 处理首轮对话丢失调用方工具的问题--------
+
+        # 将对话范围（可解析为 Uuid）写入线程的 `initial_metadata` 中。
+        # 引擎会将其读回到 `ThreadExecutionContext.conversation_scope` 中，
+        # 这使得桥接器的 `EffectBridgeAdapter` 能够通过引擎 `thread_id` 或调用方范围来解析每个对话的状态
+        # （目前为调用方提供的外部工具目录）。
+        # 若不这样做，在 spawn 后立即启动的执行器任务将与桥接器 spawn 后的 `transfer` 产生竞态条件，
+        # 从而导致首轮对话丢失调用方工具。
+        scope_uuid = parse_engine_thread_id(scope)
+        extra_metadata = None
+        if scope_uuid is not None:
+            extra_metadata = {
+                "conversation_scope": str(scope_uuid),
+            }
+
+        # --------Step10: 为线程绑定每次执行的上下文--------
+
+        # 在引擎生成线程之前预先绑定每次执行的上下文。
+        # `handle_user_message` 在内部分配并启动引擎任务；
+        # 如果快速工具门控在 `set_execution_context` 落地之前触发，
+        # 则控制器的 `pause()` 将找不到对应条目并静默取消门控。
+        # 预执行插槽以 user_id 为键，上游的每个对话锁确保每个对话最多只有一个桥接轮次正在执行。
+        scope_thread_id = ExternalThreadId.new(scope) if scope else None
+        per_exec_context = PerExecutionContext(
+            conversation_id=conv_id,
+            source_channel=message.channel,
+            scope_thread_id=scope_thread_id,
+            channel_metadata=message.metadata,
+            original_message=message.content,
+        )
+        await state.gate_controller.set_pre_execution_context(
+            message.user_id, conv_id, per_exec_context
+        )
+
+        # --------Step11: 处理用户消息--------
+
+        # 处理消息——生成新线程或注入到活动线程中。
+        # 出错时我们必须清除刚刚安装的预执行插槽：
+        # 若不这样做，失败的 `handle_user_message`（在分配任何 thread_id 之前引擎生成/注入失败）
+        # 会留下一个以 user_id 为键的过时条目，
+        # 这将导致同一用户的下一个门控提示被错误路由。
+        try:
+            thread_id = await state.conversation_manager.handle_user_message(
+                conv_id,
+                effective_content,
+                project_id,
+                message.user_id,
+                thread_config,
+                validated_tz.name() if validated_tz else None,
+                extra_metadata,
+            )
+        except Exception as e:
+            await state.gate_controller.clear_pre_execution_context(
+                message.user_id, conv_id
+            )
+            raise engine_err("线程错误", e)
+
+        # 将预执行条目提升为以（用户、线程）为键的条目。
+        # 此后，来自此线程的门控将首先落在线线程键的条目上；
+        # 每用户回退覆盖在此提升落地之前触发的任何门控。
+        await state.gate_controller.set_execution_context(
+            message.user_id, thread_id, per_exec_context
+        )
+
+        # 将目录重新键控到引擎分配的 `thread_id` 上，
+        # 以便 `await_thread_outcome` 中的终端状态清理钩子
+        # 在规范键下找到条目。竞争窗口保护是上面的
+        # conversation_scope 管道；此 transfer 是记账部分。
+        if scope_uuid is not None:
+            await state.external_tool_catalog.transfer(scope_uuid, thread_id)
+
+        if attachment_notes:
+            await save_attachment_index_notes(
+                state.store,
+                project_id,
+                message.user_id,
+                thread_id,
+                attachment_notes,
+            )
+
+        # 双重写入 v1 数据库，以便网关历史 API 显示消息。
+        # 在可用时使用限定范围的对话，回退到默认的助手对话。
+        # 外部通道范围（例如 `wecom:group:*`）不是 UUID，
+        # 因此它们被映射到稳定的 UUID 对话 ID，同时在
+        # `conversations.thread_id` 中保留原始范围。
+        if state.db is not None:
+            try:
+                cid = await resolve_v1_conversation_for_message(state.db, message)
+                await state.db.add_conversation_message(cid, "user", effective_content)
+            except Exception as e:
+                logger.warning(
+                    "无法为用户消息持久化解析 v1 对话, message_id=%s: %s",
+                    message.id,
+                    e,
+                )
+
+        logger.debug("engine v2: 线程已生成, thread_id=%s", thread_id)
+        outcome = await await_thread_outcome(
+            agent, state, message, conv_id, thread_id
+        )
+
+        # 删除每执行上下文。`PendingGate` 行（如果门控触发）
+        # 携带了解析器从此处开始所需的一切。
+        #
+        # BridgeOutcome.Pending 意味着请求处理程序在引擎仍在运行时
+        # 达到了截止时间（通常停在 `BridgeGateController::pause` 中等待批准）。
+        # 在此处清除上下文会使暂停的线程搁浅——其最终解析将对任何后续门控
+        # 调用 `pause()`，而没有注册的上下文，表现为静默的 `Cancelled`。
+        # 将清理推迟到监视线程完成并在引擎实际完成后清除的后台任务。
+        if (
+                isinstance(outcome, BridgeOutcome)
+                and outcome.is_pending()
+                and await state.thread_manager.is_running(thread_id)
+        ):
+            spawn_deferred_context_cleanup(
+                state.gate_controller,
+                state.thread_manager,
+                message.user_id,
+                thread_id,
+                conv_id,
+            )
+        else:
+            await state.gate_controller.clear_execution_context(
+                message.user_id, thread_id, conv_id
+            )
+
+        return outcome
+
+
+def spawn_deferred_context_cleanup(
+        gate_controller: BridgeGateController,
+        thread_manager: ThreadManager,
+        user_id: str,
+        thread_id: ThreadId,
+        conv_id: ConversationId,
+) -> None:
     """
-        event_rx = state.thread_manager.subscribe_events()
-        channels = agent.channels
-        channel_name = message.channel
-        metadata = message.metadata
-        sse = state.sse
-        tid_str = str(thread_id)
+生成一个后台任务，等待线程完成或超时后清除执行上下文。
 
-        # 安全超时：如果线程在 5 分钟内未完成，则跳出以避免永远挂起用户会话
-        # （例如，在拒绝批准后线程无法恢复）
-        deadline = asyncio.get_event_loop().time() + 300
-        timed_out = False
-        gate_parked = False
-        pending_key = PendingGateKey(user_id=message.user_id, thread_id=thread_id)
+轮询频率：30 秒（廉价；一旦用户解析，线程完成时间为秒到分钟级）。
+上限为一小时——远超限制任何 pause() 调用的 30 分钟 PendingGate 过期时间。
+"""
+
+    async def _cleanup():
+        poll_interval = 30  # 秒
+        max_wait = 60 * 60  # 秒
+        elapsed = 0
 
         while True:
+            if not await thread_manager.is_running(thread_id):
+                break
+            if elapsed >= max_wait:
+                logger.warning(
+                    "延迟上下文清理达到一小时上限；仍将清除上下文, thread_id=%s",
+                    thread_id,
+                )
+                break
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
+        logger.debug(
+            "engine v2: 延迟上下文清理已运行, thread_id=%s",
+            thread_id,
+        )
+
+    asyncio.create_task(_cleanup())
+
+
+GATEWAY_CHANNEL_NAME = "gateway"
+
+
+def spawn_post_park_continuation(
+        state: EngineState,
+        channels: ChannelManager,
+        message: IncomingMessage,
+        conv_id: ConversationId,
+        thread_id: ThreadId,
+) -> None:
+    """
+生成一个后台任务，在门控暂停后接管事件转发和最终响应投递。
+
+当线程在内联门控处暂停时，前台返回 Pending，此后台任务负责：
+- 转发线程事件到通道和 SSE
+- 在线程完成时投递最终响应
+- 清理执行上下文
+"""
+    thread_manager = state.thread_manager
+    conversation_manager = state.conversation_manager
+    effect_adapter = state.effect_adapter
+    store = state.store
+    gate_controller = state.gate_controller
+    pending_gates = state.pending_gates
+    sse = state.sse
+    db = state.db
+    auth_manager = state.auth_manager
+    extension_manager = state.extension_manager
+    user_id = message.user_id
+    channel_name = message.channel
+    metadata = message.metadata
+    tid_str = str(thread_id)
+
+    async def _continuation():
+        event_rx = thread_manager.subscribe_events()
+        max_wait = 60 * 60  # 一小时上限
+        elapsed = 0
+        poll_interval = 0.5  # 500 毫秒
+
+        # 事件转发循环
+        while True:
             try:
-                event = await asyncio.wait_for(event_rx.recv(), timeout=0.5)
-                if getattr(event, 'thread_id', None) == thread_id:
-                    await forward_event_to_channel(event, channels, channel_name, metadata)
-                    if sse is not None:
-                        skip_verbose = not sse.has_verbose_receivers()
-                        leak_detector = state.effect_adapter.safety().leak_detector()
-                        for app_event in thread_event_to_app_events(event, tid_str):
-                            if skip_verbose and app_event.is_verbose_only():
-                                continue
-                            # 引擎 crate 原始发出 CodeExecuted——它不依赖 `ironclaw_safety`。
-                            # 在此处的桥接边界，在事件到达任何 SSE 订阅者之前，
-                            # 清除 code/stdout/return_value 负载中的密钥
-                            # （bearer 令牌、API 密钥等）。
-                            redact_code_executed_secrets(app_event, leak_detector)
-                            sse.broadcast_for_user(message.user_id, app_event)
-            except asyncio.TimeoutError:
-                pass
+                # 尝试接收事件
+                try:
+                    event = await asyncio.wait_for(event_rx.recv(), timeout=poll_interval)
+                    if getattr(event, 'thread_id', None) == thread_id:
+                        await forward_event_to_channel(event, channels, channel_name, metadata)
+                        if sse is not None:
+                            skip_verbose = not sse.has_verbose_receivers()
+                            leak_detector = effect_adapter.safety().leak_detector()
+                            for app_event in thread_event_to_app_events(event, tid_str):
+                                if skip_verbose and app_event.is_verbose_only():
+                                    continue
+                                redact_code_executed_secrets(app_event, leak_detector)
+                                sse.broadcast_for_user(user_id, app_event)
+                except asyncio.TimeoutError:
+                    pass
+
+                # 检查线程是否仍在运行
+                if not await thread_manager.is_running(thread_id):
+                    break
+
+                elapsed += poll_interval
+                if elapsed >= max_wait:
+                    logger.warning(
+                        "暂停后继续任务达到一小时上限；放弃, thread_id=%s",
+                        thread_id,
+                    )
+                    await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
+                    return
+
             except Exception:
                 break
 
-            # 检查线程是否仍在运行
-            if not await state.thread_manager.is_running(thread_id):
-                break
-
-            # 内联门控检测：如果在线程仍在运行时已为 (user, thread) 注册了待处理门控，
-            # 则引擎在 `BridgeGateController::pause` 内暂停等待用户解析。
-            # 在此处持有 `handle_message` 会使每用户代理循环串行化在暂停之后——
-            # 排队在 `msg_tx` 中的第二个线程的 `UserInput` 无法分派，
-            # 直到用户解析此门控或下面的 5 分钟截止时间触发。
-            # 移交给后台继续任务（保留事件转发 + 最终响应投递）
-            # 并显示为 `Pending`，以便代理循环解除阻塞。
-            if await state.pending_gates.peek(pending_key) is not None:
-                gate_parked = True
-                break
-
-            if asyncio.get_event_loop().time() >= deadline:
-                logger.warning(
-                    "await_thread_outcome 在 5 分钟后超时——跳出以避免挂起, thread_id=%s",
-                    thread_id,
-                )
-                timed_out = True
-                break
-
-        # 如果我们因为线程在内联门控处暂停而退出，将生命周期的其余部分
-        # （事件转发 + 完成时的最终响应广播 + 每执行上下文清理）
-        # 移交给后台任务并返回 `Pending`。join_thread 不能在前台任务上运行，
-        # 因为它会在暂停的 future 上阻塞长达门控的 30 分钟过期时间。
-        if gate_parked and await state.thread_manager.is_running(thread_id):
-            spawn_post_park_continuation(
-                state,
-                agent.channels,
-                message,
-                conv_id,
+        # 线程已完成。镜像 `await_thread_outcome` 的循环后
+        # outcome → BridgeOutcome 路径，但直接通过 channel + SSE 投递响应，
+        # 而不是通过桥接返回值返回（前台调用很久以前就返回了 Pending）。
+        try:
+            outcome = await thread_manager.join_thread(thread_id)
+        except Exception as e:
+            logger.debug(
+                "暂停后继续: join_thread 失败, thread_id=%s, error=%s",
                 thread_id,
+                e,
             )
-            return BridgeOutcome.Pending
+            await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
+            return
 
-        # 如果我们达到截止时间且线程仍在运行（通常是因为它在
-        # `BridgeGateController::pause` 中暂停等待用户尚未操作的批准），
-        # 不要调用 `join_thread`——这会在同一暂停任务上阻塞请求处理程序
-        # 长达门控的 `expires_at`（30 分钟）。显示为 `Pending`：
-        # 活动的 `PendingGate` 行保持可用，用户仍可以解析它，
-        # 解析器路径将把解析投递到暂停的 oneshot 中。
-        if timed_out and await state.thread_manager.is_running(thread_id):
-            return BridgeOutcome.Pending
-
-        outcome = await state.thread_manager.join_thread(thread_id)
-
-        # 在终端结果上丢弃外部工具目录条目——线程永远无法从
-        # `Completed`、`Stopped`、`MaxIterations` 或 `Failed` 恢复，
-        # 因此条目将永远泄漏。`GatePaused` 有意保留条目：
-        # 后续恢复请求需要目录仍然知道此线程的调用者提供的工具。
-        if not isinstance(outcome, ThreadOutcome.GatePaused):
-            await state.external_tool_catalog.clear(thread_id)
-
-        await state.conversation_manager.record_thread_outcome(
-            conv_id, thread_id, outcome
-        )
-
-        # 为所有产生响应的结果写入 v1 数据库响应
-        async def _write_v1_response(text: str) -> None:
-            if state.db is not None:
-                try:
-                    cid = await resolve_v1_conversation_for_message(state.db, message)
-                    await state.db.add_conversation_message(cid, "assistant", text)
-                except Exception as e:
-                    logger.warning(
-                        "解析 v1 对话以持久化助手响应失败, message_id=%s: %s",
-                        message.id,
-                        e,
-                    )
-
-        # SSE 响应广播（web）
-        if (
-                state.sse is not None
-                and isinstance(outcome, ThreadOutcome.Completed)
-                and outcome.response is not None
-        ):
-            state.sse.broadcast_for_user(
-                message.user_id,
-                AppEvent.Response(
-                    content=outcome.response,
-                    thread_id=tid_str,
-                ),
+        try:
+            await conversation_manager.record_thread_outcome(conv_id, thread_id, outcome)
+        except Exception as e:
+            logger.debug(
+                "暂停后继续: record_thread_outcome 失败, thread_id=%s, error=%s",
+                thread_id,
+                e,
             )
 
-        result: BridgeOutcome
+        response_text: Optional[str] = None
 
         if isinstance(outcome, ThreadOutcome.Completed):
-            logger.debug("engine v2: 已完成, thread_id=%s", thread_id)
-
-            response = outcome.response
-
-            # 基于文本的认证回退：检测响应中的 authentication_required 并进入认证模式。
-            # 这是纵深防御安全网——飞行前认证门控应在执行前捕获大多数情况。
-            if response is not None and "authentication_required" in response:
-                logger.debug(
-                    "基于文本的认证回退触发——飞行前门控未捕获到, thread_id=%s",
-                    thread_id,
-                )
-
-                parsed_cred_name = parse_credential_name(response)
-
-                # 防御凭证名称注入：仅当解析的名称是实际注册的凭证时，
-                # 才启用回退认证门控。使用选定凭证名称构造
-                # `authentication_required` 消息的工具不能强制用户提供不相关的密钥。
-                # 没有凭证注册表就无法验证名称，因此门控不得触发——
-                # 没有注册表的测试/嵌入夹具有意丢失回退路径，而不是获得提示注入向量。
-                cred_name = None
-                if parsed_cred_name is not None:
-                    cred_reg = agent.tools().credential_registry()
-                    if cred_reg is not None and cred_reg.has_secret(parsed_cred_name):
-                        cred_name = parsed_cred_name
-
-                if cred_name is None:
-                    logger.warning(
-                        "基于文本的认证回退拒绝未知或缺失的凭证名称, thread_id=%s",
-                        thread_id,
-                    )
-                    return BridgeOutcome.Respond(response)
-
-                # 通过 AuthManager 查找设置说明（或回退到内联查找）
-                setup_hint = f"提供您的 {cred_name} 令牌"
-                if state.auth_manager is not None:
-                    hint = state.auth_manager.get_setup_instructions(cred_name)
-                    if hint is not None:
-                        setup_hint = hint
-
-                pending = PendingGate(
-                    request_id=uuid.uuid4(),
-                    gate_name="authentication",
-                    user_id=message.user_id,
-                    thread_id=thread_id,
-                    scope_thread_id=(
-                        ExternalThreadId.new(scope)
-                        if (scope := message.conversation_scope())
-                        else None
-                    ),
-                    conversation_id=conv_id,
-                    source_channel=message.channel,
-                    action_name="authentication_fallback",
-                    call_id=f"fallback-auth-{thread_id}",
-                    parameters={"credential_name": cred_name},
-                    display_parameters=None,
-                    description=f"需要为 '{cred_name}' 进行认证。",
-                    resume_kind=ResumeKind.Authentication(
-                        credential_name=CredentialName.from_trusted(cred_name),
-                        instructions=setup_hint,
-                        auth_url=None,
-                    ),
-                    created_at=datetime.now(timezone.utc),
-                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-                    original_message=message.content,
-                    resume_output=None,
-                    paused_lease=None,
-                    approval_already_granted=False,
-                )
-                pending_request_id = str(pending.request_id)
-                try:
-                    await state.pending_gates.insert(pending)
-                except Exception as e:
-                    logger.debug("存储回退认证门控失败: %s", e)
-
-                # 通过通道显示认证提示（仅卡片，无文本）
-                try:
-                    await agent.channels.send_status(
-                        message.channel,
-                        StatusUpdate.AuthRequired(
-                            extension_name=ExtensionName.from_trusted(cred_name),
-                            instructions=setup_hint,
-                            auth_url=None,
-                            setup_url=None,
-                            request_id=pending_request_id,
-                        ),
-                        message.metadata,
-                    )
-                except Exception:
-                    pass
-
-                return BridgeOutcome.Pending
-
-            # 仅为已完成的线程持久化 tool_calls——不为 GatePaused 持久化
-            # （部分工具，在恢复时会产生孤立行）
-            if state.db is not None:
-                await persist_v2_tool_calls(state.store, state.db, thread_id, message)
-
-            if response is not None:
-                result = BridgeOutcome.Respond(response)
-            else:
-                result = BridgeOutcome.NoResponse
+            if db is not None:
+                await persist_v2_tool_calls(store, db, thread_id, message)
+            response_text = outcome.response
 
         elif isinstance(outcome, ThreadOutcome.Stopped):
-            result = BridgeOutcome.Respond("线程已停止。")
+            response_text = "线程已停止。"
 
         elif isinstance(outcome, ThreadOutcome.MaxIterations):
-            result = BridgeOutcome.Respond("达到最大迭代次数但未完成。")
+            response_text = "达到最大迭代次数但未完成。"
 
         elif isinstance(outcome, ThreadOutcome.Failed):
             sanitized = user_facing_thread_failure(outcome.error)
-            sse_will_deliver_to_user = (
-                    state.sse is not None and message.channel == GATEWAY_CHANNEL_NAME
-            )
-            if state.sse is not None:
-                state.sse.broadcast_for_user(
-                    message.user_id,
+            sse_will_deliver_to_user = sse is not None and channel_name == GATEWAY_CHANNEL_NAME
+            if sse is not None:
+                sse.broadcast_for_user(
+                    user_id,
                     AppEvent.Error(
                         message=sanitized,
                         thread_id=tid_str,
                     ),
                 )
-            result = bridge_outcome_for_failed_thread(
+            bridge_outcome = bridge_outcome_for_failed_thread(
                 outcome.error,
                 outcome.debug_detail,
-                message.user_id,
-                message.channel,
+                user_id,
+                channel_name,
                 sse_will_deliver_to_user,
             )
+            if isinstance(bridge_outcome, BridgeOutcome.Respond):
+                response_text = bridge_outcome.text
 
         elif isinstance(outcome, ThreadOutcome.GatePaused):
-            # 在存储/广播之前编辑敏感参数
-            tool = await state.effect_adapter.tools().get(outcome.action_name)
+            # 恢复后的引擎遇到了另一个（遗留）GatePaused 结果——
+            # 通常是 Authentication 或 External。构建新的待处理门控行
+            # 并显示提示；目前没有响应文本要投递。
+            tool = await effect_adapter.tools().get(outcome.action_name)
             redacted_params = (
                 redact_params(outcome.parameters, tool.sensitive_params())
                 if tool
                 else outcome.parameters
             )
 
-            # 存储在统一的 PendingGateStore 中（按 user_id + thread_id 键控）
             pending = PendingGate(
                 request_id=uuid.uuid4(),
                 gate_name=outcome.gate_name,
-                user_id=message.user_id,
+                user_id=user_id,
                 thread_id=thread_id,
                 scope_thread_id=(
                     ExternalThreadId.new(scope)
@@ -4583,7 +4138,7 @@ async def has_any_pending_gate(
                     else None
                 ),
                 conversation_id=conv_id,
-                source_channel=message.channel,
+                source_channel=channel_name,
                 action_name=outcome.action_name,
                 call_id=outcome.call_id,
                 parameters=outcome.parameters,
@@ -4602,737 +4157,1178 @@ async def has_any_pending_gate(
             )
 
             try:
-                await state.pending_gates.insert(pending)
+                await pending_gates.insert(pending)
             except Exception as e:
                 logger.debug(
-                    "存储待处理门控失败（可能重复）, gate=%s, error=%s",
+                    "暂停后继续: 存储后续待处理门控失败, gate=%s, error=%s",
                     outcome.gate_name,
                     e,
                 )
+            else:
+                extension_name = await resolve_auth_gate_extension_name(
+                    auth_manager,
+                    extension_manager,
+                    effect_adapter.tools(),
+                    pending,
+                )
 
-            # 来自 Responses API 的调用者提供的外部工具：
-            # 显示为 `AppEvent::ExternalToolCall`，以便 /v1/responses 处理程序
-            # 可以发出 `function_call` ResponseOutputItem 并完成回合。
-            if (
-                    isinstance(pending.resume_kind, ResumeKind.External)
-                    and is_external_tool_callback_id(pending.resume_kind.callback_id)
-            ):
-                if state.sse is not None:
-                    arguments = json.dumps(pending.parameters)
-                    state.sse.broadcast_for_user(
-                        message.user_id,
-                        AppEvent.ExternalToolCall(
-                            request_id=str(pending.request_id),
-                            call_id=pending.call_id,
-                            name=pending.action_name,
-                            arguments=arguments,
-                            thread_id=pending.effective_wire_thread_id(),
+                status_update = None
+                if isinstance(pending.resume_kind, ResumeKind.Approval):
+                    status_update = StatusUpdate.ApprovalNeeded(
+                        request_id=str(pending.request_id),
+                        tool_name=pending.action_name,
+                        description=pending.description,
+                        parameters=(
+                            pending.display_parameters
+                            if pending.display_parameters is not None
+                            else pending.parameters
                         ),
+                        allow_always=pending.resume_kind.allow_always,
                     )
-                else:
-                    logger.debug(
-                        "外部工具门控已暂停（CodeAct 后）但没有连接广播器；调用者将不会被通知, user_id=%s, callback=%s, request_id=%s",
-                        message.user_id,
-                        pending.resume_kind.callback_id,
-                        pending.request_id,
+                elif isinstance(pending.resume_kind, ResumeKind.Authentication):
+                    status_update = StatusUpdate.AuthRequired(
+                        extension_name=(
+                            extension_name
+                            if extension_name is not None
+                            else ExtensionName.from_trusted(pending.action_name)
+                        ),
+                        instructions=pending.resume_kind.instructions,
+                        auth_url=pending.resume_kind.auth_url,
+                        setup_url=None,
+                        request_id=str(pending.request_id),
                     )
-                return BridgeOutcome.Pending
 
-            # 通过源通道发送批准/认证卡片
-            extension_name = await resolve_auth_gate_extension_name(
-                state.auth_manager,
-                state.extension_manager,
-                state.effect_adapter.tools(),
-                pending,
+                if status_update is not None:
+                    try:
+                        await channels.send_status(channel_name, status_update, metadata)
+                    except Exception:
+                        pass
+
+        # 投递最终响应
+        if response_text is not None:
+            if sse is not None:
+                sse.broadcast_for_user(
+                    user_id,
+                    AppEvent.Response(
+                        content=response_text,
+                        thread_id=tid_str,
+                    ),
+                )
+            try:
+                await channels.respond(message, OutgoingResponse.text(response_text))
+            except Exception as e:
+                logger.debug(
+                    "暂停后继续: 通道响应失败, channel=%s, error=%s",
+                    channel_name,
+                    e,
+                )
+            try:
+                await channels.send_status(
+                    channel_name,
+                    StatusUpdate.Status("完成"),
+                    metadata,
+                )
+            except Exception as e:
+                logger.debug(
+                    "暂停后继续: 完成状态发送失败, channel=%s, error=%s",
+                    channel_name,
+                    e,
+                )
+            if db is not None:
+                try:
+                    cid = await resolve_v1_conversation_for_message(db, message)
+                    await db.add_conversation_message(cid, "assistant", response_text)
+                except Exception as e:
+                    logger.warning(
+                        "暂停后继续: 解析 v1 对话以持久化助手响应失败, thread_id=%s: %s",
+                        thread_id,
+                        e,
+                    )
+
+        await gate_controller.clear_execution_context(user_id, thread_id, conv_id)
+        logger.debug(
+            "engine v2: 暂停后继续任务已运行, thread_id=%s",
+            thread_id,
+        )
+
+    asyncio.create_task(_continuation())
+
+
+async def fire_event_missions_for_message(
+        state: EngineState,
+        message: IncomingMessage,
+        content: str,
+) -> None:
+    """
+触发其模式匹配入站消息的活动 OnEvent 任务。
+
+构建包含消息元数据的负载，任务线程可以通过 `state["trigger_payload"]` 读取。
+跳过空内容和系统通道消息。错误以 debug 级别记录——
+此处的失败绝不能阻塞面向用户的消息流。
+"""
+    trimmed = content.strip()
+    if not trimmed:
+        return
+
+    # 递归守卫。将代理自己的出站文本作为入站事件回显的通道适配器
+    # 必须设置 is_agent_broadcast（Slack/Discord 风格）；
+    # 作为任务触发副作用产生的消息必须设置 triggering_mission_id
+    # （跨不同任务的链式递归）。任一标志意味着：不要重新触发。
+    if message.is_agent_broadcast:
+        logger.debug(
+            "engine v2: 跳过任务触发——消息是代理广播回显, channel=%s",
+            message.channel,
+        )
+        return
+    if message.triggering_mission_id is not None:
+        logger.debug(
+            "engine v2: 跳过任务触发——消息源自任务, channel=%s, upstream_mission_id=%s",
+            message.channel,
+            message.triggering_mission_id,
+        )
+        return
+
+    mission_manager = await state.effect_adapter.mission_manager()
+    if mission_manager is None:
+        return
+
+    payload = {
+        "channel": message.channel,
+        "user_id": message.user_id,
+        "content": content,
+        "metadata": message.metadata,
+    }
+
+    try:
+        spawned = await mission_manager.fire_on_message_event(
+            message.channel, content, message.user_id, payload
+        )
+        if spawned:
+            logger.debug(
+                "engine v2: 从入站消息触发了 %d 个 OnEvent 任务, channel=%s, user_id=%s",
+                len(spawned),
+                message.channel,
+                message.user_id,
             )
-            await send_pending_gate_status(agent, message, pending, extension_name)
-            result = BridgeOutcome.Pending
+    except Exception as error:
+        logger.debug(
+            "engine v2: fire_on_message_event 失败；继续正常处理, channel=%s, error=%s",
+            message.channel,
+            error,
+        )
 
+
+async def await_thread_outcome(
+        agent: Agent,
+        state: EngineState,
+        message: IncomingMessage,
+        conv_id: ConversationId,
+        thread_id: ThreadId,
+) -> BridgeOutcome:
+    """
+等待线程完成并返回桥接结果。
+
+处理事件转发、内联门控检测、超时和所有线程结果类型。
+"""
+    event_rx = state.thread_manager.subscribe_events()
+    channels = agent.channels
+    channel_name = message.channel
+    metadata = message.metadata
+    sse = state.sse
+    tid_str = str(thread_id)
+
+    # 安全超时：如果线程在 5 分钟内未完成，则跳出以避免永远挂起用户会话
+    # （例如，在拒绝批准后线程无法恢复）
+    deadline = asyncio.get_event_loop().time() + 300
+    timed_out = False
+    gate_parked = False
+    pending_key = PendingGateKey(user_id=message.user_id, thread_id=thread_id)
+
+    while True:
+        try:
+            event = await asyncio.wait_for(event_rx.recv(), timeout=0.5)
+            if getattr(event, 'thread_id', None) == thread_id:
+                await forward_event_to_channel(event, channels, channel_name, metadata)
+                if sse is not None:
+                    skip_verbose = not sse.has_verbose_receivers()
+                    leak_detector = state.effect_adapter.safety().leak_detector()
+                    for app_event in thread_event_to_app_events(event, tid_str):
+                        if skip_verbose and app_event.is_verbose_only():
+                            continue
+                        # 引擎 crate 原始发出 CodeExecuted——它不依赖 `ironclaw_safety`。
+                        # 在此处的桥接边界，在事件到达任何 SSE 订阅者之前，
+                        # 清除 code/stdout/return_value 负载中的密钥
+                        # （bearer 令牌、API 密钥等）。
+                        redact_code_executed_secrets(app_event, leak_detector)
+                        sse.broadcast_for_user(message.user_id, app_event)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            break
+
+        # 检查线程是否仍在运行
+        if not await state.thread_manager.is_running(thread_id):
+            break
+
+        # 内联门控检测：如果在线程仍在运行时已为 (user, thread) 注册了待处理门控，
+        # 则引擎在 `BridgeGateController::pause` 内暂停等待用户解析。
+        # 在此处持有 `handle_message` 会使每用户代理循环串行化在暂停之后——
+        # 排队在 `msg_tx` 中的第二个线程的 `UserInput` 无法分派，
+        # 直到用户解析此门控或下面的 5 分钟截止时间触发。
+        # 移交给后台继续任务（保留事件转发 + 最终响应投递）
+        # 并显示为 `Pending`，以便代理循环解除阻塞。
+        if await state.pending_gates.peek(pending_key) is not None:
+            gate_parked = True
+            break
+
+        if asyncio.get_event_loop().time() >= deadline:
+            logger.warning(
+                "await_thread_outcome 在 5 分钟后超时——跳出以避免挂起, thread_id=%s",
+                thread_id,
+            )
+            timed_out = True
+            break
+
+    # 如果我们因为线程在内联门控处暂停而退出，将生命周期的其余部分
+    # （事件转发 + 完成时的最终响应广播 + 每执行上下文清理）
+    # 移交给后台任务并返回 `Pending`。join_thread 不能在前台任务上运行，
+    # 因为它会在暂停的 future 上阻塞长达门控的 30 分钟过期时间。
+    if gate_parked and await state.thread_manager.is_running(thread_id):
+        spawn_post_park_continuation(
+            state,
+            agent.channels,
+            message,
+            conv_id,
+            thread_id,
+        )
+        return BridgeOutcome.Pending
+
+    # 如果我们达到截止时间且线程仍在运行（通常是因为它在
+    # `BridgeGateController::pause` 中暂停等待用户尚未操作的批准），
+    # 不要调用 `join_thread`——这会在同一暂停任务上阻塞请求处理程序
+    # 长达门控的 `expires_at`（30 分钟）。显示为 `Pending`：
+    # 活动的 `PendingGate` 行保持可用，用户仍可以解析它，
+    # 解析器路径将把解析投递到暂停的 oneshot 中。
+    if timed_out and await state.thread_manager.is_running(thread_id):
+        return BridgeOutcome.Pending
+
+    outcome = await state.thread_manager.join_thread(thread_id)
+
+    # 在终端结果上丢弃外部工具目录条目——线程永远无法从
+    # `Completed`、`Stopped`、`MaxIterations` 或 `Failed` 恢复，
+    # 因此条目将永远泄漏。`GatePaused` 有意保留条目：
+    # 后续恢复请求需要目录仍然知道此线程的调用者提供的工具。
+    if not isinstance(outcome, ThreadOutcome.GatePaused):
+        await state.external_tool_catalog.clear(thread_id)
+
+    await state.conversation_manager.record_thread_outcome(
+        conv_id, thread_id, outcome
+    )
+
+    # 为所有产生响应的结果写入 v1 数据库响应
+    async def _write_v1_response(text: str) -> None:
+        if state.db is not None:
+            try:
+                cid = await resolve_v1_conversation_for_message(state.db, message)
+                await state.db.add_conversation_message(cid, "assistant", text)
+            except Exception as e:
+                logger.warning(
+                    "解析 v1 对话以持久化助手响应失败, message_id=%s: %s",
+                    message.id,
+                    e,
+                )
+
+    # SSE 响应广播（web）
+    if (
+            state.sse is not None
+            and isinstance(outcome, ThreadOutcome.Completed)
+            and outcome.response is not None
+    ):
+        state.sse.broadcast_for_user(
+            message.user_id,
+            AppEvent.Response(
+                content=outcome.response,
+                thread_id=tid_str,
+            ),
+        )
+
+    result: BridgeOutcome
+
+    if isinstance(outcome, ThreadOutcome.Completed):
+        logger.debug("engine v2: 已完成, thread_id=%s", thread_id)
+
+        response = outcome.response
+
+        # 基于文本的认证回退：检测响应中的 authentication_required 并进入认证模式。
+        # 这是纵深防御安全网——飞行前认证门控应在执行前捕获大多数情况。
+        if response is not None and "authentication_required" in response:
+            logger.debug(
+                "基于文本的认证回退触发——飞行前门控未捕获到, thread_id=%s",
+                thread_id,
+            )
+
+            parsed_cred_name = parse_credential_name(response)
+
+            # 防御凭证名称注入：仅当解析的名称是实际注册的凭证时，
+            # 才启用回退认证门控。使用选定凭证名称构造
+            # `authentication_required` 消息的工具不能强制用户提供不相关的密钥。
+            # 没有凭证注册表就无法验证名称，因此门控不得触发——
+            # 没有注册表的测试/嵌入夹具有意丢失回退路径，而不是获得提示注入向量。
+            cred_name = None
+            if parsed_cred_name is not None:
+                cred_reg = agent.tools().credential_registry()
+                if cred_reg is not None and cred_reg.has_secret(parsed_cred_name):
+                    cred_name = parsed_cred_name
+
+            if cred_name is None:
+                logger.warning(
+                    "基于文本的认证回退拒绝未知或缺失的凭证名称, thread_id=%s",
+                    thread_id,
+                )
+                return BridgeOutcome.Respond(response)
+
+            # 通过 AuthManager 查找设置说明（或回退到内联查找）
+            setup_hint = f"提供您的 {cred_name} 令牌"
+            if state.auth_manager is not None:
+                hint = state.auth_manager.get_setup_instructions(cred_name)
+                if hint is not None:
+                    setup_hint = hint
+
+            pending = PendingGate(
+                request_id=uuid.uuid4(),
+                gate_name="authentication",
+                user_id=message.user_id,
+                thread_id=thread_id,
+                scope_thread_id=(
+                    ExternalThreadId.new(scope)
+                    if (scope := message.conversation_scope())
+                    else None
+                ),
+                conversation_id=conv_id,
+                source_channel=message.channel,
+                action_name="authentication_fallback",
+                call_id=f"fallback-auth-{thread_id}",
+                parameters={"credential_name": cred_name},
+                display_parameters=None,
+                description=f"需要为 '{cred_name}' 进行认证。",
+                resume_kind=ResumeKind.Authentication(
+                    credential_name=CredentialName.from_trusted(cred_name),
+                    instructions=setup_hint,
+                    auth_url=None,
+                ),
+                created_at=datetime.now(timezone.utc),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+                original_message=message.content,
+                resume_output=None,
+                paused_lease=None,
+                approval_already_granted=False,
+            )
+            pending_request_id = str(pending.request_id)
+            try:
+                await state.pending_gates.insert(pending)
+            except Exception as e:
+                logger.debug("存储回退认证门控失败: %s", e)
+
+            # 通过通道显示认证提示（仅卡片，无文本）
+            try:
+                await agent.channels.send_status(
+                    message.channel,
+                    StatusUpdate.AuthRequired(
+                        extension_name=ExtensionName.from_trusted(cred_name),
+                        instructions=setup_hint,
+                        auth_url=None,
+                        setup_url=None,
+                        request_id=pending_request_id,
+                    ),
+                    message.metadata,
+                )
+            except Exception:
+                pass
+
+            return BridgeOutcome.Pending
+
+        # 仅为已完成的线程持久化 tool_calls——不为 GatePaused 持久化
+        # （部分工具，在恢复时会产生孤立行）
+        if state.db is not None:
+            await persist_v2_tool_calls(state.store, state.db, thread_id, message)
+
+        if response is not None:
+            result = BridgeOutcome.Respond(response)
         else:
             result = BridgeOutcome.NoResponse
 
-        # 为所有结果写入 v1 数据库响应，以便历史端点显示正确状态
-        if isinstance(result, BridgeOutcome.Respond):
-            await _write_v1_response(result.text)
+    elif isinstance(outcome, ThreadOutcome.Stopped):
+        result = BridgeOutcome.Respond("线程已停止。")
 
-        return result
+    elif isinstance(outcome, ThreadOutcome.MaxIterations):
+        result = BridgeOutcome.Respond("达到最大迭代次数但未完成。")
 
-    # ── 共享事件显示辅助函数 ────────────────────────────
+    elif isinstance(outcome, ThreadOutcome.Failed):
+        sanitized = user_facing_thread_failure(outcome.error)
+        sse_will_deliver_to_user = (
+                state.sse is not None and message.channel == GATEWAY_CHANNEL_NAME
+        )
+        if state.sse is not None:
+            state.sse.broadcast_for_user(
+                message.user_id,
+                AppEvent.Error(
+                    message=sanitized,
+                    thread_id=tid_str,
+                ),
+            )
+        result = bridge_outcome_for_failed_thread(
+            outcome.error,
+            outcome.debug_detail,
+            message.user_id,
+            message.channel,
+            sse_will_deliver_to_user,
+        )
 
-    def format_action_display_name(action_name: str, params_summary: Optional[str]) -> str:
-        """
-    格式化操作名称，附带可选参数摘要以供显示。
-    例如：`"http(https://api.github.com/...)"` 或仅 `"web_search"`。
-    """
-        if params_summary:
-            return f"{action_name}({params_summary})"
-        return action_name
+    elif isinstance(outcome, ThreadOutcome.GatePaused):
+        # 在存储/广播之前编辑敏感参数
+        tool = await state.effect_adapter.tools().get(outcome.action_name)
+        redacted_params = (
+            redact_params(outcome.parameters, tool.sensitive_params())
+            if tool
+            else outcome.parameters
+        )
 
-    def interpret_message_event(role: str, content_preview: str) -> Optional[str]:
-        """
-    将 MessageAdded 事件解释为人类可读的状态消息。
-    对于不需要 UI 显示的事件返回 `None`。
-    """
-        if role == "User" and content_preview.startswith("[stdout]"):
-            return "代码已执行"
-        elif role == "User" and content_preview.startswith("[code "):
-            return "代码已执行（无输出）"
-        elif role == "User" and (
-                "Error" in content_preview or content_preview.startswith("Traceback")
+        # 存储在统一的 PendingGateStore 中（按 user_id + thread_id 键控）
+        pending = PendingGate(
+            request_id=uuid.uuid4(),
+            gate_name=outcome.gate_name,
+            user_id=message.user_id,
+            thread_id=thread_id,
+            scope_thread_id=(
+                ExternalThreadId.new(scope)
+                if (scope := message.conversation_scope())
+                else None
+            ),
+            conversation_id=conv_id,
+            source_channel=message.channel,
+            action_name=outcome.action_name,
+            call_id=outcome.call_id,
+            parameters=outcome.parameters,
+            display_parameters=redacted_params,
+            description=(
+                f"工具 '{outcome.action_name}' 需要 {outcome.resume_kind.kind_name()}"
+                f" (门控: {outcome.gate_name})"
+            ),
+            resume_kind=outcome.resume_kind,
+            created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            original_message=message.content,
+            resume_output=outcome.resume_output,
+            paused_lease=outcome.paused_lease,
+            approval_already_granted=False,
+        )
+
+        try:
+            await state.pending_gates.insert(pending)
+        except Exception as e:
+            logger.debug(
+                "存储待处理门控失败（可能重复）, gate=%s, error=%s",
+                outcome.gate_name,
+                e,
+            )
+
+        # 来自 Responses API 的调用者提供的外部工具：
+        # 显示为 `AppEvent::ExternalToolCall`，以便 /v1/responses 处理程序
+        # 可以发出 `function_call` ResponseOutputItem 并完成回合。
+        if (
+                isinstance(pending.resume_kind, ResumeKind.External)
+                and is_external_tool_callback_id(pending.resume_kind.callback_id)
         ):
-            return "代码错误——正在重试..."
-        elif role == "Assistant":
-            return "正在执行代码..."
-        else:
-            return None
+            if state.sse is not None:
+                arguments = json.dumps(pending.parameters)
+                state.sse.broadcast_for_user(
+                    message.user_id,
+                    AppEvent.ExternalToolCall(
+                        request_id=str(pending.request_id),
+                        call_id=pending.call_id,
+                        name=pending.action_name,
+                        arguments=arguments,
+                        thread_id=pending.effective_wire_thread_id(),
+                    ),
+                )
+            else:
+                logger.debug(
+                    "外部工具门控已暂停（CodeAct 后）但没有连接广播器；调用者将不会被通知, user_id=%s, callback=%s, request_id=%s",
+                    message.user_id,
+                    pending.resume_kind.callback_id,
+                    pending.request_id,
+                )
+            return BridgeOutcome.Pending
 
-    # ── 引擎查询 DTO ────────────────────────────────────────
+        # 通过源通道发送批准/认证卡片
+        extension_name = await resolve_auth_gate_extension_name(
+            state.auth_manager,
+            state.extension_manager,
+            state.effect_adapter.tools(),
+            pending,
+        )
+        await send_pending_gate_status(agent, message, pending, extension_name)
+        result = BridgeOutcome.Pending
 
-    @dataclass
-    class EngineThreadInfo:
-        """列表视图的轻量级线程摘要。"""
-        id: str
-        goal: str
-        thread_type: str
-        state: str
-        project_id: str
-        step_count: int
-        total_tokens: int
-        created_at: str
-        updated_at: str
-        title: Optional[str] = None
-        parent_id: Optional[str] = None
+    else:
+        result = BridgeOutcome.NoResponse
 
-    @dataclass
-    class EngineThreadDetail:
-        """包含消息和配置的线程详情。"""
-        # 来自 EngineThreadInfo 的展平字段
-        id: str
-        goal: str
-        thread_type: str
-        state: str
-        project_id: str
-        step_count: int
-        total_tokens: int
-        created_at: str
-        updated_at: str
-        # 特有字段
-        messages: List[Dict[str, Any]]
-        max_iterations: int
-        total_cost_usd: float
-        title: Optional[str] = None
-        parent_id: Optional[str] = None
-        completed_at: Optional[str] = None
+    # 为所有结果写入 v1 数据库响应，以便历史端点显示正确状态
+    if isinstance(result, BridgeOutcome.Respond):
+        await _write_v1_response(result.text)
 
-    @dataclass
-    class EngineStepInfo:
-        """线程详情视图的步骤摘要。"""
-        id: str
-        sequence: int
-        status: str
-        tier: str
-        action_results_count: int
-        tokens_input: int
-        tokens_output: int
-        started_at: Optional[str] = None
-        completed_at: Optional[str] = None
+    return result
 
-    @dataclass
-    class EngineProjectInfo:
-        """项目摘要。"""
-        id: str
-        name: str
-        description: str
-        created_at: str
-        goals: List[str] = field(default_factory=list)
-        metrics: List[ProjectMetric] = field(default_factory=list)
 
-    @dataclass
-    class AttentionItem:
-        """项目概览中显示的关注项。"""
-        # `"gate"` 或 `"failure"`
-        kind: str
-        project_id: str
-        project_name: str
-        message: str
-        thread_id: Optional[str] = None
+# ── 共享事件显示辅助函数 ────────────────────────────
 
-    @dataclass
-    class ProjectOverviewEntry:
-        """包含计算出的健康状态和统计信息的每项目摘要。"""
-        id: str
-        name: str
-        description: str
-        # `"green"`、`"yellow"` 或 `"red"`
-        health: str
-        active_missions: int
-        total_missions: int
-        threads_today: int
-        cost_today_usd: float
-        failures_24h: int
-        pending_gates: int
-        created_at: str
-        goals: List[str] = field(default_factory=list)
-        last_activity: Optional[str] = None
-
-    @dataclass
-    class ProjectsOverviewResponse:
-        """完整项目概览响应。"""
-        attention: List[AttentionItem]
-        projects: List[ProjectOverviewEntry]
-
-    @dataclass
-    class EngineMissionInfo:
-        """列表视图的任务摘要。"""
-        # 类型化的任务标识符，从引擎传递而来，而不是在适配器边界
-        # 往返转换为 `String`。通过 `MissionId` 的派生 `Serialize`
-        # 透明地序列化为 UUID 字符串，因此线形状与 newtype 之前的 DTO 保持相同。
-        id: MissionId
-        name: str
-        goal: str
-        status: str
-        cadence_type: str
-        # 频率的人类可读描述（例如 "每周一 09:00"、"webhook: /github"、"手动"）。
-        # 比单独的 `cadence_type` 渲染更好。
-        cadence_description: str
-        thread_count: int
-        created_at: str
-        updated_at: str
-        current_focus: Optional[str] = None
-
-    @dataclass
-    class EngineMissionDetail:
-        """包含完整策略和预算信息的任务详情。"""
-        # 来自 EngineMissionInfo 的展平字段
-        id: MissionId
-        name: str
-        goal: str
-        status: str
-        cadence_type: str
-        cadence_description: str
-        thread_count: int
-        created_at: str
-        updated_at: str
-        # 特有字段
-        cadence: Dict[str, Any]
-        approach_history: List[str]
-        notify_channels: List[str]
-        threads_today: int
-        max_threads_per_day: int
-        threads: List[EngineThreadInfo]
-        current_focus: Optional[str] = None
-        success_criteria: Optional[str] = None
-        next_fire_at: Optional[str] = None
-
-    # ── 引擎查询函数 ───────────────────────────────────
-
-    def cadence_type_label(cadence: MissionCadence) -> str:
-        """返回任务频率类型的标签。"""
-        if isinstance(cadence, MissionCadence.Cron):
-            return "cron"
-        elif isinstance(cadence, MissionCadence.OnEvent):
-            return "event"
-        elif isinstance(cadence, MissionCadence.OnSystemEvent):
-            return "system_event"
-        elif isinstance(cadence, MissionCadence.Webhook):
-            return "webhook"
-        elif isinstance(cadence, MissionCadence.Manual):
-            return "manual"
-        return "unknown"
-
-    def cadence_description(cadence: MissionCadence) -> str:
-        """
-    为 UI 提供任务频率的人类可读描述。
-
-    对于 cron 表达式，识别常见模式（"每小时"、"每周一 09:00" 等），
-    对于无法识别的模式回退到 `"cron: <expression>"`。
-    其他频率类型包含其模式/路径，以便用户可以看到触发任务的内容。
+def format_action_display_name(action_name: str, params_summary: Optional[str]) -> str:
     """
-        if isinstance(cadence, MissionCadence.Cron):
-            base = describe_cron(cadence.expression) or f"cron: {cadence.expression}"
-            if cadence.timezone:
-                return f"{base} ({cadence.timezone})"
-            return base
-        elif isinstance(cadence, MissionCadence.OnEvent):
-            return f"on event: {cadence.event_pattern}"
-        elif isinstance(cadence, MissionCadence.OnSystemEvent):
-            return f"on system event: {cadence.source}/{cadence.event_type}"
-        elif isinstance(cadence, MissionCadence.Webhook):
-            return f"webhook: {cadence.path}"
-        elif isinstance(cadence, MissionCadence.Manual):
-            return "manual"
-        return "unknown"
+格式化操作名称，附带可选参数摘要以供显示。
+例如：`"http(https://api.github.com/...)"` 或仅 `"web_search"`。
+"""
+    if params_summary:
+        return f"{action_name}({params_summary})"
+    return action_name
 
-    def describe_cron(expression: str) -> Optional[str]:
-        """
-    将 5 字段 cron 表达式翻译为常见模式的英文描述。
-    如果表达式不匹配已知形状，返回 `None`；调用者应回退到显示原始表达式。
+
+def interpret_message_event(role: str, content_preview: str) -> Optional[str]:
     """
-        parts = expression.split()
-        # 接受标准 5 字段 cron；暂时忽略 6/7 字段变体
-        if len(parts) != 5:
-            return None
-
-        minute, hour, dom, month, dow = parts[0], parts[1], parts[2], parts[3], parts[4]
-
-        is_any = lambda s: s == "*"
-        parse_num = lambda s: int(s) if s.isdigit() else None
-
-        def day_name(n: int) -> str:
-            names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-            return names[n % 7] if n % 7 < 7 else ""
-
-        # 每分钟
-        if is_any(minute) and is_any(hour) and is_any(dom) and is_any(month) and is_any(dow):
-            return "every minute"
-
-        # 每小时的第 M 分钟
-        m = parse_num(minute)
-        if is_any(hour) and is_any(dom) and is_any(month) and is_any(dow) and m is not None:
-            if m == 0:
-                return "every hour"
-            return f"every hour at :{m:02d}"
-
-        # 每天 H:M（无星期几、无月中日限制）
-        if is_any(dom) and is_any(month) and is_any(dow):
-            m = parse_num(minute)
-            h = parse_num(hour)
-            if m is not None and h is not None:
-                return f"every day at {h:02d}:{m:02d}"
-
-        # 每周特定一天 H:M
-        if is_any(dom) and is_any(month):
-            m = parse_num(minute)
-            h = parse_num(hour)
-            d = parse_num(dow)
-            if m is not None and h is not None and d is not None:
-                name = day_name(d)
-                if name:
-                    return f"every {name} at {h:02d}:{m:02d}"
-
-        # 每月特定日期 H:M
-        if is_any(month) and is_any(dow):
-            m = parse_num(minute)
-            h = parse_num(hour)
-            d = parse_num(dom)
-            if m is not None and h is not None and d is not None:
-                return f"monthly on day {d} at {h:02d}:{m:02d}"
-
+将 MessageAdded 事件解释为人类可读的状态消息。
+对于不需要 UI 显示的事件返回 `None`。
+"""
+    if role == "User" and content_preview.startswith("[stdout]"):
+        return "代码已执行"
+    elif role == "User" and content_preview.startswith("[code "):
+        return "代码已执行（无输出）"
+    elif role == "User" and (
+            "Error" in content_preview or content_preview.startswith("Traceback")
+    ):
+        return "代码错误——正在重试..."
+    elif role == "Assistant":
+        return "正在执行代码..."
+    else:
         return None
 
-    def thread_to_info(t: Thread) -> EngineThreadInfo:
-        """
-    将引擎线程转换为线程信息 DTO。
 
-    对于在 `title` 字段存在之前持久化的遗留线程，回退到从 `goal`
-    派生的简短标签。没有这个，`EngineThreadInfo` 的前端消费者
-    （TUI、任务详情视图）会渲染 UUID 前缀，因为 DTO 缺少 `turn_count`。
+# ── 引擎查询 DTO ────────────────────────────────────────
+
+@dataclass
+class EngineThreadInfo:
+    """列表视图的轻量级线程摘要。"""
+    id: str
+    goal: str
+    thread_type: str
+    state: str
+    project_id: str
+    step_count: int
+    total_tokens: int
+    created_at: str
+    updated_at: str
+    title: Optional[str] = None
+    parent_id: Optional[str] = None
+
+
+@dataclass
+class EngineThreadDetail:
+    """包含消息和配置的线程详情。"""
+    # 来自 EngineThreadInfo 的展平字段
+    id: str
+    goal: str
+    thread_type: str
+    state: str
+    project_id: str
+    step_count: int
+    total_tokens: int
+    created_at: str
+    updated_at: str
+    # 特有字段
+    messages: List[Dict[str, Any]]
+    max_iterations: int
+    total_cost_usd: float
+    title: Optional[str] = None
+    parent_id: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+@dataclass
+class EngineStepInfo:
+    """线程详情视图的步骤摘要。"""
+    id: str
+    sequence: int
+    status: str
+    tier: str
+    action_results_count: int
+    tokens_input: int
+    tokens_output: int
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+@dataclass
+class EngineProjectInfo:
+    """项目摘要。"""
+    id: str
+    name: str
+    description: str
+    created_at: str
+    goals: List[str] = field(default_factory=list)
+    metrics: List[ProjectMetric] = field(default_factory=list)
+
+
+@dataclass
+class AttentionItem:
+    """项目概览中显示的关注项。"""
+    # `"gate"` 或 `"failure"`
+    kind: str
+    project_id: str
+    project_name: str
+    message: str
+    thread_id: Optional[str] = None
+
+
+@dataclass
+class ProjectOverviewEntry:
+    """包含计算出的健康状态和统计信息的每项目摘要。"""
+    id: str
+    name: str
+    description: str
+    # `"green"`、`"yellow"` 或 `"red"`
+    health: str
+    active_missions: int
+    total_missions: int
+    threads_today: int
+    cost_today_usd: float
+    failures_24h: int
+    pending_gates: int
+    created_at: str
+    goals: List[str] = field(default_factory=list)
+    last_activity: Optional[str] = None
+
+
+@dataclass
+class ProjectsOverviewResponse:
+    """完整项目概览响应。"""
+    attention: List[AttentionItem]
+    projects: List[ProjectOverviewEntry]
+
+
+@dataclass
+class EngineMissionInfo:
+    """列表视图的任务摘要。"""
+    # 类型化的任务标识符，从引擎传递而来，而不是在适配器边界
+    # 往返转换为 `String`。通过 `MissionId` 的派生 `Serialize`
+    # 透明地序列化为 UUID 字符串，因此线形状与 newtype 之前的 DTO 保持相同。
+    id: MissionId
+    name: str
+    goal: str
+    status: str
+    cadence_type: str
+    # 频率的人类可读描述（例如 "每周一 09:00"、"webhook: /github"、"手动"）。
+    # 比单独的 `cadence_type` 渲染更好。
+    cadence_description: str
+    thread_count: int
+    created_at: str
+    updated_at: str
+    current_focus: Optional[str] = None
+
+
+@dataclass
+class EngineMissionDetail:
+    """包含完整策略和预算信息的任务详情。"""
+    # 来自 EngineMissionInfo 的展平字段
+    id: MissionId
+    name: str
+    goal: str
+    status: str
+    cadence_type: str
+    cadence_description: str
+    thread_count: int
+    created_at: str
+    updated_at: str
+    # 特有字段
+    cadence: Dict[str, Any]
+    approach_history: List[str]
+    notify_channels: List[str]
+    threads_today: int
+    max_threads_per_day: int
+    threads: List[EngineThreadInfo]
+    current_focus: Optional[str] = None
+    success_criteria: Optional[str] = None
+    next_fire_at: Optional[str] = None
+
+
+# ── 引擎查询函数 ───────────────────────────────────
+
+def cadence_type_label(cadence: MissionCadence) -> str:
+    """返回任务频率类型的标签。"""
+    if isinstance(cadence, MissionCadence.Cron):
+        return "cron"
+    elif isinstance(cadence, MissionCadence.OnEvent):
+        return "event"
+    elif isinstance(cadence, MissionCadence.OnSystemEvent):
+        return "system_event"
+    elif isinstance(cadence, MissionCadence.Webhook):
+        return "webhook"
+    elif isinstance(cadence, MissionCadence.Manual):
+        return "manual"
+    return "unknown"
+
+
+def cadence_description(cadence: MissionCadence) -> str:
     """
-        title = t.title if t.title else Thread.derive_title_from_message(t.goal)
-        return EngineThreadInfo(
-            id=str(t.id),
-            goal=t.goal,
-            title=title,
-            thread_type=str(t.thread_type),
-            state=str(t.state),
-            project_id=str(t.project_id),
-            parent_id=str(t.parent_id) if t.parent_id else None,
-            step_count=t.step_count,
-            total_tokens=t.total_tokens_used,
-            created_at=t.created_at.isoformat(),
-            updated_at=t.updated_at.isoformat(),
-        )
+为 UI 提供任务频率的人类可读描述。
 
-    async def list_engine_threads(
-            project_id: Optional[str],
-            user_id: str,
-    ) -> List[EngineThreadInfo]:
-        """列出引擎线程，可选按项目过滤。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return []
-        guard = await lock.read()
-        if guard is None:
-            return []
+对于 cron 表达式，识别常见模式（"每小时"、"每周一 09:00" 等），
+对于无法识别的模式回退到 `"cron: <expression>"`。
+其他频率类型包含其模式/路径，以便用户可以看到触发任务的内容。
+"""
+    if isinstance(cadence, MissionCadence.Cron):
+        base = describe_cron(cadence.expression) or f"cron: {cadence.expression}"
+        if cadence.timezone:
+            return f"{base} ({cadence.timezone})"
+        return base
+    elif isinstance(cadence, MissionCadence.OnEvent):
+        return f"on event: {cadence.event_pattern}"
+    elif isinstance(cadence, MissionCadence.OnSystemEvent):
+        return f"on system event: {cadence.source}/{cadence.event_type}"
+    elif isinstance(cadence, MissionCadence.Webhook):
+        return f"webhook: {cadence.path}"
+    elif isinstance(cadence, MissionCadence.Manual):
+        return "manual"
+    return "unknown"
 
-        if project_id is not None:
-            pid = ProjectId(uuid.UUID(project_id))
-        else:
-            pid = guard.default_project_id
 
-        threads = await guard.store.list_threads(pid, user_id)
-        return [thread_to_info(t) for t in threads]
+def describe_cron(expression: str) -> Optional[str]:
+    """
+将 5 字段 cron 表达式翻译为常见模式的英文描述。
+如果表达式不匹配已知形状，返回 `None`；调用者应回退到显示原始表达式。
+"""
+    parts = expression.split()
+    # 接受标准 5 字段 cron；暂时忽略 6/7 字段变体
+    if len(parts) != 5:
+        return None
 
-    async def get_engine_thread(
-            thread_id: str,
-            user_id: str,
-    ) -> Optional[EngineThreadDetail]:
-        """按 ID 获取单个引擎线程。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return None
-        guard = await lock.read()
-        if guard is None:
-            return None
+    minute, hour, dom, month, dow = parts[0], parts[1], parts[2], parts[3], parts[4]
 
-        tid = ThreadId(uuid.UUID(thread_id))
+    is_any = lambda s: s == "*"
+    parse_num = lambda s: int(s) if s.isdigit() else None
 
-        thread = await guard.store.load_thread(tid)
-        if thread is None:
-            return None
+    def day_name(n: int) -> str:
+        names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        return names[n % 7] if n % 7 < 7 else ""
 
-        # 所有权检查：仅当线程属于请求用户时才返回
-        if not thread.is_owned_by(user_id):
-            return None
+    # 每分钟
+    if is_any(minute) and is_any(hour) and is_any(dom) and is_any(month) and is_any(dow):
+        return "every minute"
 
-        messages = [
-            {
-                "role": str(m.role),
-                "content": m.content,
-                "timestamp": m.timestamp.isoformat(),
-            }
-            for m in thread.messages
-        ]
+    # 每小时的第 M 分钟
+    m = parse_num(minute)
+    if is_any(hour) and is_any(dom) and is_any(month) and is_any(dow) and m is not None:
+        if m == 0:
+            return "every hour"
+        return f"every hour at :{m:02d}"
 
-        return EngineThreadDetail(
-            id=str(thread.id),
-            goal=thread.goal,
-            title=thread.title or Thread.derive_title_from_message(thread.goal),
-            thread_type=str(thread.thread_type),
-            state=str(thread.state),
-            project_id=str(thread.project_id),
-            parent_id=str(thread.parent_id) if thread.parent_id else None,
-            step_count=thread.step_count,
-            total_tokens=thread.total_tokens_used,
-            created_at=thread.created_at.isoformat(),
-            updated_at=thread.updated_at.isoformat(),
-            messages=messages,
-            max_iterations=thread.config.max_iterations,
-            completed_at=thread.completed_at.isoformat() if thread.completed_at else None,
-            total_cost_usd=thread.total_cost_usd,
-        )
+    # 每天 H:M（无星期几、无月中日限制）
+    if is_any(dom) and is_any(month) and is_any(dow):
+        m = parse_num(minute)
+        h = parse_num(hour)
+        if m is not None and h is not None:
+            return f"every day at {h:02d}:{m:02d}"
 
-    async def list_engine_thread_steps(
-            thread_id: str,
-            user_id: str,
-    ) -> List[EngineStepInfo]:
-        """列出线程的步骤。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return []
-        guard = await lock.read()
-        if guard is None:
-            return []
+    # 每周特定一天 H:M
+    if is_any(dom) and is_any(month):
+        m = parse_num(minute)
+        h = parse_num(hour)
+        d = parse_num(dow)
+        if m is not None and h is not None and d is not None:
+            name = day_name(d)
+            if name:
+                return f"every {name} at {h:02d}:{m:02d}"
 
-        tid = uuid.UUID(thread_id)
+    # 每月特定日期 H:M
+    if is_any(month) and is_any(dow):
+        m = parse_num(minute)
+        h = parse_num(hour)
+        d = parse_num(dom)
+        if m is not None and h is not None and d is not None:
+            return f"monthly on day {d} at {h:02d}:{m:02d}"
 
-        # 在返回步骤之前验证线程所有权
-        thread = await guard.store.load_thread(ThreadId(tid))
-        if thread is None or not thread.is_owned_by(user_id):
-            return []
+    return None
 
-        steps = await guard.store.load_steps(ThreadId(tid))
-        return [
-            EngineStepInfo(
-                id=str(s.id),
-                sequence=s.sequence,
-                status=str(s.status),
-                tier=str(s.tier),
-                action_results_count=len(s.action_results),
-                tokens_input=s.tokens_used.input_tokens,
-                tokens_output=s.tokens_used.output_tokens,
-                started_at=s.started_at.isoformat(),
-                completed_at=s.completed_at.isoformat() if s.completed_at else None,
-            )
-            for s in steps
-        ]
 
-    async def list_engine_thread_events(
-            thread_id: str,
-            user_id: str,
-    ) -> List[Dict[str, Any]]:
-        """将线程事件列出为原始 JSON 值。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return []
-        guard = await lock.read()
-        if guard is None:
-            return []
+def thread_to_info(t: Thread) -> EngineThreadInfo:
+    """
+将引擎线程转换为线程信息 DTO。
 
-        tid = uuid.UUID(thread_id)
+对于在 `title` 字段存在之前持久化的遗留线程，回退到从 `goal`
+派生的简短标签。没有这个，`EngineThreadInfo` 的前端消费者
+（TUI、任务详情视图）会渲染 UUID 前缀，因为 DTO 缺少 `turn_count`。
+"""
+    title = t.title if t.title else Thread.derive_title_from_message(t.goal)
+    return EngineThreadInfo(
+        id=str(t.id),
+        goal=t.goal,
+        title=title,
+        thread_type=str(t.thread_type),
+        state=str(t.state),
+        project_id=str(t.project_id),
+        parent_id=str(t.parent_id) if t.parent_id else None,
+        step_count=t.step_count,
+        total_tokens=t.total_tokens_used,
+        created_at=t.created_at.isoformat(),
+        updated_at=t.updated_at.isoformat(),
+    )
 
-        # 在返回事件之前验证线程所有权
-        thread = await guard.store.load_thread(ThreadId(tid))
-        if thread is None or not thread.is_owned_by(user_id):
-            return []
 
-        events = await guard.store.load_events(ThreadId(tid))
-        import json
-        result = []
-        for e in events:
-            try:
-                result.append(json.loads(json.dumps(e, default=str)))
-            except Exception:
-                pass
-        return result
+async def list_engine_threads(
+        project_id: Optional[str],
+        user_id: str,
+) -> List[EngineThreadInfo]:
+    """列出引擎线程，可选按项目过滤。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return []
+    guard = await lock.read()
+    if guard is None:
+        return []
 
-    async def list_engine_projects(user_id: str) -> List[EngineProjectInfo]:
-        """列出所有项目。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return []
-        guard = await lock.read()
-        if guard is None:
-            return []
-
-        projects = await guard.store.list_projects(user_id)
-        return [
-            EngineProjectInfo(
-                id=str(p.id),
-                name=p.name,
-                description=p.description,
-                goals=p.goals,
-                metrics=p.metrics,
-                created_at=p.created_at.isoformat(),
-            )
-            for p in projects
-        ]
-
-    async def get_engine_project(
-            project_id: str,
-            user_id: str,
-    ) -> Optional[EngineProjectInfo]:
-        """按 ID 获取单个项目。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return None
-        guard = await lock.read()
-        if guard is None:
-            return None
-
+    if project_id is not None:
         pid = ProjectId(uuid.UUID(project_id))
-        project = await guard.store.load_project(pid)
+    else:
+        pid = guard.default_project_id
 
-        if project is None or not project.is_owned_by(user_id):
-            return None
+    threads = await guard.store.list_threads(pid, user_id)
+    return [thread_to_info(t) for t in threads]
 
-        return EngineProjectInfo(
-            id=str(project.id),
+
+async def get_engine_thread(
+        thread_id: str,
+        user_id: str,
+) -> Optional[EngineThreadDetail]:
+    """按 ID 获取单个引擎线程。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return None
+    guard = await lock.read()
+    if guard is None:
+        return None
+
+    tid = ThreadId(uuid.UUID(thread_id))
+
+    thread = await guard.store.load_thread(tid)
+    if thread is None:
+        return None
+
+    # 所有权检查：仅当线程属于请求用户时才返回
+    if not thread.is_owned_by(user_id):
+        return None
+
+    messages = [
+        {
+            "role": str(m.role),
+            "content": m.content,
+            "timestamp": m.timestamp.isoformat(),
+        }
+        for m in thread.messages
+    ]
+
+    return EngineThreadDetail(
+        id=str(thread.id),
+        goal=thread.goal,
+        title=thread.title or Thread.derive_title_from_message(thread.goal),
+        thread_type=str(thread.thread_type),
+        state=str(thread.state),
+        project_id=str(thread.project_id),
+        parent_id=str(thread.parent_id) if thread.parent_id else None,
+        step_count=thread.step_count,
+        total_tokens=thread.total_tokens_used,
+        created_at=thread.created_at.isoformat(),
+        updated_at=thread.updated_at.isoformat(),
+        messages=messages,
+        max_iterations=thread.config.max_iterations,
+        completed_at=thread.completed_at.isoformat() if thread.completed_at else None,
+        total_cost_usd=thread.total_cost_usd,
+    )
+
+
+async def list_engine_thread_steps(
+        thread_id: str,
+        user_id: str,
+) -> List[EngineStepInfo]:
+    """列出线程的步骤。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return []
+    guard = await lock.read()
+    if guard is None:
+        return []
+
+    tid = uuid.UUID(thread_id)
+
+    # 在返回步骤之前验证线程所有权
+    thread = await guard.store.load_thread(ThreadId(tid))
+    if thread is None or not thread.is_owned_by(user_id):
+        return []
+
+    steps = await guard.store.load_steps(ThreadId(tid))
+    return [
+        EngineStepInfo(
+            id=str(s.id),
+            sequence=s.sequence,
+            status=str(s.status),
+            tier=str(s.tier),
+            action_results_count=len(s.action_results),
+            tokens_input=s.tokens_used.input_tokens,
+            tokens_output=s.tokens_used.output_tokens,
+            started_at=s.started_at.isoformat(),
+            completed_at=s.completed_at.isoformat() if s.completed_at else None,
+        )
+        for s in steps
+    ]
+
+
+async def list_engine_thread_events(
+        thread_id: str,
+        user_id: str,
+) -> List[Dict[str, Any]]:
+    """将线程事件列出为原始 JSON 值。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return []
+    guard = await lock.read()
+    if guard is None:
+        return []
+
+    tid = uuid.UUID(thread_id)
+
+    # 在返回事件之前验证线程所有权
+    thread = await guard.store.load_thread(ThreadId(tid))
+    if thread is None or not thread.is_owned_by(user_id):
+        return []
+
+    events = await guard.store.load_events(ThreadId(tid))
+    import json
+    result = []
+    for e in events:
+        try:
+            result.append(json.loads(json.dumps(e, default=str)))
+        except Exception:
+            pass
+    return result
+
+
+async def list_engine_projects(user_id: str) -> List[EngineProjectInfo]:
+    """列出所有项目。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return []
+    guard = await lock.read()
+    if guard is None:
+        return []
+
+    projects = await guard.store.list_projects(user_id)
+    return [
+        EngineProjectInfo(
+            id=str(p.id),
+            name=p.name,
+            description=p.description,
+            goals=p.goals,
+            metrics=p.metrics,
+            created_at=p.created_at.isoformat(),
+        )
+        for p in projects
+    ]
+
+
+async def get_engine_project(
+        project_id: str,
+        user_id: str,
+) -> Optional[EngineProjectInfo]:
+    """按 ID 获取单个项目。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return None
+    guard = await lock.read()
+    if guard is None:
+        return None
+
+    pid = ProjectId(uuid.UUID(project_id))
+    project = await guard.store.load_project(pid)
+
+    if project is None or not project.is_owned_by(user_id):
+        return None
+
+    return EngineProjectInfo(
+        id=str(project.id),
+        name=project.name,
+        description=project.description,
+        goals=project.goals,
+        metrics=project.metrics,
+        created_at=project.created_at.isoformat(),
+    )
+
+
+def is_real_thread_failure(thread: Thread, h24_ago: datetime) -> bool:
+    """
+检查线程是否代表真实的故障（而非引擎重启恢复）。
+
+过滤由 `recover_project_threads` 在引擎重启时强制失败的线程——
+它们被标记了 `engine_restart_recovery` 元数据，不是可操作的故障。
+"""
+    if thread.state != ThreadState.Failed:
+        return False
+    if thread.updated_at < h24_ago:
+        return False
+    recovery_flag = thread.metadata.get(ENGINE_RESTART_RECOVERY_METADATA_KEY)
+    if recovery_flag is True:
+        return False
+    return True
+
+
+async def get_engine_projects_overview(user_id: str) -> ProjectsOverviewResponse:
+    """
+项目概览——所有项目的健康状态、统计信息、关注项。
+
+遍历所有项目，从任务和线程计算每项目统计信息，
+并将待处理门控收集为关注项。设计用于控制室仪表板，
+用户在此检查高度自主的代理。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return ProjectsOverviewResponse(attention=[], projects=[])
+    guard = await lock.read()
+    if guard is None:
+        return ProjectsOverviewResponse(attention=[], projects=[])
+
+    # 克隆 Arc 以在 I/O 之前释放锁
+    store = guard.store
+    pending_gates = guard.pending_gates
+    guard.release()
+
+    projects = await store.list_projects(user_id)
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    h24_ago = now - timedelta(hours=24)
+
+    # 一次性收集所有用户门控（稍后按 thread_id 键控）
+    user_gates = await pending_gates.list_for_user(user_id)
+
+    # 并发获取所有项目的线程和任务
+    project_data = []
+    for project in projects:
+        pid = project.id
+        threads = await store.list_threads(pid, user_id)
+        missions = await store.list_missions_with_shared(pid, user_id)
+        project_data.append((threads, missions))
+
+    attention: List[AttentionItem] = []
+    entries: List[ProjectOverviewEntry] = []
+
+    for project, (threads, missions) in zip(projects, project_data):
+        pid = project.id
+
+        active_missions = sum(
+            1 for m in missions if m.status == MissionStatus.Active
+        )
+
+        threads_today = sum(
+            1 for t in threads if t.created_at >= today_start
+        )
+
+        cost_today_usd = sum(
+            t.total_cost_usd for t in threads if t.created_at >= today_start
+        )
+
+        # 过滤重启恢复噪音：`recover_project_threads` 在引擎重启时
+        # 强制失败非终端线程，并用 `engine_restart_recovery` 标记它们。
+        # 它们不是可操作的故障，因此我们将它们从计数和关注提要中排除 (#3274)
+        failures_24h = sum(
+            1 for t in threads if is_real_thread_failure(t, h24_ago)
+        )
+
+        last_activity = max(
+            (t.updated_at for t in threads),
+            default=None,
+        )
+        if last_activity is not None:
+            last_activity = last_activity.isoformat()
+
+        # 计算此项目中线程的待处理门控
+        project_thread_ids = {t.id for t in threads}
+        project_gates = [
+            g for g in user_gates if g.thread_id in project_thread_ids
+        ]
+        pending_gate_count = len(project_gates)
+
+        # 为此项目构建关注项
+        for gate in project_gates:
+            attention.append(AttentionItem(
+                kind="gate",
+                project_id=str(pid),
+                project_name=project.name,
+                message=gate.description,
+                thread_id=str(gate.thread_id),
+            ))
+
+        for thread in threads:
+            if is_real_thread_failure(thread, h24_ago):
+                attention.append(AttentionItem(
+                    kind="failure",
+                    project_id=str(pid),
+                    project_name=project.name,
+                    message=f"线程失败: {thread.goal}",
+                    thread_id=str(thread.id),
+                ))
+
+        # 健康状态：红色表示有故障或门控，黄色表示有暂停，绿色表示其他
+        if failures_24h > 0 or pending_gate_count > 0:
+            health = "red"
+        elif any(m.status == MissionStatus.Paused for m in missions):
+            health = "yellow"
+        else:
+            health = "green"
+
+        entries.append(ProjectOverviewEntry(
+            id=str(pid),
             name=project.name,
             description=project.description,
             goals=project.goals,
-            metrics=project.metrics,
+            health=health,
+            active_missions=active_missions,
+            total_missions=len(missions),
+            threads_today=threads_today,
+            cost_today_usd=cost_today_usd,
+            failures_24h=failures_24h,
+            pending_gates=pending_gate_count,
+            last_activity=last_activity,
             created_at=project.created_at.isoformat(),
-        )
+        ))
 
-    def is_real_thread_failure(thread: Thread, h24_ago: datetime) -> bool:
-        """
-    检查线程是否代表真实的故障（而非引擎重启恢复）。
+    return ProjectsOverviewResponse(attention=attention, projects=entries)
 
-    过滤由 `recover_project_threads` 在引擎重启时强制失败的线程——
-    它们被标记了 `engine_restart_recovery` 元数据，不是可操作的故障。
-    """
-        if thread.state != ThreadState.Failed:
-            return False
-        if thread.updated_at < h24_ago:
-            return False
-        recovery_flag = thread.metadata.get(ENGINE_RESTART_RECOVERY_METADATA_KEY)
-        if recovery_flag is True:
-            return False
-        return True
 
-    async def get_engine_projects_overview(user_id: str) -> ProjectsOverviewResponse:
-        """
-    项目概览——所有项目的健康状态、统计信息、关注项。
+async def list_engine_missions(
+        project_id: Optional[str],
+        user_id: str,
+) -> List[EngineMissionInfo]:
+    """列出任务，可选按项目过滤。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return []
+    guard = await lock.read()
+    if guard is None:
+        return []
 
-    遍历所有项目，从任务和线程计算每项目统计信息，
-    并将待处理门控收集为关注项。设计用于控制室仪表板，
-    用户在此检查高度自主的代理。
-    """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return ProjectsOverviewResponse(attention=[], projects=[])
-        guard = await lock.read()
-        if guard is None:
-            return ProjectsOverviewResponse(attention=[], projects=[])
+    if project_id is not None:
+        pid = ProjectId(uuid.UUID(project_id))
+    else:
+        pid = guard.default_project_id
 
-        # 克隆 Arc 以在 I/O 之前释放锁
-        store = guard.store
-        pending_gates = guard.pending_gates
-        guard.release()
-
-        projects = await store.list_projects(user_id)
-
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        h24_ago = now - timedelta(hours=24)
-
-        # 一次性收集所有用户门控（稍后按 thread_id 键控）
-        user_gates = await pending_gates.list_for_user(user_id)
-
-        # 并发获取所有项目的线程和任务
-        project_data = []
-        for project in projects:
-            pid = project.id
-            threads = await store.list_threads(pid, user_id)
-            missions = await store.list_missions_with_shared(pid, user_id)
-            project_data.append((threads, missions))
-
-        attention: List[AttentionItem] = []
-        entries: List[ProjectOverviewEntry] = []
-
-        for project, (threads, missions) in zip(projects, project_data):
-            pid = project.id
-
-            active_missions = sum(
-                1 for m in missions if m.status == MissionStatus.Active
-            )
-
-            threads_today = sum(
-                1 for t in threads if t.created_at >= today_start
-            )
-
-            cost_today_usd = sum(
-                t.total_cost_usd for t in threads if t.created_at >= today_start
-            )
-
-            # 过滤重启恢复噪音：`recover_project_threads` 在引擎重启时
-            # 强制失败非终端线程，并用 `engine_restart_recovery` 标记它们。
-            # 它们不是可操作的故障，因此我们将它们从计数和关注提要中排除 (#3274)
-            failures_24h = sum(
-                1 for t in threads if is_real_thread_failure(t, h24_ago)
-            )
-
-            last_activity = max(
-                (t.updated_at for t in threads),
-                default=None,
-            )
-            if last_activity is not None:
-                last_activity = last_activity.isoformat()
-
-            # 计算此项目中线程的待处理门控
-            project_thread_ids = {t.id for t in threads}
-            project_gates = [
-                g for g in user_gates if g.thread_id in project_thread_ids
-            ]
-            pending_gate_count = len(project_gates)
-
-            # 为此项目构建关注项
-            for gate in project_gates:
-                attention.append(AttentionItem(
-                    kind="gate",
-                    project_id=str(pid),
-                    project_name=project.name,
-                    message=gate.description,
-                    thread_id=str(gate.thread_id),
-                ))
-
-            for thread in threads:
-                if is_real_thread_failure(thread, h24_ago):
-                    attention.append(AttentionItem(
-                        kind="failure",
-                        project_id=str(pid),
-                        project_name=project.name,
-                        message=f"线程失败: {thread.goal}",
-                        thread_id=str(thread.id),
-                    ))
-
-            # 健康状态：红色表示有故障或门控，黄色表示有暂停，绿色表示其他
-            if failures_24h > 0 or pending_gate_count > 0:
-                health = "red"
-            elif any(m.status == MissionStatus.Paused for m in missions):
-                health = "yellow"
-            else:
-                health = "green"
-
-            entries.append(ProjectOverviewEntry(
-                id=str(pid),
-                name=project.name,
-                description=project.description,
-                goals=project.goals,
-                health=health,
-                active_missions=active_missions,
-                total_missions=len(missions),
-                threads_today=threads_today,
-                cost_today_usd=cost_today_usd,
-                failures_24h=failures_24h,
-                pending_gates=pending_gate_count,
-                last_activity=last_activity,
-                created_at=project.created_at.isoformat(),
-            ))
-
-        return ProjectsOverviewResponse(attention=attention, projects=entries)
-
-    async def list_engine_missions(
-            project_id: Optional[str],
-            user_id: str,
-    ) -> List[EngineMissionInfo]:
-        """列出任务，可选按项目过滤。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return []
-        guard = await lock.read()
-        if guard is None:
-            return []
-
-        if project_id is not None:
-            pid = ProjectId(uuid.UUID(project_id))
-        else:
-            pid = guard.default_project_id
-
-        missions = await guard.store.list_missions_with_shared(pid, user_id)
-        return [
-            EngineMissionInfo(
-                id=m.id,
-                name=m.name,
-                goal=m.goal,
-                status=str(m.status),
-                cadence_type=cadence_type_label(m.cadence),
-                cadence_description=cadence_description(m.cadence),
-                thread_count=len(m.thread_history),
-                current_focus=m.current_focus,
-                created_at=m.created_at.isoformat(),
-                updated_at=m.updated_at.isoformat(),
-            )
-            for m in missions
-        ]
-
-    async def get_engine_mission(
-            mission_id: str,
-            user_id: str,
-    ) -> Optional[EngineMissionDetail]:
-        """按 ID 获取单个任务。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return None
-        guard = await lock.read()
-        if guard is None:
-            return None
-
-        mid = MissionId(uuid.UUID(mission_id))
-        m = await guard.store.load_mission(mid)
-
-        if m is None:
-            return None
-
-        # 所有权检查：允许访问用户自己的任务和共享任务
-        if m.user_id != user_id and not is_shared_owner(m.user_id):
-            return None
-
-        import json
-        cadence_json = json.loads(json.dumps(m.cadence, default=str))
-
-        # 为生成的线程表加载线程摘要
-        threads: List[EngineThreadInfo] = []
-        for tid in m.thread_history:
-            try:
-                thread = await guard.store.load_thread(tid)
-                if thread is not None:
-                    threads.append(thread_to_info(thread))
-            except Exception:
-                pass
-
-        return EngineMissionDetail(
+    missions = await guard.store.list_missions_with_shared(pid, user_id)
+    return [
+        EngineMissionInfo(
             id=m.id,
             name=m.name,
             goal=m.goal,
@@ -5343,321 +5339,381 @@ async def has_any_pending_gate(
             current_focus=m.current_focus,
             created_at=m.created_at.isoformat(),
             updated_at=m.updated_at.isoformat(),
-            cadence=cadence_json,
-            approach_history=m.approach_history,
-            notify_channels=m.notify_channels,
-            success_criteria=m.success_criteria,
-            threads_today=m.threads_today,
-            max_threads_per_day=m.max_threads_per_day,
-            next_fire_at=m.next_fire_at.isoformat() if m.next_fire_at else None,
-            threads=threads,
         )
+        for m in missions
+    ]
 
-    async def fire_engine_mission(mission_id: str, user_id: str) -> Optional[str]:
-        """手动触发任务（生成新线程）。"""
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            raise engine_err("未初始化", "引擎 v2 未运行")
-        guard = await lock.read()
-        if guard is None:
-            raise engine_err("未初始化", "引擎 v2 未运行")
 
-        mid = MissionId(uuid.UUID(mission_id))
+async def get_engine_mission(
+        mission_id: str,
+        user_id: str,
+) -> Optional[EngineMissionDetail]:
+    """按 ID 获取单个任务。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return None
+    guard = await lock.read()
+    if guard is None:
+        return None
 
-        mission_manager = await guard.effect_adapter.mission_manager()
-        if mission_manager is None:
-            raise engine_err("任务", "任务管理器不可用")
+    mid = MissionId(uuid.UUID(mission_id))
+    m = await guard.store.load_mission(mid)
 
-        result = await mission_manager.fire_mission(mid, user_id, None)
-        return str(result) if result is not None else None
+    if m is None:
+        return None
 
-    async def pause_engine_mission(
-            mission_id: str,
-            user_id: str,
-            is_admin: bool,
-    ) -> None:
-        """
-    暂停任务。
+    # 所有权检查：允许访问用户自己的任务和共享任务
+    if m.user_id != user_id and not is_shared_owner(m.user_id):
+        return None
 
-    对于共享任务，调用者必须是管理员（传递 `is_admin=True`）。
-    对于用户任务，所有权由引擎强制执行。
-    """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            raise engine_err("未初始化", "引擎 v2 未运行")
-        guard = await lock.read()
-        if guard is None:
-            raise engine_err("未初始化", "引擎 v2 未运行")
+    import json
+    cadence_json = json.loads(json.dumps(m.cadence, default=str))
 
-        mid = uuid.UUID(mission_id)
-        mission_manager = await guard.effect_adapter.mission_manager()
-        if mission_manager is None:
-            raise engine_err("任务", "任务管理器不可用")
-
-        # 共享任务需要管理员角色；传递共享所有者 id 以满足引擎检查
-        effective_user_id = await resolve_mission_user_id(
-            guard.store, mid, user_id, is_admin
-        )
-        await mission_manager.pause_mission(MissionId(mid), effective_user_id)
-
-    async def resume_engine_mission(
-            mission_id: str,
-            user_id: str,
-            is_admin: bool,
-    ) -> None:
-        """
-    恢复暂停的任务。
-
-    对于共享任务，调用者必须是管理员（传递 `is_admin=True`）。
-    对于用户任务，所有权由引擎强制执行。
-    """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            raise engine_err("未初始化", "引擎 v2 未运行")
-        guard = await lock.read()
-        if guard is None:
-            raise engine_err("未初始化", "引擎 v2 未运行")
-
-        mid = uuid.UUID(mission_id)
-        mission_manager = await guard.effect_adapter.mission_manager()
-        if mission_manager is None:
-            raise engine_err("任务", "任务管理器不可用")
-
-        effective_user_id = await resolve_mission_user_id(
-            guard.store, mid, user_id, is_admin
-        )
-        await mission_manager.resume_mission(MissionId(mid), effective_user_id)
-
-    async def reset_engine_state() -> None:
-        """
-    重置全局引擎状态，以便可以初始化全新的引擎。
-
-    由测试装备用于隔离引擎 v2 测试——每个测试获得干净的引擎状态，
-    而不是继承先前测试的 `OnceLock` 单例。
-    """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is not None:
-            await lock.write()
-            ENGINE_STATE = None
-
-    async def override_engine_project_root_for_test(path: Path) -> bool:
-        """
-    仅测试用途的 `EngineState.project_root` 覆盖。
-
-    附件持久化通过缓存的 `bootstrap.ironclaw_base_dir()` 解析路径；
-    在想要断言临时目录的测试中，此覆盖让测试在 `init_engine` 填充
-    `ENGINE_STATE` 后将写入重定向到已知位置。
-    如果覆盖已应用，返回 `True`。
-    """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return False
-        guard = await lock.write()
-        if guard is None:
-            return False
-        guard.project_root = path
-        return True
-
-    async def engine_retrospectives_for_test() -> List[ExecutionTrace]:
-        """
-    为每个当前已知的引擎线程构建回溯 `ExecutionTrace`。
-    当引擎 v2 未初始化时返回空列表。
-
-    仅测试辅助函数：基于快照的重放测试将每个跟踪折叠到
-    `ReplayOutcome.engine_threads` 下的每线程条目中。
-    不是任何公共 API 的一部分；在 `#[doc(hidden)]` 下暴露，
-    因为集成测试位于单独的 crate 中，无法看到 `#[cfg(test)]`-only 项。
-
-    当多个引擎 v2 重放可以并发运行时，调用者必须序列化访问——
-    `ENGINE_STATE` 是进程全局单例，此函数遍历每个项目的每个线程。
-    `tests/e2e_engine_v2.rs` 中的快照测试因此获取 `engine_v2_test_lock()`；
-    生成引擎线程的新测试套件必须执行相同操作，或在调用前通过
-    `reset_engine_state()` 清除状态。
-    """
-        lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
-        if lock is None:
-            return []
-        guard = await lock.read()
-        if guard is None:
-            return []
-
+    # 为生成的线程表加载线程摘要
+    threads: List[EngineThreadInfo] = []
+    for tid in m.thread_history:
         try:
-            projects = await guard.store.list_all_projects()
+            thread = await guard.store.load_thread(tid)
+            if thread is not None:
+                threads.append(thread_to_info(thread))
         except Exception:
-            return []
+            pass
 
-        out: List[ExecutionTrace] = []
-        for project in projects:
+    return EngineMissionDetail(
+        id=m.id,
+        name=m.name,
+        goal=m.goal,
+        status=str(m.status),
+        cadence_type=cadence_type_label(m.cadence),
+        cadence_description=cadence_description(m.cadence),
+        thread_count=len(m.thread_history),
+        current_focus=m.current_focus,
+        created_at=m.created_at.isoformat(),
+        updated_at=m.updated_at.isoformat(),
+        cadence=cadence_json,
+        approach_history=m.approach_history,
+        notify_channels=m.notify_channels,
+        success_criteria=m.success_criteria,
+        threads_today=m.threads_today,
+        max_threads_per_day=m.max_threads_per_day,
+        next_fire_at=m.next_fire_at.isoformat() if m.next_fire_at else None,
+        threads=threads,
+    )
+
+
+async def fire_engine_mission(mission_id: str, user_id: str) -> Optional[str]:
+    """手动触发任务（生成新线程）。"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        raise engine_err("未初始化", "引擎 v2 未运行")
+    guard = await lock.read()
+    if guard is None:
+        raise engine_err("未初始化", "引擎 v2 未运行")
+
+    mid = MissionId(uuid.UUID(mission_id))
+
+    mission_manager = await guard.effect_adapter.mission_manager()
+    if mission_manager is None:
+        raise engine_err("任务", "任务管理器不可用")
+
+    result = await mission_manager.fire_mission(mid, user_id, None)
+    return str(result) if result is not None else None
+
+
+async def pause_engine_mission(
+        mission_id: str,
+        user_id: str,
+        is_admin: bool,
+) -> None:
+    """
+暂停任务。
+
+对于共享任务，调用者必须是管理员（传递 `is_admin=True`）。
+对于用户任务，所有权由引擎强制执行。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        raise engine_err("未初始化", "引擎 v2 未运行")
+    guard = await lock.read()
+    if guard is None:
+        raise engine_err("未初始化", "引擎 v2 未运行")
+
+    mid = uuid.UUID(mission_id)
+    mission_manager = await guard.effect_adapter.mission_manager()
+    if mission_manager is None:
+        raise engine_err("任务", "任务管理器不可用")
+
+    # 共享任务需要管理员角色；传递共享所有者 id 以满足引擎检查
+    effective_user_id = await resolve_mission_user_id(
+        guard.store, mid, user_id, is_admin
+    )
+    await mission_manager.pause_mission(MissionId(mid), effective_user_id)
+
+
+async def resume_engine_mission(
+        mission_id: str,
+        user_id: str,
+        is_admin: bool,
+) -> None:
+    """
+恢复暂停的任务。
+
+对于共享任务，调用者必须是管理员（传递 `is_admin=True`）。
+对于用户任务，所有权由引擎强制执行。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        raise engine_err("未初始化", "引擎 v2 未运行")
+    guard = await lock.read()
+    if guard is None:
+        raise engine_err("未初始化", "引擎 v2 未运行")
+
+    mid = uuid.UUID(mission_id)
+    mission_manager = await guard.effect_adapter.mission_manager()
+    if mission_manager is None:
+        raise engine_err("任务", "任务管理器不可用")
+
+    effective_user_id = await resolve_mission_user_id(
+        guard.store, mid, user_id, is_admin
+    )
+    await mission_manager.resume_mission(MissionId(mid), effective_user_id)
+
+
+async def reset_engine_state() -> None:
+    """
+重置全局引擎状态，以便可以初始化全新的引擎。
+
+由测试装备用于隔离引擎 v2 测试——每个测试获得干净的引擎状态，
+而不是继承先前测试的 `OnceLock` 单例。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is not None:
+        await lock.write()
+        ENGINE_STATE = None
+
+
+async def override_engine_project_root_for_test(path: Path) -> bool:
+    """
+仅测试用途的 `EngineState.project_root` 覆盖。
+
+附件持久化通过缓存的 `bootstrap.ironclaw_base_dir()` 解析路径；
+在想要断言临时目录的测试中，此覆盖让测试在 `init_engine` 填充
+`ENGINE_STATE` 后将写入重定向到已知位置。
+如果覆盖已应用，返回 `True`。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return False
+    guard = await lock.write()
+    if guard is None:
+        return False
+    guard.project_root = path
+    return True
+
+
+async def engine_retrospectives_for_test() -> List[ExecutionTrace]:
+    """
+为每个当前已知的引擎线程构建回溯 `ExecutionTrace`。
+当引擎 v2 未初始化时返回空列表。
+
+仅测试辅助函数：基于快照的重放测试将每个跟踪折叠到
+`ReplayOutcome.engine_threads` 下的每线程条目中。
+不是任何公共 API 的一部分；在 `#[doc(hidden)]` 下暴露，
+因为集成测试位于单独的 crate 中，无法看到 `#[cfg(test)]`-only 项。
+
+当多个引擎 v2 重放可以并发运行时，调用者必须序列化访问——
+`ENGINE_STATE` 是进程全局单例，此函数遍历每个项目的每个线程。
+`tests/e2e_engine_v2.rs` 中的快照测试因此获取 `engine_v2_test_lock()`；
+生成引擎线程的新测试套件必须执行相同操作，或在调用前通过
+`reset_engine_state()` 清除状态。
+"""
+    lock = ENGINE_STATE.get() if ENGINE_STATE is not None else None
+    if lock is None:
+        return []
+    guard = await lock.read()
+    if guard is None:
+        return []
+
+    try:
+        projects = await guard.store.list_all_projects()
+    except Exception:
+        return []
+
+    out: List[ExecutionTrace] = []
+    for project in projects:
+        try:
+            threads = await guard.store.list_all_threads(project.id)
+        except Exception:
+            continue
+
+        for thread in threads:
             try:
-                threads = await guard.store.list_all_threads(project.id)
+                events = await guard.store.load_events(thread.id)
+                thread.events = events
             except Exception:
-                continue
+                pass
+            out.append(build_trace(thread))
 
-            for thread in threads:
-                try:
-                    events = await guard.store.load_events(thread.id)
-                    thread.events = events
-                except Exception:
-                    pass
-                out.append(build_trace(thread))
+    return out
 
-        return out
 
-    async def resolve_mission_user_id(
-            store: Store,
-            mid: uuid.UUID,
-            user_id: str,
-            is_admin: bool,
-    ) -> str:
-        """
-    解析任务管理操作的有效 user_id。
-
-    如果任务是共享拥有的，则需要管理员角色并返回共享所有者 id，
-    以便引擎所有权检查通过。否则返回调用者的 user_id。
+async def resolve_mission_user_id(
+        store: Store,
+        mid: uuid.UUID,
+        user_id: str,
+        is_admin: bool,
+) -> str:
     """
+解析任务管理操作的有效 user_id。
+
+如果任务是共享拥有的，则需要管理员角色并返回共享所有者 id，
+以便引擎所有权检查通过。否则返回调用者的 user_id。
+"""
+    try:
+        mission = await store.load_mission(MissionId(mid))
+    except Exception:
+        mission = None
+
+    if mission is not None and is_shared_owner(mission.user_id):
+        if not is_admin:
+            raise engine_err(
+                "禁止访问",
+                "共享任务只能由管理员管理",
+            )
+        return shared_owner_id()
+
+    return user_id
+
+
+# ── 遗留迁移 ────────────────────────────────────────────
+
+async def migrate_legacy_user_ids(store: Store, owner_id: str) -> None:
+    """
+一次性迁移：将所有者的 user_id 标记到任何使用 serde 默认值
+`"legacy"` 反序列化的引擎记录上（多租户之前的数据）。
+
+在引擎初始化时、用户范围查询之前运行。迁移后，记录可以通过
+所有者身份找到，并且 "legacy" 哨兵消失。
+"""
+    # 项目
+    try:
+        legacy_projects = await store.list_projects("legacy")
+        for project in legacy_projects:
+            project.user_id = owner_id
+            project.updated_at = datetime.now(timezone.utc)
+            try:
+                await store.save_project(project)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 我们需要一个 project_id 来查询线程/任务/文档。
+    # 使用现在已迁移的 owner_id 调用 list_projects，
+    # 或在保存失败时回退到 "legacy"。
+    all_projects = await store.list_projects(owner_id) or []
+
+    for project in all_projects:
+        pid = project.id
+
+        # 线程
         try:
-            mission = await store.load_mission(MissionId(mid))
+            legacy_threads = await store.list_all_threads(pid)
+            for thread in legacy_threads:
+                if thread.user_id == "legacy":
+                    thread.user_id = owner_id
+                    thread.updated_at = datetime.now(timezone.utc)
+                    try:
+                        await store.save_thread(thread)
+                    except Exception:
+                        pass
         except Exception:
-            mission = None
+            pass
 
-        if mission is not None and is_shared_owner(mission.user_id):
-            if not is_admin:
-                raise engine_err(
-                    "禁止访问",
-                    "共享任务只能由管理员管理",
-                )
-            return shared_owner_id()
-
-        return user_id
-
-    # ── 遗留迁移 ────────────────────────────────────────────
-
-    async def migrate_legacy_user_ids(store: Store, owner_id: str) -> None:
-        """
-    一次性迁移：将所有者的 user_id 标记到任何使用 serde 默认值
-    `"legacy"` 反序列化的引擎记录上（多租户之前的数据）。
-
-    在引擎初始化时、用户范围查询之前运行。迁移后，记录可以通过
-    所有者身份找到，并且 "legacy" 哨兵消失。
-    """
-        # 项目
+        # 任务
         try:
-            legacy_projects = await store.list_projects("legacy")
-            for project in legacy_projects:
-                project.user_id = owner_id
-                project.updated_at = datetime.now(timezone.utc)
+            legacy_missions = await store.list_all_missions(pid)
+            for mission in legacy_missions:
+                if mission.user_id == "legacy":
+                    # 系统学习任务保持 "system"；仅标记真正孤立的
+                    mission.user_id = owner_id
+                    mission.updated_at = datetime.now(timezone.utc)
+                    try:
+                        await store.save_mission(mission)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 内存文档（直接使用 list_memory_docs，因为 "legacy" 是 user_id）。
+        # PR 之前的代码将所有迁移的技能标记为 __shared__，因此遗留 Skill
+        # 文档必须恢复到 shared_owner_id()——将它们标记为 owner_id
+        # 会使它们对 list_skills_global() 不可见，并破坏网关用户的
+        # 跨项目可见性（问题 #2084）。
+        try:
+            legacy_docs = await store.list_memory_docs(pid, "legacy")
+            for doc in legacy_docs:
+                doc.user_id = (
+                    shared_owner_id()
+                    if doc.doc_type == DocType.Skill
+                    else owner_id
+                )
+                doc.updated_at = datetime.now(timezone.utc)
                 try:
-                    await store.save_project(project)
+                    await store.save_memory_doc(doc)
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # 我们需要一个 project_id 来查询线程/任务/文档。
-        # 使用现在已迁移的 owner_id 调用 list_projects，
-        # 或在保存失败时回退到 "legacy"。
-        all_projects = await store.list_projects(owner_id) or []
+    # 从旧 frontmatter（在 project_id 持久化之前）反序列化的内存文档
+    # 以 project_id = nil 加载。上面的每项目循环永远不会匹配它们，
+    # 因为 nil 不是真实项目。将它们分配给所有者的默认项目，
+    # 以便它们对项目范围的查询可见。
+    if all_projects:
+        default_project = all_projects[0]
+        nil_pid = ProjectId(uuid.UUID(int=0))
+        try:
+            orphaned = await store.list_memory_docs(nil_pid, "legacy")
+            for doc in orphaned:
+                doc.project_id = default_project.id
+                doc.user_id = (
+                    shared_owner_id()
+                    if doc.doc_type == DocType.Skill
+                    else owner_id
+                )
+                doc.updated_at = datetime.now(timezone.utc)
+                try:
+                    await store.save_memory_doc(doc)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        for project in all_projects:
-            pid = project.id
+    logger.debug(
+        "engine v2: 所有者 %s 的遗留 user_id 迁移完成",
+        owner_id,
+    )
 
-            # 线程
-            try:
-                legacy_threads = await store.list_all_threads(pid)
-                for thread in legacy_threads:
-                    if thread.user_id == "legacy":
-                        thread.user_id = owner_id
-                        thread.updated_at = datetime.now(timezone.utc)
-                        try:
-                            await store.save_thread(thread)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
 
-            # 任务
-            try:
-                legacy_missions = await store.list_all_missions(pid)
-                for mission in legacy_missions:
-                    if mission.user_id == "legacy":
-                        # 系统学习任务保持 "system"；仅标记真正孤立的
-                        mission.user_id = owner_id
-                        mission.updated_at = datetime.now(timezone.utc)
-                        try:
-                            await store.save_mission(mission)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            # 内存文档（直接使用 list_memory_docs，因为 "legacy" 是 user_id）。
-            # PR 之前的代码将所有迁移的技能标记为 __shared__，因此遗留 Skill
-            # 文档必须恢复到 shared_owner_id()——将它们标记为 owner_id
-            # 会使它们对 list_skills_global() 不可见，并破坏网关用户的
-            # 跨项目可见性（问题 #2084）。
-            try:
-                legacy_docs = await store.list_memory_docs(pid, "legacy")
-                for doc in legacy_docs:
-                    doc.user_id = (
-                        shared_owner_id()
-                        if doc.doc_type == DocType.Skill
-                        else owner_id
-                    )
-                    doc.updated_at = datetime.now(timezone.utc)
-                    try:
-                        await store.save_memory_doc(doc)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # 从旧 frontmatter（在 project_id 持久化之前）反序列化的内存文档
-        # 以 project_id = nil 加载。上面的每项目循环永远不会匹配它们，
-        # 因为 nil 不是真实项目。将它们分配给所有者的默认项目，
-        # 以便它们对项目范围的查询可见。
-        if all_projects:
-            default_project = all_projects[0]
-            nil_pid = ProjectId(uuid.UUID(int=0))
-            try:
-                orphaned = await store.list_memory_docs(nil_pid, "legacy")
-                for doc in orphaned:
-                    doc.project_id = default_project.id
-                    doc.user_id = (
-                        shared_owner_id()
-                        if doc.doc_type == DocType.Skill
-                        else owner_id
-                    )
-                    doc.updated_at = datetime.now(timezone.utc)
-                    try:
-                        await store.save_memory_doc(doc)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        logger.debug(
-            "engine v2: 所有者 %s 的遗留 user_id 迁移完成",
-            owner_id,
-        )
-
-    def clamp_always_to_resume_kind(always: bool, resume_kind: ResumeKind) -> bool:
-        """
-    将调用者提供的 `always` 批准标志限制为待处理门控的
-    `ResumeKind` 实际允许的范围。
-
-    受保护操作的门控（编排器自我修改写入）通告
-    `ResumeKind::Approval { allow_always: false }`，因此 UI 隐藏
-    "始终批准"按钮。但批准 HTTP 端点仍然接受用户提供的
-    `always: true`，因此没有此限制，精心构造的请求可以为
-    `memory_write` 安装会话范围的自动批准，并绕过每个后续的每次调用门控。
-    待处理门控自己的 `allow_always` 是权威的服务器端策略。
-
-    非批准恢复类型（auth、外部回调）不携带 "always" 语义，
-    始终限制为 `false`。
+def clamp_always_to_resume_kind(always: bool, resume_kind: ResumeKind) -> bool:
     """
-        if not always:
-            return False
-        return (
-                isinstance(resume_kind, ResumeKind.Approval)
-                and resume_kind.allow_always
-        )
+将调用者提供的 `always` 批准标志限制为待处理门控的
+`ResumeKind` 实际允许的范围。
+
+受保护操作的门控（编排器自我修改写入）通告
+`ResumeKind::Approval { allow_always: false }`，因此 UI 隐藏
+"始终批准"按钮。但批准 HTTP 端点仍然接受用户提供的
+`always: true`，因此没有此限制，精心构造的请求可以为
+`memory_write` 安装会话范围的自动批准，并绕过每个后续的每次调用门控。
+待处理门控自己的 `allow_always` 是权威的服务器端策略。
+
+非批准恢复类型（auth、外部回调）不携带 "always" 语义，
+始终限制为 `false`。
+"""
+    if not always:
+        return False
+    return (
+            isinstance(resume_kind, ResumeKind.Approval)
+            and resume_kind.allow_always
+    )
