@@ -16,7 +16,6 @@ from engine import (
     ThreadConfig,
     ThreadManager,
     ThreadOutcome,
-    GateResolution
 )
 
 from ironclaw_common import AppEvent
@@ -37,13 +36,21 @@ from extensions.naming import legacy_extension_alias
 from gate.pending import (PendingGate, PendingGateKey)
 from gate.store import PendingGateStore, GateStoreError
 from engine.gate import (
+    # 用户对于gage的处理结果
     GateResolution,
     GateResolutionApproved,
     GateResolutionDenied,
     GateResolutionDenied,
     GateResolutionCredentialProvided,
     GateResolutionCancelled,
-    GateResolutionExternalCallback
+    GateResolutionExternalCallback,
+
+    # gate的处理方式
+    ResumeKind,
+    ResumeKindApproval,
+    ResumeKindAuthentication,
+    ResumeKindExternal,
+    resume_kind_name
 )
 import logging
 from dataclasses import dataclass, field
@@ -55,7 +62,6 @@ from pathlib import Path
 import uuid
 import json
 import asyncio
-from engine import (ResumeKind)
 from llm import user_signals_execution_intent
 import asyncio
 
@@ -143,7 +149,6 @@ class PendingGateResolution:
     # 需要处理的gata，每次仅处理一个
     gate: Optional[PendingGate] = None
 
-
 async def resolve_pending_gate_for_user(
         pending_gates: PendingGateStore,
         user_id: str,
@@ -220,7 +225,7 @@ async def resolve_gate(
         message: IncomingMessage
         thread_id: ThreadId
         request_id: str
-        resolution: 用户的待处理门控
+        resolution: 用户对于gage的处理结果
     """
     await init_engine(agent)
     if ENGINE_STATE_LOCK is None:
@@ -250,37 +255,46 @@ async def resolve_gate(
         # 我们仍然在投递之前安装任何自动批准首选项，以便同一执行中的
         # 后续门控看到策略 `Allow` 而不是再次门控。
         if isinstance(resolution, (GateResolutionApproved, GateResolutionDenied, GateResolutionCancelled)):
+            # 用户是否永久批准
             always_for_inline = (
                 clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
                 if isinstance(resolution, GateResolutionApproved)
                 else False
             )
 
+            # 将'_'替换为 "-"
             legacy_registry_name = legacy_extension_alias(pending.action_name)
             prior_permission = None
             if always_for_inline:
-                await guard.effect_adapter.auto_approve_tool(pending.action_name)
+                # 将工具标记为自动批准（用户表示“始终允许”）
+                await state.effect_adapter.auto_approve_tool(pending.action_name)
                 if legacy_registry_name is not None:
-                    await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
-                prior_permission = await persist_always_allow(agent, guard, pending)
+                    await state.effect_adapter.auto_approve_tool(legacy_registry_name)
+
+                # 当用户点击"始终批准"时，将 `AlwaysAllow` 持久化到数据库
+                prior_permission = await persist_always_allow(agent, state, pending)
 
             inline_resolution = resolution
-            if isinstance(resolution, GateResolution.Approved):
-                inline_resolution = GateResolution.Approved(always=always_for_inline)
+            if isinstance(resolution, GateResolutionApproved):
+                inline_resolution = GateResolutionApproved(always=always_for_inline)
 
-            if await guard.gate_controller.try_deliver(request_id, inline_resolution):
-                if guard.sse is not None:
-                    if isinstance(resolution, GateResolution.Approved):
+            # 将解析结果转发到内联等待注册表中。如果引擎正在主动等待它，则返回 true
+            if await state.gate_controller.try_deliver(request_id, inline_resolution):
+                if state.sse is not None:
+                    if isinstance(resolution, GateResolutionApproved):
                         label = "approved_always" if always_for_inline else "approved"
                         status_msg = "门控已批准。正在恢复执行。"
-                    elif isinstance(resolution, GateResolution.Denied):
+                    elif isinstance(resolution, GateResolutionDenied):
                         label = "denied"
                         status_msg = "门控已拒绝。"
                     else:
                         label = "cancelled"
                         status_msg = "门控已取消。"
 
-                    guard.sse.broadcast_for_user(
+                    # 广播限定于特定用户的事件。
+                    #
+                    # 只有订阅了该 user_id 的订阅者（或无范围限定的订阅者）才会收到此事件。
+                    state.sse.broadcast_for_user(
                         message.user_id,
                         AppEvent.GateResolved(
                             request_id=str(pending.request_id),
@@ -288,7 +302,7 @@ async def resolve_gate(
                             tool_name=pending.action_name,
                             resolution=label,
                             message=status_msg,
-                            thread_id=pending.effective_wire_thread_id(),
+                            thread_id=pending.effective_wire_thread_id,
                         ),
                     )  # 投影豁免：桥接调度器，内联等待快速路径解析事件
                 return BridgeOutcome.Pending
@@ -297,15 +311,18 @@ async def resolve_gate(
             # 内联等待接收器的代码路径创建的）。回滚我们刚刚安装的任何自动批准，
             # 以便后续调用不会看到过时的首选项，然后穿透到下面的遗留重新进入路径。
             if always_for_inline:
-                await guard.effect_adapter.revoke_auto_approve(pending.action_name)
+                await state.effect_adapter.revoke_auto_approve(pending.action_name)
                 if legacy_registry_name is not None:
-                    await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
+                    await state.effect_adapter.revoke_auto_approve(legacy_registry_name)
+
+                # 当恢复的工具执行失败时，从数据库回滚 `AlwaysAllow`。
                 await revert_always_allow(agent, pending, prior_permission)
 
             # 根据解析类型处理
         match resolution:
             case GateResolutionApproved(always):
-                always = clamp_always_to_resume_kind(resolution.always, pending.resume_kind)
+                # 用户是否永久批准
+                always = clamp_always_to_resume_kind(always, pending.resume_kind)
 
                 # 飞行前线程检查，在提交 `AlwaysAllow` 持久化之前 (#2347)：
                 # 如果线程在 `take_verified` 和现在之间被删除，持久化自动批准
@@ -313,15 +330,16 @@ async def resolve_gate(
                 # 因此 `execute_pending_gate_action` 对缺失线程的优雅 `Ok(Respond)` 会绕过它。
                 # 在此处短路。
                 try:
-                    thread = await guard.store.load_thread(pending.thread_id)
+                    thread = await state.store.load_thread(pending.thread_id)
                 except Exception as e:
-                    raise engine_err("加载线程", e)
+                    raise RuntimeError("加载线程", e)
 
                 if thread is None:
-                    return emit_gate_expired_dismissal(guard, message, pending)
+                    # 广播 `GateResolved { resolution: "expired" }` 事件并返回关闭结果。
+                    return emit_gate_expired_dismissal(state, message, pending)
 
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
+                if state.sse is not None:
+                    state.sse.broadcast_for_user(
                         message.user_id,
                         AppEvent.GateResolved(
                             request_id=str(pending.request_id),
@@ -329,21 +347,22 @@ async def resolve_gate(
                             tool_name=pending.action_name,
                             resolution="approved_always" if always else "approved",
                             message="门控已批准。正在恢复执行。",
-                            thread_id=pending.effective_wire_thread_id(),
+                            thread_id=pending.effective_wire_thread_id,
                         ),
                     )
 
                 legacy_registry_name = legacy_extension_alias(pending.action_name)
                 prior_permission = None
                 if always:
-                    await guard.effect_adapter.auto_approve_tool(pending.action_name)
+                    await state.effect_adapter.auto_approve_tool(pending.action_name)
                     if legacy_registry_name is not None:
-                        await guard.effect_adapter.auto_approve_tool(legacy_registry_name)
-                    prior_permission = await persist_always_allow(agent, guard, pending)
+                        await state.effect_adapter.auto_approve_tool(legacy_registry_name)
+                    prior_permission = await persist_always_allow(agent, state, pending)
 
+                # 执行gate的操作
                 result = await execute_pending_gate_action(
                     agent,
-                    guard,
+                    state,
                     message,
                     pending,
                     True,
@@ -351,16 +370,16 @@ async def resolve_gate(
                 )
 
                 if always and isinstance(result, Exception):
-                    await guard.effect_adapter.revoke_auto_approve(pending.action_name)
+                    await state.effect_adapter.revoke_auto_approve(pending.action_name)
                     if legacy_registry_name is not None:
-                        await guard.effect_adapter.revoke_auto_approve(legacy_registry_name)
+                        await state.effect_adapter.revoke_auto_approve(legacy_registry_name)
                     await revert_always_allow(agent, pending, prior_permission)
 
                 return result
 
             case GateResolutionDenied(reason):
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
+                if state.sse is not None:
+                    state.sse.broadcast_for_user(
                         message.user_id,
                         AppEvent.GateResolved(
                             request_id=str(pending.request_id),
@@ -368,7 +387,7 @@ async def resolve_gate(
                             tool_name=pending.action_name,
                             resolution="denied",
                             message="门控已拒绝。",
-                            thread_id=pending.effective_wire_thread_id(),
+                            thread_id=pending.effective_wire_thread_id,
                         ),
                     )
 
@@ -638,6 +657,155 @@ async def resolve_gate(
             pending.conversation_id,
             pending.thread_id,
         )
+
+
+# ----------流程4: 执行待处理gate----------
+# 职责说明:
+#   1. 执行
+
+async def execute_pending_gate_action(
+        agent: Agent,
+        state: EngineState,
+        message: IncomingMessage,
+        pending: PendingGate,
+        approval_already_granted: bool,
+        approval_event: Optional[Tuple[str, bool]],
+) -> BridgeOutcome:
+    """执行待处理门控操作。"""
+    # 加载线程
+    try:
+        thread = await state.store.load_thread(pending.thread_id)
+    except Exception as e:
+        # 瞬态数据库故障——传播以便调用者可以重试，而不是永久丢弃门控
+        raise engine_err("加载线程", e)
+
+    if thread is None:
+        return emit_gate_expired_dismissal(state, message, pending)
+
+    resolved_call_id = await resolved_or_synthetic_call_id_for_pending_action(state, pending)
+
+    lease = await resume_lease_for_pending_gate(pending, state.thread_manager.leases)
+    if lease is None:
+        raise engine_err(
+            "恢复租约",
+            f"没有活动租约覆盖操作 '{pending.action_name}'",
+        )
+
+    exec_ctx = ThreadExecutionContext(
+        thread_id=pending.thread_id,
+        thread_type=thread.thread_type,
+        project_id=thread.project_id,
+        user_id=thread.user_id,
+        step_id=StepId.new(),
+        current_call_id=resolved_call_id,
+        source_channel=pending.source_channel,
+        user_timezone=(
+            ValidTimezone.parse(thread.metadata.get("user_timezone"))
+            if thread.metadata.get("user_timezone")
+            else None
+        ),
+        thread_goal=thread.goal,
+        available_actions_snapshot=None,
+        available_action_inventory_snapshot=None,
+        conversation_scope=None,
+        # 解析后重放：门控已在上游解析，因此不需要真正的控制器。
+        # 惰性控制器将任何意外的重新门控显示为类型化拒绝，而不是重现修复前的回滚错误。
+        gate_controller=CancellingGateController.arc(),
+        # 遗留的 resolved-pending 路径直接将其自己的 `approval_already_granted`
+        # 传递给 `execute_resolved_pending_action`，因此此字段对该路径无关。
+        # 在此重置以保持默认值明显。
+        call_approval_granted=False,
+        # 解析后重放永远不会触发新的内联门控；对话路由在此无关。
+        conversation_id=None,
+    )
+
+    active_leases = await state.thread_manager.leases.active_for_thread(thread.id)
+    try:
+        inventory = await state.effect_adapter.available_action_inventory(
+            active_leases, exec_ctx
+        )
+        available_actions = list(inventory.inline)
+        exec_ctx.available_actions_snapshot = available_actions
+        exec_ctx.available_action_inventory_snapshot = inventory
+    except Exception as error:
+        logger.debug(
+            "加载待处理门控恢复的操作清单失败, thread_id=%s, action=%s: %s",
+            thread.id,
+            pending.action_name,
+            error,
+        )
+
+    state.effect_adapter.reset_call_count()
+    try:
+        result = await state.effect_adapter.execute_resolved_pending_action(
+            pending.action_name,
+            pending.parameters,
+            lease,
+            exec_ctx,
+            approval_already_granted,
+        )
+        await state.thread_manager.resume_thread(
+            pending.thread_id,
+            message.user_id,
+            resumed_action_result_message(
+                resolved_call_id,
+                pending.action_name,
+                result.output,
+            ),
+            approval_event,
+            resolved_call_id,
+        )
+        return await await_thread_outcome(
+            agent,
+            state,
+            message,
+            pending.conversation_id,
+            pending.thread_id,
+        )
+
+    except EngineError.GatePaused as e:
+        # 获取显示参数
+        tool = await state.effect_adapter.tools().get(e.action_name)
+        display_parameters = (
+            redact_params(e.parameters, tool.sensitive_params())
+            if tool
+            else e.parameters
+        )
+
+        pending_gate = PendingGate(
+            request_id=uuid.uuid4(),
+            gate_name=e.gate_name,
+            user_id=message.user_id,
+            thread_id=pending.thread_id,
+            scope_thread_id=pending.scope_thread_id,
+            conversation_id=pending.conversation_id,
+            source_channel=message.channel,
+            action_name=e.action_name,
+            call_id=e.call_id,
+            parameters=e.parameters,
+            display_parameters=display_parameters,
+            description=f"工具 '{e.action_name}' 需要 {e.resume_kind.kind_name()}。",
+            resume_kind=e.resume_kind,
+            created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            # 当恢复的门控立即链接到另一个门控时（例如批准后跟着认证），
+            # 保留发起用户提示。OAuth 回调重放依赖于此作为原始请求，而不是批准负载。
+            original_message=(
+                pending.original_message
+                if pending.original_message is not None
+                else message.content
+            ),
+            resume_output=e.resume_output,
+            paused_lease=e.paused_lease,
+            approval_already_granted=(
+                    approval_already_granted
+                    or isinstance(pending.resume_kind, ResumeKind.Approval)
+            ),
+        )
+        return await insert_and_notify_pending_gate(agent, state, message, pending_gate)
+
+    except Exception as e:
+        raise engine_err("执行待处理门控操作", e)
 
 
 # ----------处理消息----------
@@ -1033,3 +1201,204 @@ def parse_scope_uuid(scope: Optional[str]) -> Optional[uuid.UUID]:
         return uuid.UUID(scope)
     except (ValueError, AttributeError):
         return None
+
+
+async def persist_always_allow_with_store(
+        settings_store: Optional[SettingsStore],
+        state: EngineState,
+        pending: PendingGate,
+) -> Optional[Dict[str, Any]]:
+    """
+    与 [`persist_always_allow`] 相同，但直接接收设置存储，
+    而不是通过 `Agent` 访问。让网关 HTTP 快速路径
+    (`try_resolve_inline_approval_gate`) 可以在没有 `Agent` 引用的情况下
+    安装 AlwaysAllow 首选项，因为 agent-loop mpsc 正是该路径绕过的。
+    """
+    # 在将工具名称用作设置键之前验证它。拒绝包含点号或其他可能
+    # 与点分路径设置命名空间冲突的字符的名称。
+    if not is_valid_admin_tool_name(pending.action_name):
+        logger.debug(
+            "跳过 AlwaysAllow 持久化——无效的工具名称, tool=%s",
+            pending.action_name,
+        )
+        return None
+
+    # 纵深防御：跳过 `ApprovalRequirement::Always` 工具的持久化。
+    # 使用实际的待处理参数，以便正确检测参数依赖的工具
+    # （例如具有高风险命令的 shell）。
+    tool = await state.effect_adapter.tools().get(pending.action_name)
+    is_locked = False
+    if tool is not None:
+        is_locked = tool.requires_approval(pending.parameters) == ApprovalRequirement.Always
+
+    if is_locked:
+        logger.debug(
+            "跳过 AlwaysAllow 持久化——工具声明了 ApprovalRequirement::Always, tool=%s",
+            pending.action_name,
+        )
+        return None
+
+    # 仅使用 CachedSettingsStore。原始 Database 回退绕过了缓存失效，
+    # 导致 GET /api/settings/tools 在 5 分钟 TTL 过期之前提供过时数据。
+    # 在生产环境中，设置存储在有数据库时始终可用；回退是死代码，
+    # 在测试和边缘部署中积极破坏了缓存一致性。
+    if settings_store is None:
+        return None
+
+    store = settings_store
+    key = f"tool_permissions.{pending.action_name}"
+
+    # 读取先前存在的值，以便在失败时恢复它，
+    # 而不是盲目删除长期存在的用户首选项。
+    try:
+        prior = await store.get_setting(pending.user_id, key)
+    except Exception as e:
+        logger.debug(
+            "resolve_gate: 读取先前权限失败，跳过持久化, tool=%s, error=%s",
+            pending.action_name,
+            e,
+        )
+        return None
+
+    val = json.dumps("always_allow")
+
+    # 调度豁免：引擎内部持久化镜像 v1 thread_ops 直写
+    try:
+        await store.set_setting(pending.user_id, key, val)
+        logger.debug(
+            "已将 AlwaysAllow 权限持久化到数据库设置 (engine v2), tool=%s, user_id=%s",
+            pending.action_name,
+            pending.user_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "resolve_gate: 持久化 AlwaysAllow 失败, tool=%s, user_id=%s, error=%s",
+            pending.action_name,
+            pending.user_id,
+            e,
+        )
+
+    return prior
+
+async def persist_always_allow(
+        agent: Agent,
+        state: EngineState,
+        pending: PendingGate,
+) -> Optional[Dict[str, Any]]:
+    """
+    当用户点击"始终批准"时，将 `AlwaysAllow` 持久化到数据库。
+
+    纵深防御：为实际待处理参数声明了 `ApprovalRequirement::Always` 的工具
+    永远不会被持久化（UI 隐藏按钮，但精心构造的客户端可以发送它）。
+    工具名称在用作设置键之前经过验证。
+
+    返回先前存在的权限值（如果有），以便调用者可以通过
+    [`revert_always_allow`] 在失败时恢复它。
+    """
+    return await persist_always_allow_with_store(
+        agent.deps.settings_store, state, pending
+    )
+
+async def revert_always_allow(
+        agent: Agent,
+        pending: PendingGate,
+        prior: Optional[Dict[str, Any]],
+) -> None:
+    """
+    当恢复的工具执行失败时，从数据库回滚 `AlwaysAllow`。
+
+    恢复在 [`persist_always_allow`] 写入 `AlwaysAllow` 之前存在的 `prior` 值。
+    如果没有先前值，则删除该键。
+    """
+    await revert_always_allow_with_store(
+        agent.deps.settings_store, pending, prior
+    )
+
+
+async def revert_always_allow_with_store(
+        settings_store: Optional[SettingsStore],
+        pending: PendingGate,
+        prior: Optional[Dict[str, Any]],
+) -> None:
+    """
+    与 [`revert_always_allow`] 相同，但直接接收设置存储。
+    与 [`persist_always_allow_with_store`] 配对，用于绕过 agent-loop mpsc 的
+    网关 HTTP 快速路径。
+    """
+    if settings_store is None:
+        return
+
+    store = settings_store
+    key = f"tool_permissions.{pending.action_name}"
+
+    try:
+        if prior is not None:
+            # 调度豁免：persist_always_allow 的引擎内部回滚
+            await store.set_setting(pending.user_id, key, prior)
+        else:
+            # 调度豁免：persist_always_allow 的引擎内部回滚
+            await store.delete_setting(pending.user_id, key)
+    except Exception as e:
+        logger.warning(
+            "resolve_gate: 执行失败后回滚 AlwaysAllow 失败, tool=%s, user_id=%s, error=%s",
+            pending.action_name,
+            pending.user_id,
+            e,
+        )
+
+def emit_gate_expired_dismissal(
+        state: EngineState,
+        message: IncomingMessage,
+        pending: PendingGate,
+) -> BridgeOutcome:
+    """
+    广播 `GateResolved { resolution: "expired" }` 事件并返回关闭结果。
+    当目标线程在 `take_verified` 和恢复之间被删除时使用，
+    因此没有活动线程可以执行。
+
+    持久化副作用的调用者（例如 `Approved { always }` 将 `AlwaysAllow` 写入设置）
+    必须使用 `state.store.load_thread` 进行预检，并在持久化之前调用此辅助函数，
+    以免缺失的线程静默提交对从未运行的工具的长期首选项 (#2347)。
+    """
+    logger.debug(
+        "未找到待处理门控的线程；发出过期解析, thread_id=%s, gate=%s, action=%s",
+        pending.thread_id,
+        pending.gate_name,
+        pending.action_name,
+    )
+    if state.sse is not None:
+        state.sse.broadcast_for_user(
+            message.user_id,
+            AppEvent.GateResolved(
+                request_id=str(pending.request_id),
+                gate_name=pending.gate_name,
+                tool_name=pending.action_name,
+                resolution="expired",
+                message="线程不再存在。",
+                thread_id=pending.effective_wire_thread_id(),
+            ),
+        )
+    return BridgeOutcome.Respond("线程不再存在。批准已关闭。")
+
+
+def clamp_always_to_resume_kind(always: bool, resume_kind: ResumeKind) -> bool:
+    """
+    将调用者提供的 `always` 批准标志限制为待处理门控的
+    `ResumeKind` 实际允许的范围。
+
+    受保护操作的门控（编排器自我修改写入）通告
+    `ResumeKind::Approval { allow_always: false }`，因此 UI 隐藏
+    "始终批准"按钮。但批准 HTTP 端点仍然接受用户提供的
+    `always: true`，因此没有此限制，精心构造的请求可以为
+    `memory_write` 安装会话范围的自动批准，并绕过每个后续的每次调用门控。
+    待处理门控自己的 `allow_always` 是权威的服务器端策略。
+
+    非批准恢复类型（auth、外部回调）不携带 "always" 语义，
+    始终限制为 `false`。
+    """
+    if not always:
+        return False
+    return (
+            isinstance(resume_kind, ResumeKindApproval)
+            and resume_kind.allow_always
+    )
