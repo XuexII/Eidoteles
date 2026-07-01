@@ -405,8 +405,8 @@ async def resolve_gate(
                     f"用户拒绝了操作 '{pending.action_name}'。不要重试；选择不同的方法。{reason_text}"
                 )
 
-                guard.effect_adapter.reset_call_count()
-                await guard.thread_manager.resume_thread(
+                state.effect_adapter.reset_call_count()
+                await state.thread_manager.resume_thread(
                     pending.thread_id,
                     message.user_id,
                     deny_msg,
@@ -415,8 +415,8 @@ async def resolve_gate(
                 )
 
             case GateResolutionCancelled():
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
+                if state.sse is not None:
+                    state.sse.broadcast_for_user(
                         message.user_id,
                         AppEvent.GateResolved(
                             request_id=str(pending.request_id),
@@ -424,12 +424,12 @@ async def resolve_gate(
                             tool_name=pending.action_name,
                             resolution="cancelled",
                             message="门控已取消。",
-                            thread_id=pending.effective_wire_thread_id(),
+                            thread_id=pending.effective_wire_thread_id,
                         ),
                     )
 
                 try:
-                    await guard.thread_manager.stop_thread(pending.thread_id, message.user_id)
+                    await state.thread_manager.stop_thread(pending.thread_id, message.user_id)
                 except Exception as e:
                     logger.debug("取消时停止线程失败: %s", e)
 
@@ -437,7 +437,7 @@ async def resolve_gate(
 
             case GateResolutionCredentialProvided(token):
                 if not isinstance(pending.resume_kind, ResumeKind.Authentication):
-                    raise engine_err(
+                    raise RuntimeError(
                         "解析不匹配",
                         "为非认证门控发送了 CredentialProvided",
                     )
@@ -445,9 +445,9 @@ async def resolve_gate(
                 credential_name = pending.resume_kind.credential_name
 
                 submit_target = await resolve_extension_for_action(
-                    guard.auth_manager,
-                    guard.extension_manager,
-                    guard.effect_adapter.tools(),
+                    state.auth_manager,
+                    state.extension_manager,
+                    state.effect_adapter.tools(),
                     pending.action_name,
                     pending.parameters,
                     credential_name,
@@ -455,8 +455,8 @@ async def resolve_gate(
                 )
                 display_name = submit_target
 
-                if guard.sse is not None:
-                    guard.sse.broadcast_for_user(
+                if state.sse is not None:
+                    state.sse.broadcast_for_user(
                         message.user_id,
                         AppEvent.GateResolved(
                             request_id=str(pending.request_id),
@@ -469,7 +469,7 @@ async def resolve_gate(
                     )
 
                 submission = await submit_pending_auth_credential(
-                    guard,
+                    state,
                     str(submit_target),
                     credential_name,
                     resolution.token,
