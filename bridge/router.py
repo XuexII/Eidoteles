@@ -363,6 +363,8 @@ async def resolve_extension_for_action(
         user_id: str,
 ) -> ExtensionName:
     """
+    解决凭证名称与扩展名称的映射问题
+
     解析工具操作的所有者扩展名称，当操作不由扩展支持时，
     回退到凭证名称。这是认证门控显示 + 提交路由逻辑的共享核心——
     相同的 `provider_extension_for_tool + unwrap_or_else(credential_name)` 模式

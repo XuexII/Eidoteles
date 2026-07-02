@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -41,7 +41,7 @@ MAX_REGEX_SIZE = 1 << 16
 
 # ---------- 枚举定义 ----------
 
-class SkillTrust(IntEnum):
+class SkillTrust(str, Enum):
     """
     技能的信任状态，决定其权限上限。
 
@@ -51,29 +51,40 @@ class SkillTrust(IntEnum):
     除非审查了衰减代码中所有使用 min() / 比较的调用点。
     """
     # 注册表/外部技能。仅限只读工具。
-    INSTALLED = 0
+    Installed = "installed"
 
     # 用户放置的技能（本地或工作空间）。完全信任，所有工具可用。
-    TRUSTED = 1
+    Trusted = "trusted"
 
-    def __str__(self) -> str:
-        """对应 Rust 的 Display trait 实现。"""
-        if self == SkillTrust.INSTALLED:
-            return "installed"
-        elif self == SkillTrust.TRUSTED:
-            return "trusted"
-        return ""
-
-
-class SkillSource:
+@dataclass
+class SkillSourcedFromWorkspace:
     """
-    技能从哪里加载"""
+    工作区技能目录（`<workspace>/skills/`）——可信来源
+    """
+    path: Path
 
-    def __init__(self, kind: str, path: Path):
-        # "workspace" / "user" / "installed" / "bundled"
-        self.kind = kind
-        # 对应的路径
-        self.path = Path
+@dataclass
+class SkillSourcedFromUser:
+    """
+    用户技能目录（`~/.ironclaw/skills/`）——可信来源
+    """
+    path: Path
+
+@dataclass
+class SkillSourcedFromInstalled:
+    """
+    已安装技能目录（`~/.ironclaw/installed_skills/`）——已安装来源
+    """
+    path: Path
+
+@dataclass
+class SkillSourcedFromBundled:
+    """
+    编译进二进制文件的内置捆绑技能——可信来源
+    """
+    path: Path
+
+SkillSource = SkillSourcedFromWorkspace | SkillSourcedFromUser | SkillSourcedFromInstalled | SkillSourcedFromBundled
 
 
 # ---------- 数据类定义 ----------
@@ -316,7 +327,7 @@ class LoadedSkill:
     # 原始提示内容（frontmatter 之后的 markdown 正文）。
     prompt_content: str = ""
     # 信任状态（由来源位置决定）。
-    trust: SkillTrust = SkillTrust.INSTALLED
+    trust: SkillTrust = SkillTrust.Installed
     # 此技能从何处加载。
     source: Optional[SkillSource] = None
     # 提示内容的 SHA-256 哈希（加载时计算）。

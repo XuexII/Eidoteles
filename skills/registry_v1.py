@@ -19,9 +19,29 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
+from tarfile import ReadError
 from typing import Optional, List, Dict, Set, Tuple, Any
 from enum import Enum
 import logging
+from .types import (
+    GatingRequirements,
+    LoadedSkill,
+    MAX_PROMPT_FILE_SIZE,
+    # skill 来源
+    SkillSource,
+    SkillSourcedFromWorkspace,
+    SkillSourcedFromUser,
+    SkillSourcedFromInstalled,
+    SkillSourcedFromBundled,
+    SkillTrust
+)
+from .install_metadata import INSTALL_METADATA_FILE_NAME, InstalledSkillMetadata
+from .validation import (
+    SafeRelativePathError,
+    normalize_line_endings,
+    normalize_safe_relative_path,
+    normalize_skill_identifier
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,143 +54,6 @@ MAX_DISCOVERED_SKILLS = 100
 
 # 捆绑目录扫描的默认递归深度
 DEFAULT_MAX_SCAN_DEPTH = 3
-
-# 技能文件的最大大小
-MAX_PROMPT_FILE_SIZE = 500 * 1024  # 500 KB
-
-# 安装元数据文件名
-INSTALL_METADATA_FILE_NAME = ".install_metadata.json"
-
-
-# ── 技能信任级别 ─────────────────────────────────────────────
-
-class SkillTrust(Enum):
-    Trusted = "Trusted"
-    Installed = "Installed"
-
-
-# ── 技能来源 ─────────────────────────────────────────────────
-
-@dataclass
-class SkillSource:
-    """技能来源"""
-    source_type: str
-    path: Path
-
-    @classmethod
-    def Workspace(cls, path: Path) -> "SkillSource":
-        return cls(source_type="Workspace", path=path)
-
-    @classmethod
-    def User(cls, path: Path) -> "SkillSource":
-        return cls(source_type="User", path=path)
-
-    @classmethod
-    def Installed(cls, path: Path) -> "SkillSource":
-        return cls(source_type="Installed", path=path)
-
-    @classmethod
-    def Bundled(cls, path: Path) -> "SkillSource":
-        return cls(source_type="Bundled", path=path)
-
-
-# ── 技能注册表错误 ───────────────────────────────────────────
-
-class SkillRegistryError(Exception):
-    """技能注册表操作的错误类型"""
-
-    @classmethod
-    def NotFound(cls, name: str) -> "SkillRegistryError":
-        return cls(f"未找到技能: {name}")
-
-    @classmethod
-    def ReadError(cls, path: str, reason: str) -> "SkillRegistryError":
-        return cls(f"读取技能文件失败 {path}: {reason}")
-
-    @classmethod
-    def ParseError(cls, name: str, reason: str) -> "SkillRegistryError":
-        return cls(f"解析 '{name}' 的 SKILL.md 失败: {reason}")
-
-    @classmethod
-    def FileTooLarge(cls, name: str, size: int, max_size: int) -> "SkillRegistryError":
-        return cls(f"技能文件过大 '{name}': {size} 字节 (最大 {max_size} 字节)")
-
-    @classmethod
-    def SymlinkDetected(cls, path: str) -> "SkillRegistryError":
-        return cls(f"技能目录中检测到符号链接: {path}")
-
-    @classmethod
-    def GatingFailed(cls, name: str, reason: str) -> "SkillRegistryError":
-        return cls(f"技能 '{name}' 门控失败: {reason}")
-
-    @classmethod
-    def TokenBudgetExceeded(cls, name: str, approx_tokens: int, declared: int) -> "SkillRegistryError":
-        return cls(
-            f"技能 '{name}' 提示超过 token 预算: "
-            f"约 {approx_tokens} tokens 但声明 max_context_tokens={declared}"
-        )
-
-    @classmethod
-    def AlreadyExists(cls, name: str) -> "SkillRegistryError":
-        return cls(f"技能 '{name}' 已存在")
-
-    @classmethod
-    def CannotRemove(cls, name: str, reason: str) -> "SkillRegistryError":
-        return cls(f"无法移除技能 '{name}': {reason}")
-
-    @classmethod
-    def CannotUpdate(cls, name: str, reason: str) -> "SkillRegistryError":
-        return cls(f"无法更新技能 '{name}': {reason}")
-
-    @classmethod
-    def WriteError(cls, path: str, reason: str) -> "SkillRegistryError":
-        return cls(f"写入技能文件失败 {path}: {reason}")
-
-
-# ── 已安装技能元数据 ─────────────────────────────────────────
-
-@dataclass
-class InstalledSkillMetadata:
-    """已安装技能的元数据"""
-    installed_at: Optional[str] = None
-    source_url: Optional[str] = None
-    version: Optional[str] = None
-
-
-# ── 安装文件 ─────────────────────────────────────────────────
-
-@dataclass
-class InstallFile:
-    """安装期间与 SKILL.md 一起物化的额外捆绑文件"""
-    relative_path: Path
-    contents: bytes
-
-
-# ── 已加载技能 ───────────────────────────────────────────────
-
-@dataclass
-class LoadedSkill:
-    """已加载的技能"""
-    manifest: Any  # SkillManifest
-    prompt_content: str
-    trust: SkillTrust
-    source: SkillSource
-    content_hash: str = ""
-    compiled_patterns: List[Any] = field(default_factory=list)
-    lowercased_keywords: List[str] = field(default_factory=list)
-    lowercased_exclude_keywords: List[str] = field(default_factory=list)
-    lowercased_tags: List[str] = field(default_factory=list)
-
-    @staticmethod
-    def compile_patterns(patterns: List[str]) -> List[Any]:
-        """编译正则表达式模式列表"""
-        compiled = []
-        for pattern in patterns:
-            try:
-                compiled.append(re.compile(pattern, re.IGNORECASE))
-            except re.error:
-                logger.debug(f"跳过无效的正则表达式模式: {pattern}")
-        return compiled
 
 
 # ── 技能注册表 ───────────────────────────────────────────────
@@ -215,11 +98,10 @@ class SkillRegistry:
             self, user_dir: Path, installed_dir: Optional[Path] = None
     ) -> "SkillRegistry":
         """构建具有相同共享覆盖但不同用户拥有技能根的新注册表"""
-        registry = SkillRegistry(
-            user_dir=user_dir,
-            bundled_content=self.bundled_content,
-            max_scan_depth=self.max_scan_depth,
-        )
+        registry = (SkillRegistry(user_dir=user_dir).
+                    with_bundled_content(self.bundled_content).
+                    with_max_scan_depth(self.max_scan_depth))
+
         if self.workspace_dir is not None:
             registry = registry.with_workspace_dir(self.workspace_dir)
         if installed_dir is not None:
@@ -253,7 +135,8 @@ class SkillRegistry:
         return hasher.hexdigest()
 
     async def discover_all(self) -> List[str]:
-        """从所有配置的目录发现并加载技能
+        """
+        从所有配置的目录发现并加载技能
 
         发现顺序（名称冲突时较早的优先）：
         1. 工作区技能目录（如果设置）-- Trusted
@@ -267,7 +150,7 @@ class SkillRegistry:
         if self.workspace_dir is not None:
             cap = min(MAX_DISCOVERED_SKILLS, MAX_DISCOVERED_SKILLS - len(loaded_names))
             skills = await self._discover_from_dir(
-                self.workspace_dir, SkillTrust.Trusted, SkillSource.Workspace, cap, 0,
+                self.workspace_dir, SkillTrust.Trusted, SkillSourcedFromWorkspace, cap, 0,
             )
             self._absorb(skills, seen, loaded_names, "workspace")
 
@@ -378,7 +261,7 @@ class SkillRegistry:
                         loaded_name, skill = await self._load_skill_md(skill_md, trust, source)
                         logger.debug(f"已加载技能: {loaded_name}")
                         results.append((loaded_name, skill))
-                    except SkillRegistryError as e:
+                    except Exception as e:
                         logger.warning(f"从 {path.name} 加载技能失败: {e}")
                 elif current_depth < self.max_scan_depth:
                     logger.debug(f"递归进入捆绑目录 {path.name} (深度 {current_depth + 1})")
@@ -398,7 +281,7 @@ class SkillRegistry:
                     loaded_name, skill = await self._load_skill_md(path, trust, source)
                     logger.debug(f"已加载技能: {loaded_name}")
                     results.append((loaded_name, skill))
-                except SkillRegistryError as e:
+                except RuntimeError as e:
                     logger.warning(f"加载技能失败 {path.name}: {e}")
 
         return results
@@ -454,7 +337,7 @@ class SkillRegistry:
 
     async def install_skill(self, content: str) -> str:
         """在运行时从 SKILL.md 内容安装技能"""
-        normalized = _normalize_line_endings(content)
+        normalized = normalize_line_endings(content)
         skill_name, install_content = _normalize_install_content(normalized, None)
 
         if self.has(skill_name):
@@ -597,166 +480,14 @@ class SkillRegistry:
             return None
 
 
-# ── 辅助函数 ─────────────────────────────────────────────────
-
-def _normalize_line_endings(content: str) -> str:
-    """规范化行尾"""
-    return content.replace('\r\n', '\n').replace('\r', '\n')
-
-
-def _validate_install_relative_path(path: Path) -> Path:
-    """验证安装相对路径"""
-    path_str = str(path)
-    if not path_str or path.is_absolute():
-        raise SkillRegistryError.WriteError(
-            path=path_str, reason="安装捆绑路径必须是非空相对路径"
-        )
-
-    # 检查路径遍历
-    for part in path.parts:
-        if part == "..":
-            raise SkillRegistryError.WriteError(
-                path=path_str, reason="安装捆绑路径不能逃逸技能目录"
-            )
-
-    return path
-
-
-def _normalize_install_content(
-        normalized_content: str, requested_identifier: Optional[str]
-) -> Tuple[str, str]:
-    """规范化安装内容"""
-    try:
-        parsed = _parse_skill_md(normalized_content)
-        return (parsed.manifest.name, normalized_content)
-    except SkillRegistryError as e:
-        if "InvalidName" in str(e):
-            # 尝试恢复并规范化名称
-            parsed = _parse_skill_md_for_install_recovery(normalized_content)
-            original_name = parsed.manifest.name
-            normalized_name = requested_identifier or _normalize_skill_identifier(original_name)
-            if normalized_name is None:
-                raise SkillRegistryError.ParseError(
-                    name=original_name,
-                    reason=f"无效的技能名称 '{original_name}' 无法规范化为安全的安装名称",
-                )
-
-            logger.debug(
-                f"安装期间规范化无效的技能名称: "
-                f"original_name={original_name}, normalized_name={normalized_name}"
-            )
-
-            frontmatter, prompt_content = _split_skill_md_frontmatter(normalized_content)
-            rewritten_yaml = _rewrite_frontmatter_name(frontmatter, normalized_name, original_name)
-            rendered = _assemble_skill_md(rewritten_yaml, prompt_content)
-            return (normalized_name, rendered)
-        raise
-
-
-def _parse_skill_md(content: str) -> Any:
-    """解析 SKILL.md 内容"""
-    # 简单实现：分割 frontmatter 和内容
-    lines = content.split('\n')
-    if lines[0].strip() == '---':
-        # 查找结束的 ---
-        end_idx = 1
-        while end_idx < len(lines) and lines[end_idx].strip() != '---':
-            end_idx += 1
-        if end_idx < len(lines):
-            prompt_content = '\n'.join(lines[end_idx + 1:])
-        else:
-            prompt_content = ''
-    else:
-        prompt_content = content
-
-    # 模拟解析结果
-    class ParsedSkill:
-        class Manifest:
-            name = "unknown"
-            activation = None
-            requires = None
-
-        manifest = Manifest()
-
-    return ParsedSkill()
-
-
-def _parse_skill_md_for_install_recovery(content: str) -> Any:
-    """解析 SKILL.md 用于安装恢复"""
-    return _parse_skill_md(content)
-
-
-def _normalize_skill_identifier(name: str) -> Optional[str]:
-    """规范化技能标识符"""
-    if not name:
-        return None
-    # 转换为小写，替换空格为连字符
-    normalized = name.lower().strip()
-    normalized = re.sub(r'[^a-z0-9\-_]', '-', normalized)
-    normalized = re.sub(r'-+', '-', normalized)
-    normalized = normalized.strip('-')
-    return normalized if normalized else None
-
-
-def _split_skill_md_frontmatter(content: str) -> Tuple[str, str]:
-    """分割 SKILL.md 的 frontmatter 和内容"""
-    lines = content.split('\n')
-    if lines[0].strip() == '---':
-        end_idx = 1
-        while end_idx < len(lines) and lines[end_idx].strip() != '---':
-            end_idx += 1
-        frontmatter = '\n'.join(lines[1:end_idx])
-        prompt_content = '\n'.join(lines[end_idx + 1:]) if end_idx < len(lines) else ''
-        return (frontmatter, prompt_content)
-    return ('', content)
-
-
-def _rewrite_frontmatter_name(frontmatter: str, new_name: str, error_label: str) -> str:
-    """重写 frontmatter 中的 name 字段"""
-    lines = frontmatter.split('\n')
-    new_lines = []
-    name_replaced = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('name:') and not name_replaced:
-            new_lines.append(f"name: {new_name}")
-            name_replaced = True
-        else:
-            new_lines.append(line)
-    if not name_replaced:
-        new_lines.append(f"name: {new_name}")
-    return '\n'.join(new_lines)
-
-
-def _assemble_skill_md(yaml: str, prompt_content: str) -> str:
-    """组装 SKILL.md"""
-    rendered = "---\n"
-    rendered += yaml
-    if not rendered.endswith('\n'):
-        rendered += '\n'
-    rendered += "---\n\n"
-    rendered += prompt_content
-    return rendered
-
-
-def _load_from_content(
-        raw_content: str, trust: SkillTrust, source: SkillSource
-) -> Tuple[str, LoadedSkill]:
-    """从内存内容加载和验证技能（无磁盘 I/O）"""
-    if len(raw_content.encode('utf-8')) > MAX_PROMPT_FILE_SIZE:
-        raise SkillRegistryError.FileTooLarge(
-            name="(bundled)", size=len(raw_content.encode('utf-8')), max_size=MAX_PROMPT_FILE_SIZE
-        )
-
-    normalized_content = _normalize_line_endings(raw_content)
-    return _build_loaded_skill(normalized_content, "(bundled)", trust, source)
+# ----------辅助函数----------
 
 
 def _build_loaded_skill(
         normalized_content: str, error_label: str, trust: SkillTrust, source: SkillSource
 ) -> Tuple[str, LoadedSkill]:
     """从规范化内容解析、验证、门控检查和构建 LoadedSkill"""
-    parsed = _parse_skill_md(normalized_content)
+    parsed = parse_skill_md(normalized_content)
     manifest = parsed.manifest
     prompt_content = getattr(parsed, 'prompt_content', '')
 
@@ -794,36 +525,31 @@ def _build_loaded_skill(
     return (name, skill)
 
 
+# 从磁盘加载并校验单个 SKILL.md 文件
+#
+# 读取文件内容，校验软链接与文件大小限制，随后交由 `build_loaded_skill`
+# 完成解析、合法性校验与实例构建工作
 async def load_and_validate_skill(
         path: Path, trust: SkillTrust, source: SkillSource
 ) -> Tuple[str, LoadedSkill]:
     """从磁盘加载和验证单个 SKILL.md 文件"""
     if path.is_symlink():
-        raise SkillRegistryError.SymlinkDetected(path=str(path))
+        raise RuntimeError(f"路径是软链接: {str(path)}")
 
     try:
         raw_bytes = path.read_bytes()
     except OSError as e:
-        raise SkillRegistryError.ReadError(path=str(path), reason=str(e))
+        raise ReadError(f"读取文件{str(path)}时报错: {e}")
 
     if len(raw_bytes) > MAX_PROMPT_FILE_SIZE:
-        raise SkillRegistryError.FileTooLarge(
-            name=str(path), size=len(raw_bytes), max_size=MAX_PROMPT_FILE_SIZE
-        )
+        raise ReadError(f"skill文件太大了")
 
     try:
         raw_content = raw_bytes.decode('utf-8')
     except UnicodeDecodeError as e:
-        raise SkillRegistryError.ReadError(path=str(path), reason=f"无效的 UTF-8: {e}")
+        raise ReadError(f"文件{str(path)}不是'utf-8'编码: {e}")
 
-    normalized_content = _normalize_line_endings(raw_content)
+    normalized_content = normalize_line_endings(raw_content)
     error_label = str(path)
 
     return _build_loaded_skill(normalized_content, error_label, trust, source)
-
-
-def compute_hash(content: str) -> str:
-    """计算内容的 SHA-256 哈希，格式为 "sha256:hex..." """
-    hasher = hashlib.sha256()
-    hasher.update(content.encode('utf-8'))
-    return f"sha256:{hasher.hexdigest()}"

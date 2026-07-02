@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LeaseManager:
     """管理能力租约的生命周期
+    允许某个 thread 在特定条件下使用某个 capability 中的某些动作
 
     租约是线程获得能力访问权限的机制。
     它们是作用域受限的（时间限制、使用次数限制、动作限制），
