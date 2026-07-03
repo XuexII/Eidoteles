@@ -1399,6 +1399,7 @@ async def handle_with_engine_inner(
         effective_content = augmented.text if augmented is not None else content
 
         # --------Step6: 触发OnEvent 任务--------
+        # TODO 这里有没有可能设计为小P定时任务
 
         # 触发所有处于活动状态的 OnEvent 任务，其模式（以及可选的频道过滤器）与此入站消息匹配。
         # 此处触发的任务是消息的副作用——独立于下方生成的常规对话线程，且与之并行执行。
