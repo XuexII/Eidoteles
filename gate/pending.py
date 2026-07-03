@@ -25,6 +25,7 @@ class PendingGateKey:
 class PendingGate:
     """
     暂停执行的任何门控的统一待处理状态。
+    用于在执行引擎遇到需要用户干预（批准、认证）时暂停执行，等待用户响应后恢复
 
     替换路由器的 `PendingApproval` 和 `PendingAuth`。
     存储在 [`PendingGateStore`] 中并通过 [`GatePersistence`] 持久化。

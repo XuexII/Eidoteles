@@ -228,7 +228,7 @@ class Thread:
 
     def is_owned_by(self, user_id: str) -> bool:
         """检查线程是否属于指定用户"""
-        return self.owner_id().matches_user(user_id)
+        return self.owner_id.matches_user(user_id)
 
     def set_active_skills(
             self,

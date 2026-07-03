@@ -14,7 +14,6 @@ from ..capability.policy import PolicyEngine
 from ..capability.registry import CapabilityRegistry
 from ..executor import ExecutionLoop
 from ..gate import GateController, CancellingGateController
-from ..memory import RetrievalEngine
 from ..runtime.lease_refresh import reconcile_dynamic_tool_lease
 from ..runtime.messaging import SignalSender, ThreadOutcome, ThreadSignal
 from ..runtime.tree import ThreadTree
@@ -25,6 +24,8 @@ from ..types.event import ThreadEvent, EventKind
 from ..types.message import MessageRole, ThreadMessage
 from ..types.project import ProjectId
 from ..types.thread import Thread, ThreadConfig, ThreadId, ThreadState, ThreadType
+from engine.memory import RetrievalEngine
+from engine.executor import ExecutionLoop
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ class ThreadManager:
         # 持久化
         await self.store.save_thread(thread)
 
-        return await self._start_thread(thread, user_id, False)
+        return await self.start_thread(thread, user_id, False)
 
     async def resume_thread(
             self,
@@ -289,9 +290,9 @@ class ThreadManager:
             thread.metadata.pop("runtime_checkpoint", None)
 
         await self.store.save_thread(thread)
-        await self._start_thread(thread, user_id, True)
+        await self.start_thread(thread, user_id, True)
 
-    async def _start_thread(
+    async def start_thread(
             self,
             thread: Thread,
             user_id: str,
@@ -300,7 +301,7 @@ class ThreadManager:
         """启动线程执行的后台任务。"""
         thread_id = thread.id
 
-        await _reconcile_dynamic_tool_lease(
+        await reconcile_dynamic_tool_lease(
             thread, self.effects, self.leases, self.store, self.lease_planner
         )
 

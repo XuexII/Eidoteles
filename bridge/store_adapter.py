@@ -120,340 +120,273 @@ class HybridStore(Store):
     workspace: Optional[Workspace] = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def save_thread(self, thread: Thread) -> None:
-        """保存线程"""
-        self.threads[thread.id] = thread
-        await self._persist_json(thread_path(thread.id), thread)
+    # ── 状态加载 ──────────────────────────────────────────
 
-    async def load_thread(self, id: ThreadId) -> Optional[Thread]:
-        """加载线程"""
-        # 先检查是否在缓存中
-        if id in self.threads:
-            return self.threads[id]
-
-        # 慢速路径：从数据库重新加载（可能已从内存中驱逐）
-        if self.workspace is not None:
-            try:
-                doc = await self.workspace.read(thread_path(id))
-                thread = Thread(**json.loads(doc))
-                async with self._lock:
-                    self.threads[thread.id] = thread.clone()
-                return thread
-            except Exception:
-                pass
-        return None
-
-    async def list_threads(self, project_id: ProjectId, user_id: str) -> List[Thread]:
-        """列出项目中的线程"""
-        async with self._lock:
-            return [
-                t.clone() for t in self.threads.values()
-                if t.project_id == project_id and t.user_id == user_id
-            ]
-
-    async def update_thread_state(self, id: ThreadId, state: ThreadState) -> None:
-        """更新线程状态"""
-        thread = None
-        async with self._lock:
-            if id in self.threads:
-                self.threads[id].state = state
-                thread = self.threads[id].clone()
-
-        if thread is not None:
-            await self._persist_json(thread_path(id), thread)
-
-    async def save_step(self, step: Step) -> None:
-        """保存步骤"""
-        snapshot = None
-        async with self._lock:
-            if step.thread_id not in self.steps:
-                self.steps[step.thread_id] = []
-            thread_steps = self.steps[step.thread_id]
-
-            # 更新或追加
-            found = False
-            for i, existing in enumerate(thread_steps):
-                if existing.id == step.id:
-                    thread_steps[i] = step.clone()
-                    found = True
-                    break
-            if not found:
-                thread_steps.append(step.clone())
-                thread_steps.sort(key=lambda s: s.sequence)
-
-            snapshot = [s.clone() for s in thread_steps]
-
-        if snapshot is not None:
-            await self._persist_json(step_path(step.thread_id), snapshot)
-
-    async def load_steps(self, thread_id: ThreadId) -> List[Step]:
-        """加载线程的步骤"""
-        async with self._lock:
-            if thread_id in self.steps:
-                return [s.clone() for s in self.steps[thread_id]]
-
-        # 从数据库重新加载（可能已从内存中驱逐）
-        if self.workspace is not None:
-            try:
-                doc = await self.workspace.read(step_path(thread_id))
-                steps_data = json.loads(doc)
-                steps = [Step.from_dict(s) for s in steps_data]
-                async with self._lock:
-                    self.steps[thread_id] = steps
-                return [s.clone() for s in steps]
-            except Exception:
-                pass
-        return []
-
-    async def append_events(self, events: List[ThreadEvent]) -> None:
-        """追加事件"""
-        grouped = {}
-        for event in events:
-            if event.thread_id not in grouped:
-                grouped[event.thread_id] = []
-            grouped[event.thread_id].append(event.clone())
-
-        for thread_id, new_events in grouped.items():
-            snapshot = None
-            async with self._lock:
-                if thread_id not in self.events:
-                    self.events[thread_id] = []
-                thread_events = self.events[thread_id]
-
-                for event in new_events:
-                    if not any(e.id == event.id for e in thread_events):
-                        thread_events.append(event)
-
-                thread_events.sort(key=lambda e: e.timestamp)
-                snapshot = [e.clone() for e in thread_events]
-
-            if snapshot is not None:
-                await self._persist_json(event_path(thread_id), snapshot)
-
-    async def load_events(self, thread_id: ThreadId) -> List[ThreadEvent]:
-        """加载线程的事件"""
-        async with self._lock:
-            if thread_id in self.events:
-                return [e.clone() for e in self.events[thread_id]]
-
-        # 从数据库重新加载（可能已从内存中驱逐）
-        if self.workspace is not None:
-            try:
-                doc = await self.workspace.read(event_path(thread_id))
-                events_data = json.loads(doc)
-                events = [ThreadEvent.from_dict(e) for e in events_data]
-                async with self._lock:
-                    self.events[thread_id] = events
-                return [e.clone() for e in events]
-            except Exception:
-                pass
-        return []
-
-    async def save_project(self, project: Project) -> None:
-        """保存项目"""
-        async with self._lock:
-            self.projects[project.id] = project.clone()
-        await self._persist_json(project_path(project.name), project)
-
-    async def load_project(self, id: ProjectId) -> Optional[Project]:
-        """加载项目"""
-        async with self._lock:
-            if id in self.projects:
-                return self.projects[id].clone()
-        return None
-
-    async def list_projects(self, user_id: str) -> List[Project]:
-        """列出用户的项目"""
-        async with self._lock:
-            return [
-                p.clone() for p in self.projects.values()
-                if p.user_id == user_id
-            ]
-
-    async def list_all_projects(self) -> List[Project]:
-        """列出所有项目"""
-        async with self._lock:
-            return [p.clone() for p in self.projects.values()]
-
-    async def save_memory_doc(self, doc: MemoryDoc) -> None:
-        """保存记忆文档"""
-        # 深度防御：即使调用者绕过了工具级别的检查，也门控编排器/提示写入
-        if is_protected_orchestrator_doc(doc):
-            trusted = is_trusted_internal_write_active()
-
-            # 故障跟踪器是*系统内部*记账文档 — LLM 可达的代码路径不应写入它。
-            # 无论 self-modify 状态如何，拒绝不受信任的写入，
-            # 这样即使在修补开启时攻击者也无法操纵自动回滚预算
-            if not trusted and doc.title == ORCHESTRATOR_FAILURES_TITLE:
-                raise EngineError(
-                    f"AccessDenied: 用户 '{doc.user_id}' 不能访问编排器文档 '{doc.title}'（系统内部跟踪器）"
-                )
-
-            if not self_modify_enabled():
-                if not trusted:
-                    raise EngineError(
-                        f"AccessDenied: 用户 '{doc.user_id}' 不能访问编排器文档 '{doc.title}'（自我修改已禁用）"
-                    )
-            elif not trusted:
-                # 自我修改已启用 — 在持久化之前验证不受信任的（LLM 编写的）补丁，
-                # 这样损坏的补丁不会消耗故障预算槽（3 次故障触发自动回滚）
-                validate_orchestrator_content(doc)
-
-        stamped = doc.clone()
-        # 规范化物理全局文档的 project_id，使其立即出现在任何项目的
-        # `list_shared_memory_docs` 查询结果中
-        if (is_globally_shared(stamped)
-                and is_shared_owner(stamped.user_id)
-                and not _is_nil_uuid(stamped.project_id)):
-            stamped.project_id = _nil_project_id()
-
-        # 在所有受保护文档上标记内容哈希用于审计追踪。
-        # 这是**仅写入时**的操作 — `load_knowledge_docs` 在读取时不验证哈希，
-        # 因为工作区是信任边界（任何有工作区访问权限的人都可以直接编辑文件）。
-        # 哈希为操作员提供了"LLM 在此次写入时持久化了什么"的记录用于事件审查，
-        # 而不是运行时完整性保证
-        if is_protected_orchestrator_doc(doc):
-            hash_val = hashlib.sha256(doc.content.encode('utf-8')).hexdigest()
-            if not isinstance(stamped.metadata, dict):
-                stamped.metadata = {}
-            stamped.metadata["content_hash"] = hash_val
-
-        async with self._lock:
-            self.docs[stamped.id] = stamped.clone()
-        await self._persist_doc(stamped)
-
-    async def load_memory_doc(self, id: DocId) -> Optional[MemoryDoc]:
-        """加载记忆文档"""
-        async with self._lock:
-            if id in self.docs:
-                return self.docs[id].clone()
-        return None
-
-    async def list_memory_docs(
-            self, project_id: ProjectId, user_id: str
-    ) -> List[MemoryDoc]:
-        """列出项目中的记忆文档"""
-        async with self._lock:
-            return [
-                d.clone() for d in self.docs.values()
-                if d.project_id == project_id and d.user_id == user_id
-            ]
-
-    async def list_shared_memory_docs(self, project_id: ProjectId) -> List[MemoryDoc]:
-        """列出共享文档，包括任何项目的物理全局文档
-
-        覆盖默认 trait 实现以包含物理全局文档 —
-        编排器版本、故障跟踪器和提示覆盖，它们都位于一个知名的工作区路径
-        """
-        async with self._lock:
-            out = []
-            seen = set()
-            for doc in self.docs.values():
-                if not is_shared_owner(doc.user_id):
-                    continue
-                # 匹配项目过滤器，或为每个项目显示全局文档
-                if doc.project_id == project_id or (
-                        _is_nil_uuid(doc.project_id) and is_globally_shared(doc)
-                ):
-                    doc_id = doc.id.value if hasattr(doc.id, 'value') else str(doc.id)
-                    if doc_id not in seen:
-                        seen.add(doc_id)
-                        out.append(doc.clone())
-
-            out.sort(key=lambda d: d.id.value if hasattr(d.id, 'value') else str(d.id))
-            return out
-
-    async def save_lease(self, lease: CapabilityLease) -> None:
-        """保存租约"""
-        async with self._lock:
-            self.leases[lease.id] = lease.clone()
-        await self._persist_json(lease_path(lease.id), lease)
-
-    async def load_active_leases(self, thread_id: ThreadId) -> List[CapabilityLease]:
-        """加载线程的活跃租约"""
-        async with self._lock:
-            return [
-                l.clone() for l in self.leases.values()
-                if l.thread_id == thread_id and l.is_valid()
-            ]
-
-    async def revoke_lease(self, lease_id: LeaseId, reason: str) -> None:
-        """撤销租约"""
-        lease = None
-        async with self._lock:
-            if lease_id in self.leases:
-                self.leases[lease_id].revoked = True
-                lease = self.leases[lease_id].clone()
-
-        if lease is not None:
-            await self._persist_json(lease_path(lease_id), lease)
-
-    async def save_mission(self, mission: Mission) -> None:
-        """保存任务"""
-        proj_slug = await self._project_slug(mission.project_id)
-        async with self._lock:
-            self.missions[mission.id] = mission.clone()
-        await self._persist_json(
-            _mission_path(proj_slug, mission.name, mission.id), mission
-        )
-
-    async def load_mission(self, id: MissionId) -> Optional[Mission]:
-        """加载任务"""
-        async with self._lock:
-            if id in self.missions:
-                return self.missions[id].clone()
-        return None
-
-    async def list_missions(
-            self, project_id: ProjectId, user_id: str
-    ) -> List[Mission]:
-        """列出项目中的任务"""
-        async with self._lock:
-            missions = [
-                m.clone() for m in self.missions.values()
-                if m.project_id == project_id and m.user_id == user_id
-            ]
-            missions.sort(key=lambda m: (m.name, m.id.value if hasattr(m.id, 'value') else str(m.id)))
-            return missions
-
-    async def update_mission_status(self, id: MissionId, status: MissionStatus) -> None:
-        """更新任务状态"""
-        mission = None
-        async with self._lock:
-            if id in self.missions:
-                self.missions[id].status = status
-                self.missions[id].updated_at = datetime.now(timezone.utc)
-                mission = self.missions[id].clone()
-
-        if mission is not None:
-            proj_slug = await self._project_slug(mission.project_id)
-            await self._persist_json(
-                _mission_path(proj_slug, mission.name, id), mission
-            )
-
-    # ── 内部辅助方法 ────────────────────────────────────
-
-    async def _project_slug(self, project_id: ProjectId) -> str:
-        """获取项目的 slug（用于引擎内部路径）"""
-        async with self._lock:
-            if project_id in self.projects:
-                p = self.projects[project_id]
-                return slugify(p.name, str(p.id.value)[:8] if hasattr(p.id, 'value') else str(p.id)[:8])
-            short_id = str(project_id.value)[:8] if hasattr(project_id, 'value') else str(project_id)[:8]
-            return f"unknown--{short_id}"
-
-    async def _persist_json(self, path: str, value: Any) -> None:
-        """将值持久化为 JSON 到工作区"""
+    async def load_state_from_workspace(self) -> None:
+        """在启动时从工作区加载持久化的引擎状态"""
         if self.workspace is None:
             return
 
+        ws = self.workspace
+
+        # 在加载器运行之前，将仍然存在于旧 `engine/...` 前缀下的任何状态
+        # 迁移到 `.system/engine/...` 中，以便下面的加载看到单个规范位置，
+        # 并且孤立的旧文档不会累积
+        await self.migrate_legacy_engine_paths(ws)
+        await self.load_knowledge_docs(ws)
+
+        # 将仍然存在于旧引擎路径的任何项目 JSON 迁移到面向用户的
+        # `projects/<slug>/.project.json` 布局中，然后从新位置加载
+        await self.migrate_legacy_project_jsons(ws)
+        await self.load_projects_from_workspace(ws)
+
+        await self.load_map(ws, CONVERSATIONS_PREFIX, self._on_conversation)
+        await self.load_map(ws, THREADS_PREFIX, self._on_thread)
+        await self.load_map(ws, STEPS_PREFIX, self._on_steps)
+        await self.load_map(ws, EVENTS_PREFIX, self._on_events)
+        await self.load_map(ws, LEASES_PREFIX, self._on_lease)
+
+        # 任务位于每个项目下: .system/engine/projects/{slug}/missions/{slug}/mission.json
+        await self.load_missions_from_projects(ws)
+
+        # 回填被任务引用但在活跃线程映射中缺失的线程
+        await self.backfill_archived_threads(ws)
+
+        logger.debug(
+            f"从工作区加载引擎状态: "
+            f"projects={len(self.projects)}, conversations={len(self.conversations)}, "
+            f"threads={len(self.threads)}, steps={len(self.steps)}, "
+            f"events={len(self.events)}, leases={len(self.leases)}, "
+            f"missions={len(self.missions)}, docs={len(self.docs)}"
+        )
+
+    async def migrate_legacy_engine_paths(self, ws: Any) -> None:
+        """一次性启动迁移：将存储在旧 `engine/...` 前缀下的任何文档重写到 `.system/engine/...` 中"""
+        # 廉价的预检：大多数启动没有旧路径，不能为完整的 `list_all()` 遍历付出代价
+        try:
+            entries = await ws.list(LEGACY_ENGINE_ROOT)
+            if not entries:
+                return
+        except Exception as e:
+            logger.debug(f"旧引擎迁移: 预检列表失败: {e}")
+            return
+
+        # 预检看到了什么 — 回退到完整的 `list_all()` 以获取嵌套路径
+        try:
+            all_paths = await ws.list_all()
+        except Exception as e:
+            logger.debug(f"旧引擎迁移: list_all 失败: {e}")
+            return
+
+        legacy = []
+        for p in all_paths:
+            trimmed = p.lstrip('/')
+            if trimmed == LEGACY_ENGINE_ROOT or trimmed.startswith(f"{LEGACY_ENGINE_ROOT}/"):
+                legacy.append(p)
+
+        if not legacy:
+            return
+
+        logger.debug(f"将 {len(legacy)} 个旧引擎路径迁移到 .system/engine/")
+
+        migrated = 0
+        failed = 0
+        for old_path in legacy:
+            trimmed = old_path.lstrip('/')
+            suffix = trimmed[len(LEGACY_ENGINE_ROOT):].lstrip('/')
+            new_path = NEW_ENGINE_ROOT if not suffix else f"{NEW_ENGINE_ROOT}/{suffix}"
+
+            try:
+                doc = await ws.read(old_path)
+            except Exception as e:
+                logger.debug(f"旧引擎迁移: 读取失败: old={old_path}, error={e}")
+                failed += 1
+                continue
+
+            try:
+                already_present = await ws.exists(new_path)
+            except Exception as e:
+                logger.debug(f"旧引擎迁移: 存在性检查失败: old={old_path}, new={new_path}, error={e}")
+                failed += 1
+                continue
+
+            if not already_present:
+                try:
+                    new_doc = await ws.write(new_path, doc.content)
+                    # 保留旧文档的元数据到新文档上
+                    if doc.metadata is not None:
+                        try:
+                            await ws.update_metadata(new_doc.id, doc.metadata)
+                        except Exception as e:
+                            logger.debug(
+                                f"旧引擎迁移: 元数据复制失败: old={old_path}, new={new_path}, error={e}"
+                            )
+                except Exception as e:
+                    logger.debug(f"旧引擎迁移: 写入失败: old={old_path}, new={new_path}, error={e}")
+                    failed += 1
+                    continue
+
+            try:
+                await ws.delete(old_path)
+            except Exception as e:
+                logger.debug(f"旧引擎迁移: 删除失败: old={old_path}, error={e}")
+                failed += 1
+                continue
+
+            migrated += 1
+
+        logger.debug(f"旧引擎迁移: 完成 (migrated={migrated}, failed={failed})")
+
+    async def cleanup_terminal_state(self, min_age: timedelta) -> int:
+        """从内存缓存中驱逐终端（Done/Failed）线程。
+        完整的线程数据（消息、事件、步骤）始终保留在磁盘上 — LLM 输出永远不会被删除。
+        此方法仅从内存映射中移除旧的终端线程以保持 RAM 有界
+        """
+        cleaned = 0
+        now = datetime.now(timezone.utc)
+
+        # 1. 从内存映射中驱逐终端线程（磁盘文件保留）
+        terminal = []
+        for t in self.threads.values():
+            if t.state in (ThreadState.Done, ThreadState.Failed, ThreadState.Completed):
+                at = t.completed_at or t.updated_at
+                if at is not None and (now - at) > min_age:
+                    terminal.append(t)
+
+        for thread in terminal:
+            # 写入紧凑的存档摘要（用于人类可读的浏览）
+            slug = slugify(thread.goal, str(thread.id))
+            archive_path = f"{THREAD_ARCHIVE_PREFIX}/{slug}.json"
+            summary = compact_thread_summary(thread)
+            await self.persist_json(archive_path, summary)
+
+            # 仅从内存映射中驱逐 — 磁盘文件永远不会被删除
+            self.threads.pop(thread.id, None)
+            self.events.pop(thread.id, None)
+            self.steps.pop(thread.id, None)
+            cleaned += 1
+
+        # 2. 从内存中清理已撤销/过期的租约
+        dead_leases = [lid for lid, l in self.leases.items() if l.revoked or not l.is_valid()]
+        for lid in dead_leases:
+            self.leases.pop(lid, None)
+            cleaned += 1
+
+        if cleaned > 0:
+            logger.debug(
+                f"从内存中驱逐了终端状态（磁盘保留）: "
+                f"threads_evicted={len(terminal)}, leases_cleaned={len(dead_leases)}"
+            )
+
+        return cleaned
+
+    async def generate_engine_readme(self) -> None:
+        """生成带有当前引擎状态摘要的 `.system/engine/README.md`"""
+        def count_by_type(dt):
+            return sum(1 for d in self.docs.values() if d.doc_type == dt)
+
+        active_threads = sum(
+            1 for t in self.threads.values()
+            if t.state not in (ThreadState.Done, ThreadState.Failed)
+        )
+        active_leases = sum(1 for l in self.leases.values() if l.is_valid())
+
+        orch_versions = sum(
+            1 for d in self.docs.values()
+            if d.title == ORCHESTRATOR_MAIN_TITLE and ORCHESTRATOR_CODE_TAG in d.tags
+        )
+
+        readme = f"# Engine State\n\n最后更新: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n\n"
+
+        readme += "## 知识 (`.system/engine/knowledge/`)\n\n"
+        readme += f"- **{count_by_type(DocType.Lesson)} 个经验教训** — 学到的规则\n"
+        readme += f"- **{count_by_type(DocType.Skill)} 个技能** — 提取的过程\n"
+        readme += f"- **{count_by_type(DocType.Summary)} 个摘要** — 线程完成记录\n"
+        readme += f"- **{count_by_type(DocType.Spec)} 个规范** — 规格说明\n"
+        readme += f"- **{count_by_type(DocType.Issue)} 个问题** — 已知问题\n"
+
+        readme += f"\n## 编排器 (`.system/engine/orchestrator/`)\n\n- 存储了 {orch_versions} 个版本\n"
+
+        readme += "\n## 任务 (`.system/engine/projects/<project>/missions/`)\n\n"
+        for m in self.missions.values():
+            goal_preview = truncate_for_readme(m.goal, 80)
+            readme += f"- **{m.name}** ({m.status}) — {goal_preview}\n"
+
+        readme += f"\n## 运行时 (`.system/engine/runtime/`)\n\n"
+        readme += f"- {active_threads} 个活跃线程\n"
+        readme += f"- {active_leases} 个活跃租约\n"
+
+        await self.persist_text(".system/engine/README.md", readme)
+
+    # ── 内部辅助方法 ─────────────────────────────────────
+
+    async def load_knowledge_docs(self, ws: Any) -> None:
+        """加载知识文档"""
+        search_prefixes = [KNOWLEDGE_PREFIX, ORCHESTRATOR_PREFIX]
+
+        for prefix in search_prefixes:
+            for entry in await self.file_entries(ws, prefix, [".md", ".json", ".py"]):
+                try:
+                    doc = await ws.read(entry.path)
+                except Exception as e:
+                    logger.debug(f"读取引擎文档失败: path={entry.path}, error={e}")
+                    continue
+
+                parsed = deserialize_knowledge_doc(doc.content)
+                if parsed is None:
+                    try:
+                        parsed = MemoryDoc.from_dict(json.loads(doc.content))
+                    except Exception:
+                        parsed = synthesize_orchestrator_doc_from_py(entry.path, doc.content)
+
+                if parsed is not None:
+                    self.doc_paths[parsed.id] = entry.path
+                    self.docs[parsed.id] = parsed
+                else:
+                    logger.debug(f"跳过引擎中的非文档文件: path={entry.path}")
+
+    async def load_map(self, ws: Any, directory: str, on_value: Callable) -> None:
+        """从目录加载 JSON 文件并应用回调"""
+        for entry in await self.file_entries(ws, directory, [".json"]):
+            try:
+                doc = await ws.read(entry.path)
+                value = json.loads(doc.content)
+                await on_value(value)
+            except Exception as e:
+                logger.debug(f"解析引擎状态失败: path={entry.path}, error={e}")
+
+    async def file_entries(self, ws: Any, directory: str, extensions: List[str]) -> List[Any]:
+        """列出目录下的文件，递归一级到子目录"""
+        try:
+            top = await ws.list(directory)
+        except Exception:
+            return []
+
+        files = []
+        for entry in top:
+            if entry.is_directory:
+                try:
+                    children = await ws.list(entry.path)
+                    for child in children:
+                        if not child.is_directory and any(child.path.endswith(ext) for ext in extensions):
+                            files.append(child)
+                except Exception:
+                    pass
+            elif any(entry.path.endswith(ext) for ext in extensions):
+                files.append(entry)
+        return files
+
+    async def persist_json(self, path: str, value: Any) -> None:
+        """将值持久化为 JSON 到工作区"""
+        if self.workspace is None:
+            return
         try:
             json_str = json.dumps(value, ensure_ascii=False, indent=2, default=str)
             await self.workspace.write(path, json_str)
         except Exception as e:
             logger.debug(f"持久化引擎状态失败: path={path}, error={e}")
 
-    async def _persist_text(self, path: str, content: str) -> None:
+    async def persist_text(self, path: str, content: str) -> None:
         """将文本内容持久化到工作区"""
         if self.workspace is None:
             return
@@ -462,40 +395,485 @@ class HybridStore(Store):
         except Exception as e:
             logger.debug(f"持久化引擎文本失败: path={path}, error={e}")
 
-    async def _persist_doc(self, doc: MemoryDoc) -> None:
-        """将 MemoryDoc 持久化到工作区"""
-        if self.workspace is None:
+    async def load_projects_from_workspace(self, ws: Any) -> None:
+        """从面向用户的工作区中的 `projects/<slug>/.project.json` 加载项目"""
+        try:
+            entries = await ws.list(PROJECTS_ROOT)
+        except Exception:
             return
 
+        for entry in entries:
+            if not entry.is_directory:
+                continue
+            raw_slug = entry.name()
+            meta_path = f"{entry.path}/{PROJECT_METADATA_FILENAME}"
+            try:
+                doc = await ws.read(meta_path)
+                project = Project.from_dict(json.loads(doc.content))
+            except Exception:
+                project = synth_bare_project(raw_slug, ws.user_id())
+                if project is None:
+                    continue
+
+            self.projects[project.id] = project
+
+    async def migrate_legacy_project_jsons(self, ws: Any) -> None:
+        """一次性迁移：将仍然存在于旧引擎内部路径的项目 JSON 迁移到面向用户的布局中"""
+        try:
+            project_dirs = await ws.list(PROJECTS_PREFIX)
+        except Exception:
+            return
+
+        for entry in project_dirs:
+            if not entry.is_directory:
+                continue
+            legacy_path = f"{entry.path}/project.json"
+            try:
+                doc = await ws.read(legacy_path)
+            except Exception:
+                continue
+
+            try:
+                project = Project.from_dict(json.loads(doc.content))
+            except Exception as e:
+                broken_path = f"{entry.path}/project.broken.json"
+                logger.warning(f"旧项目元数据无法解析: {e} — 移动到 {broken_path}: path={legacy_path}")
+                try:
+                    await ws.write(broken_path, doc.content)
+                except Exception as we:
+                    logger.warning(f"写入 {broken_path} 失败: {we}")
+                    continue
+                try:
+                    await ws.delete(legacy_path)
+                except Exception as de:
+                    logger.warning(f"移除旧项目路径失败 {legacy_path}: {de}")
+                continue
+
+            new_path = project_path(project.name)
+            # 如果用户可能已编辑的新元数据文件，不要覆盖
+            try:
+                await ws.read(new_path)
+                await ws.delete(legacy_path)
+                continue
+            except Exception:
+                pass
+
+            try:
+                await ws.write(new_path, doc.content)
+            except Exception as e:
+                logger.warning(f"迁移项目元数据失败: legacy={legacy_path}, new={new_path}, error={e}")
+                continue
+
+            try:
+                await ws.delete(legacy_path)
+            except Exception as e:
+                logger.warning(f"移除旧项目路径失败 {legacy_path}: {e}")
+
+    async def load_missions_from_projects(self, ws: Any) -> None:
+        """从每个项目目录中加载任务"""
+        try:
+            project_dirs = await ws.list(PROJECTS_PREFIX)
+        except Exception:
+            return
+
+        for proj_entry in project_dirs:
+            if not proj_entry.is_directory:
+                continue
+            missions_dir = f"{proj_entry.path}/missions"
+            try:
+                mission_dirs = await ws.list(missions_dir)
+            except Exception:
+                continue
+
+            for mission_entry in mission_dirs:
+                if not mission_entry.is_directory:
+                    continue
+                mission_file = f"{mission_entry.path}/mission.json"
+                try:
+                    doc = await ws.read(mission_file)
+                    mission = Mission.from_dict(json.loads(doc.content))
+                    self.missions[mission.id] = mission
+                except Exception as e:
+                    logger.debug(f"解析任务失败: path={mission_file}, error={e}")
+
+    async def backfill_archived_threads(self, ws: Any) -> None:
+        """回填被任务引用但尚未在内存映射中的线程"""
+        # 收集被任务引用但在线程映射中缺失的线程 ID
+        missing = []
+        for m in self.missions.values():
+            for tid in m.thread_history:
+                if tid not in self.threads:
+                    missing.append(tid)
+
+        if not missing:
+            return
+
+        backfilled = 0
+
+        # 第一次遍历：尝试从数据库中的活跃路径加载完整线程
+        still_missing = []
+        for tid in missing:
+            try:
+                doc = await ws.read(thread_path(tid))
+                thread = Thread.from_dict(json.loads(doc.content))
+                self.threads[thread.id] = thread
+                backfilled += 1
+            except Exception:
+                still_missing.append(str(tid))
+
+        # 第二次遍历：对于旧删除的线程回退到存档摘要
+        if still_missing:
+            missing_set = set(still_missing)
+            try:
+                archive_entries = await ws.list(THREAD_ARCHIVE_PREFIX)
+                for entry in archive_entries:
+                    if entry.is_directory:
+                        continue
+                    try:
+                        doc = await ws.read(entry.path)
+                        summary = ThreadArchiveSummary.from_dict(json.loads(doc.content))
+                        if summary.thread_id in missing_set:
+                            thread = thread_from_archive(summary)
+                            if thread is not None:
+                                self.threads[thread.id] = thread
+                                backfilled += 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if backfilled > 0:
+            logger.debug(f"从数据库回填了 {backfilled} 个任务线程")
+
+    async def project_slug(self, project_id: Any) -> str:
+        """获取引擎内部的任务路径 slug"""
+        if project_id in self.projects:
+            p = self.projects[project_id]
+            return slugify(p.name, str(p.id)[:8])
+        short = str(project_id)[:8]
+        return f"unknown--{short}"
+
+    async def delete_workspace_file(self, path: str) -> None:
+        """删除工作区文件"""
+        if self.workspace is None:
+            return
+        try:
+            await self.workspace.delete(path)
+        except Exception as e:
+            logger.debug(f"删除引擎文件失败: path={path}, error={e}")
+
+    async def persist_doc(self, doc: Any) -> None:
+        """将 MemoryDoc 持久化到工作区"""
         new_path = doc_workspace_path(doc)
 
         # 如果文档之前存在于不同的路径，删除旧的
-        async with self._lock:
-            old_path = self.doc_paths.get(doc.id)
-            if old_path is not None and old_path != new_path:
-                try:
-                    await self.workspace.delete(old_path)
-                except Exception as e:
-                    logger.debug(f"删除旧文档路径失败: path={old_path}, error={e}")
+        old_path = self.doc_paths.get(doc.id)
+        if old_path is not None and old_path != new_path:
+            await self.delete_workspace_file(old_path)
 
         # 根据路径选择序列化格式
         if is_orchestrator_code_path(new_path):
-            # 编排器 Python：存储原始内容（Python 源代码）
             content = doc.content
         elif new_path.lower().endswith(".md"):
-            # 知识文档和提示覆盖：frontmatter + 内容
             content = serialize_knowledge_doc(doc)
         else:
-            # 其他所有内容：JSON
             try:
                 content = json.dumps(doc.to_dict(), ensure_ascii=False, indent=2, default=str)
             except Exception as e:
                 logger.debug(f"序列化文档失败: path={new_path}, error={e}")
                 return
 
-        await self._persist_text(new_path, content)
-        async with self._lock:
-            self.doc_paths[doc.id] = new_path
+        await self.persist_text(new_path, content)
+        self.doc_paths[doc.id] = new_path
+
+    # ── Store 接口实现 ────────────────────────────────────
+
+    async def save_thread(self, thread: Any) -> None:
+        """保存线程"""
+        self.threads[thread.id] = thread.clone() if hasattr(thread, 'clone') else thread
+        await self.persist_json(thread_path(thread.id), thread)
+
+    async def load_thread(self, id: Any) -> Optional[Any]:
+        """加载线程"""
+        if id in self.threads:
+            t = self.threads[id]
+            return t.clone() if hasattr(t, 'clone') else t
+
+        if self.workspace is not None:
+            try:
+                doc = await self.workspace.read(thread_path(id))
+                thread = Thread.from_dict(json.loads(doc.content))
+                self.threads[thread.id] = thread
+                return thread
+            except Exception:
+                pass
+        return None
+
+    async def list_threads(self, project_id: Any, user_id: str) -> List[Any]:
+        """列出项目中的线程"""
+        return [
+            t for t in self.threads.values()
+            if t.project_id == project_id and t.user_id == user_id
+        ]
+
+    async def update_thread_state(self, id: Any, state: Any) -> None:
+        """更新线程状态"""
+        if id in self.threads:
+            self.threads[id].state = state
+            await self.persist_json(thread_path(id), self.threads[id])
+
+    async def save_step(self, step: Any) -> None:
+        """保存步骤"""
+        if step.thread_id not in self.steps:
+            self.steps[step.thread_id] = []
+        thread_steps = self.steps[step.thread_id]
+
+        found = False
+        for i, existing in enumerate(thread_steps):
+            if existing.id == step.id:
+                thread_steps[i] = step
+                found = True
+                break
+        if not found:
+            thread_steps.append(step)
+            thread_steps.sort(key=lambda s: s.sequence)
+
+        await self.persist_json(step_path(step.thread_id), thread_steps)
+
+    async def load_steps(self, thread_id: Any) -> List[Any]:
+        """加载线程的步骤"""
+        if thread_id in self.steps:
+            return list(self.steps[thread_id])
+
+        if self.workspace is not None:
+            try:
+                doc = await self.workspace.read(step_path(thread_id))
+                steps_data = json.loads(doc.content)
+                steps = [Step.from_dict(s) for s in steps_data]
+                self.steps[thread_id] = steps
+                return list(steps)
+            except Exception:
+                pass
+        return []
+
+    async def append_events(self, events: List[Any]) -> None:
+        """追加事件"""
+        grouped = {}
+        for event in events:
+            if event.thread_id not in grouped:
+                grouped[event.thread_id] = []
+            grouped[event.thread_id].append(event)
+
+        for thread_id, new_events in grouped.items():
+            if thread_id not in self.events:
+                self.events[thread_id] = []
+            thread_events = self.events[thread_id]
+
+            for event in new_events:
+                if not any(e.id == event.id for e in thread_events):
+                    thread_events.append(event)
+
+            thread_events.sort(key=lambda e: e.timestamp)
+            await self.persist_json(event_path(thread_id), thread_events)
+
+    async def load_events(self, thread_id: Any) -> List[Any]:
+        """加载线程的事件"""
+        if thread_id in self.events:
+            return list(self.events[thread_id])
+
+        if self.workspace is not None:
+            try:
+                doc = await self.workspace.read(event_path(thread_id))
+                events_data = json.loads(doc.content)
+                events = [ThreadEvent.from_dict(e) for e in events_data]
+                self.events[thread_id] = events
+                return list(events)
+            except Exception:
+                pass
+        return []
+
+    async def save_project(self, project: Any) -> None:
+        """保存项目"""
+        self.projects[project.id] = project
+        await self.persist_json(project_path(project.name), project)
+
+    async def load_project(self, id: Any) -> Optional[Any]:
+        """加载项目"""
+        return self.projects.get(id)
+
+    async def list_projects(self, user_id: str) -> List[Any]:
+        """列出用户的项目"""
+        return [p for p in self.projects.values() if p.user_id == user_id]
+
+    async def list_all_projects(self) -> List[Any]:
+        """列出所有项目"""
+        return list(self.projects.values())
+
+    async def save_conversation(self, conversation: Any) -> None:
+        """保存对话"""
+        self.conversations[conversation.id] = conversation
+        await self.persist_json(conversation_path(conversation.id), conversation)
+
+    async def load_conversation(self, id: Any) -> Optional[Any]:
+        """加载对话"""
+        return self.conversations.get(id)
+
+    async def list_conversations(self, user_id: str) -> List[Any]:
+        """列出用户的对话"""
+        return [c for c in self.conversations.values() if c.user_id == user_id]
+
+    async def save_memory_doc(self, doc: Any) -> None:
+        """保存记忆文档"""
+        # 深度防御：即使调用者绕过了工具级别的检查，也门控编排器/提示写入
+        if is_protected_orchestrator_doc(doc):
+            trusted = is_trusted_internal_write_active()
+
+            if not trusted and doc.title == ORCHESTRATOR_FAILURES_TITLE:
+                raise EngineError(
+                    f"AccessDenied: 用户 '{doc.user_id}' 不能访问编排器文档 "
+                    f"'{doc.title}'（系统内部跟踪器）"
+                )
+
+            if not self_modify_enabled():
+                if not trusted:
+                    raise EngineError(
+                        f"AccessDenied: 用户 '{doc.user_id}' 不能访问编排器文档 "
+                        f"'{doc.title}'（自我修改已禁用）"
+                    )
+            elif not trusted:
+                validate_orchestrator_content(doc)
+
+        stamped = doc.clone() if hasattr(doc, 'clone') else doc
+
+        # 规范化物理全局文档的 project_id
+        if (is_globally_shared(stamped)
+            and is_shared_owner(stamped.user_id)
+            and not _is_nil_uuid(stamped.project_id)):
+            stamped.project_id = ProjectId(uuid.UUID(int=0))
+
+        # 在所有受保护文档上标记内容哈希用于审计追踪
+        if is_protected_orchestrator_doc(doc):
+            hash_val = hashlib.sha256(doc.content.encode('utf-8')).hexdigest()
+            if not isinstance(stamped.metadata, dict):
+                stamped.metadata = {}
+            stamped.metadata["content_hash"] = hash_val
+
+        self.docs[stamped.id] = stamped
+        await self.persist_doc(stamped)
+
+    async def load_memory_doc(self, id: Any) -> Optional[Any]:
+        """加载记忆文档"""
+        return self.docs.get(id)
+
+    async def list_memory_docs(self, project_id: Any, user_id: str) -> List[Any]:
+        """列出项目中的记忆文档"""
+        return [
+            d for d in self.docs.values()
+            if d.project_id == project_id and d.user_id == user_id
+        ]
+
+    async def list_shared_memory_docs(self, project_id: Any) -> List[Any]:
+        """列出对任何项目查询可见的共享文档"""
+        out = []
+        seen = set()
+        for doc in self.docs.values():
+            if not is_shared_owner(doc.user_id):
+                continue
+            if doc.project_id == project_id or (
+                _is_nil_uuid(doc.project_id) and is_globally_shared(doc)
+            ):
+                doc_id = str(doc.id)
+                if doc_id not in seen:
+                    seen.add(doc_id)
+                    out.append(doc)
+
+        out.sort(key=lambda d: str(d.id))
+        return out
+
+    async def list_memory_docs_by_owner(self, user_id: str) -> List[Any]:
+        """按所有者列出记忆文档"""
+        return [d for d in self.docs.values() if d.user_id == user_id]
+
+    async def save_lease(self, lease: Any) -> None:
+        """保存租约"""
+        self.leases[lease.id] = lease
+        await self.persist_json(lease_path(lease.id), lease)
+
+    async def load_active_leases(self, thread_id: Any) -> List[Any]:
+        """加载线程的活跃租约"""
+        return [
+            l for l in self.leases.values()
+            if l.thread_id == thread_id and l.is_valid()
+        ]
+
+    async def revoke_lease(self, lease_id: Any, reason: str) -> None:
+        """撤销租约"""
+        if lease_id in self.leases:
+            self.leases[lease_id].revoked = True
+            await self.persist_json(lease_path(lease_id), self.leases[lease_id])
+
+    async def save_mission(self, mission: Any) -> None:
+        """保存任务"""
+        proj_slug = await self.project_slug(mission.project_id)
+        self.missions[mission.id] = mission
+        await self.persist_json(
+            mission_path(proj_slug, mission.name, mission.id), mission,
+        )
+
+    async def load_mission(self, id: Any) -> Optional[Any]:
+        """加载任务"""
+        return self.missions.get(id)
+
+    async def list_missions(self, project_id: Any, user_id: str) -> List[Any]:
+        """列出项目中的任务"""
+        missions = [
+            m for m in self.missions.values()
+            if m.project_id == project_id and m.user_id == user_id
+        ]
+        missions.sort(key=lambda m: (m.name, str(m.id)))
+        return missions
+
+    async def list_all_threads(self, project_id: Any) -> List[Any]:
+        """列出项目中所有线程（无论用户）"""
+        return [t for t in self.threads.values() if t.project_id == project_id]
+
+    async def list_all_missions(self, project_id: Any) -> List[Any]:
+        """列出项目中所有任务（无论用户）"""
+        missions = [m for m in self.missions.values() if m.project_id == project_id]
+        missions.sort(key=lambda m: (m.name, str(m.id)))
+        return missions
+
+    async def update_mission_status(self, id: Any, status: Any) -> None:
+        """更新任务状态"""
+        if id in self.missions:
+            self.missions[id].status = status
+            self.missions[id].updated_at = datetime.now(timezone.utc)
+            mission = self.missions[id]
+            proj_slug = await self.project_slug(mission.project_id)
+            await self.persist_json(
+                mission_path(proj_slug, mission.name, id), mission,
+            )
+
+    # ── 加载回调 ──────────────────────────────────────────
+
+    async def _on_conversation(self, conversation: Any) -> None:
+        self.conversations[conversation.id] = conversation
+
+    async def _on_thread(self, thread: Any) -> None:
+        self.threads[thread.id] = thread
+
+    async def _on_steps(self, steps: List[Any]) -> None:
+        if steps:
+            thread_id = steps[0].thread_id
+            self.steps[thread_id] = steps
+
+    async def _on_events(self, events: List[Any]) -> None:
+        if events:
+            thread_id = events[0].thread_id
+            self.events[thread_id] = events
+
+    async def _on_lease(self, lease: Any) -> None:
+        self.leases[lease.id] = lease
 
 
 # ── 辅助函数 ─────────────────────────────────────────────────

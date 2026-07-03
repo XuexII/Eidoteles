@@ -66,7 +66,7 @@ class ProjectId:
 @dataclass(kw_only=True)
 class Project:
     """项目 — 上下文作用域单元"""
-    id: ProjectId = field(init=False)
+    id: ProjectId = field(default_factory=ProjectId, init=False)
     # 租户隔离：拥有此项目的用户
     user_id: str
     name: str

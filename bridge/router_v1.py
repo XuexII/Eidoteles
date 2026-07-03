@@ -1,17 +1,34 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
+import logging
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from enum import Enum
+from pathlib import Path
+from typing import List, Dict, Set, Optional, Any, Tuple
 
+from bridge.engine_actions import mission_capability_actions
+from bridge.llm_adapter import LlmBridgeAdapter
+from channels.web.sse import SseManager
+from error import Error
+from extensions.naming import legacy_extension_alias
+
+from agent import Agent, augment_with_attachments
+from auth.extension import AuthManager
+from bridge.effect_adapter import EffectBridgeAdapter
+from channels import (IncomingMessage, StatusUpdate)
+from channels.web import GATEWAY_CHANNEL_NAME
+from db import Database
 from engine import (
-    ThreadId,
-    Capability,
+Capability,
     CapabilityRegistry,
     ConversationManager,
-    EffectExecutor,
+PolicyEngine,
     LeaseManager,
-    MissionManager,
-    PolicyEngine,
-    Project,
     ProjectId,
     Store,
     ThreadConfig,
@@ -20,34 +37,16 @@ from engine import (
     ThreadMessage,
     CapabilityLease,
     MessageRole,
-StepId,
-ThreadExecutionContext,
-CancellingGateController
+    StepId,
+    ThreadExecutionContext,
+    CancellingGateController,
+Project,
+MissionManager
 )
-
-from ironclaw_common import AppEvent
-from engine.types import (is_shared_owner, shared_owner_id)
-from engine.types.thread import Thread, ThreadId, ThreadState
-
-from agent import Agent, augment_with_attachments
-from auth.extension import AuthManager
-from bridge.effect_adapter import EffectBridgeAdapter
-from bridge.engine_actions import mission_capability_actions
-from bridge.llm_adapter import LlmBridgeAdapter
-from bridge.store_adapter import HybridStore
-from channels.web import GATEWAY_CHANNEL_NAME
-from channels.web.sse import SseManager
-from channels import (IncomingMessage, OutgoingResponse, StatusUpdate)
-from db import Database
-from error import Error
-from extensions.naming import legacy_extension_alias
-from gate.pending import (PendingGate, PendingGateKey)
-from gate.store import PendingGateStore, GateStoreError
 from engine.gate import (
     # 用户对于gage的处理结果
     GateResolution,
     GateResolutionApproved,
-    GateResolutionDenied,
     GateResolutionDenied,
     GateResolutionCredentialProvided,
     GateResolutionCancelled,
@@ -56,38 +55,29 @@ from engine.gate import (
     # gate的处理方式
     ResumeKind,
     ResumeKindApproval,
-    ResumeKindAuthentication,
-    ResumeKindExternal,
-    resume_kind_name
+    ResumeKindAuthentication
 )
-import logging
-from dataclasses import dataclass, field
-from typing import List, Dict, Set, Optional, Union, Any, Tuple
-import os
-import regex as re
-from datetime import datetime, timezone
-from pathlib import Path
-import uuid
-import json
-import asyncio
+from bridge.llm_adapter import LlmBridgeAdapter
+from bridge.store_adapter import HybridStore
+from engine.types.thread import Thread, ThreadId
+from gate.pending import (PendingGate, PendingGateKey)
+from gate.store import PendingGateStore
+from ironclaw_common import AppEvent
 from llm import user_signals_execution_intent
-
+from secrets.store import SecretsStore
 # 导入数据类型
 # bridge
 from types.bridge.bridge_outcome import (
     BridgeOutcome,
     BridgeRespondOutcome,
-    BridgeNoResponseOutcome,
     BridgePendingOutcome
 )
-
 from types.gate.pending_gate_resolution import (
     PendingGateResolution,
     PendingGateResolutionNone,
     PendingGateResolutionResolved,
     PendingGateResolutionAmbiguous
 )
-from secrets.store import SecretsStore
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +153,366 @@ class PendingAuthCredentialSubmission(Enum):
 #   1. 使用代理的依赖项获取或初始化引擎状态
 
 async def init_engine(agent: Agent) -> None:
-    pass
+    """
+    使用智能体的依赖项获取或初始化引擎状态。
+
+    当 `ENGINE_V2=true` 时，在启动时（从 `Agent::run()` 中）主动调用，
+    同时各处理程序也会作为延迟回退机制防御性地调用。
+    """
+
+    global ENGINE_STATE
+
+    # 快速路径：已初始化
+    if ENGINE_STATE is not None:
+        return
+
+    async with ENGINE_STATE_LOCK:
+        # 双重检查：获取写锁后再次检查
+        if ENGINE_STATE is not None:
+            return
+
+        logger.debug("引擎 v2: 正在初始化引擎状态")
+
+        # 构建 LLM 桥接适配器
+        llm_adapter = LlmBridgeAdapter(
+            agent.llm,
+            agent.cheap_llm if hasattr(agent, 'cheap_llm') else None,
+        )
+
+        # 构建效果适配器
+        effect_adapter = EffectBridgeAdapter(
+            agent.tools,
+            agent.safety,
+            agent.hooks,
+        )
+        effect_adapter.with_global_auto_approve(agent.config().auto_approve_tools)
+
+        # 传播追踪 HTTP 拦截器（实时记录或重放），以便引擎 v2 工具调度记录/重放 HTTP 交换。
+        # 没有此步骤，记录的追踪会错过从引擎 v2 路径发出的每个出站调用，
+        # 并且重放无法替换响应
+        if hasattr(agent.deps, 'http_interceptor') and agent.deps.http_interceptor is not None:
+            await effect_adapter.set_http_interceptor(agent.deps.http_interceptor)
+
+        # 构建集中式认证管理器用于预检凭证检查
+        has_secrets = agent.tools.secrets_store() is not None
+        has_cred_reg = agent.tools.credential_registry() is not None
+        logger.debug(
+            f"引擎 v2: 认证管理器初始化检查: "
+            f"has_secrets_store={has_secrets}, has_credential_registry={has_cred_reg}"
+        )
+
+        auth_manager = None
+        if hasattr(agent.deps, 'auth_manager') and agent.deps.auth_manager is not None:
+            auth_manager = agent.deps.auth_manager
+            await effect_adapter.set_auth_manager(auth_manager)
+            logger.debug("引擎 v2: 认证管理器已设置在效果适配器上")
+        elif agent.tools.secrets_store() is not None:
+            auth_manager = AuthManager(
+                agent.tools.secrets_store(),
+                getattr(agent.deps, 'skill_registry', None),
+                getattr(agent.deps, 'extension_manager', None),
+                agent.tools,
+            )
+            await effect_adapter.set_auth_manager(auth_manager)
+            logger.debug("引擎 v2: 认证管理器已设置在效果适配器上")
+        else:
+            logger.debug("引擎 v2: 没有密钥存储 — 认证管理器未创建")
+
+        # 构建混合存储
+        store = HybridStore(workspace=agent.workspace)
+        await store.load_state_from_workspace()
+        await effect_adapter.set_engine_store(store)
+
+        if hasattr(agent.deps, 'skill_registry') and agent.deps.skill_registry is not None:
+            await effect_adapter.set_skill_registry(agent.deps.skill_registry)
+
+        # 清理先前运行的已完成线程和死租约
+        cleaned = await store.cleanup_terminal_state(timedelta(minutes=5))
+        if cleaned > 0:
+            logger.debug(f"引擎 v2: 启动时清理了 {cleaned} 个终端状态条目")
+
+        # 生成引擎工作区 README
+        await store.generate_engine_readme()
+
+        # 注册任务功能作为能力，以便线程接收租约。
+        # 由 EffectBridgeAdapter::handle_mission_call() 在常规工具执行器之前处理
+        capabilities = CapabilityRegistry()
+        capabilities.register(Capability(
+            name="missions",
+            description="任务和例程生命周期管理",
+            actions=mission_capability_actions(),
+            knowledge=[],
+            policies=[],
+        ))
+
+        leases = LeaseManager()
+        policy = PolicyEngine()
+
+        # 与效果适配器共享注册表，以便其 `available_actions`
+        # 可以向 LLM 展示引擎原生能力动作（任务）。
+        # 没有此步骤，任务工具有活跃租约但永远不会出现在每次 LLM 调用发送的工具列表中
+        capabilities_ref = capabilities
+        await effect_adapter.set_capability_registry(capabilities_ref)
+
+        # 构建线程管理器
+        thread_manager = ThreadManager(
+            llm_adapter,
+            effect_adapter,
+            store,
+            capabilities_ref,
+            leases,
+            policy,
+        )
+
+        # 迁移旧记录：预先存在的引擎记录反序列化时没有 user_id 字段，
+        # 并获得 serde 默认值 "legacy"。将所有者的身份标记到它们上，
+        # 以便用户范围的查询在升级后找到它们
+        owner_id = agent.deps.owner_id
+        # 将所有者的 user_id 标记到任何使用 serde 默认值
+        await migrate_legacy_user_ids(store, owner_id)
+
+        # 当可用时重用持久化的默认项目
+        projects = await store.list_projects(owner_id)
+        default_project = None
+        for project in projects:
+            if project.name == "default":
+                default_project = project
+                break
+
+        if default_project is not None:
+            project_id = default_project.id
+        else:
+            project = Project(owner_id, "default", "引擎 v2 的默认项目")
+            project_id = project.id
+            await store.save_project(project)
+
+        # 构建对话管理器
+        conversation_manager = ConversationManager(thread_manager, store)
+        try:
+            await conversation_manager.bootstrap_user(owner_id)
+        except Exception as e:
+            logger.debug(f"引擎 v2: bootstrap_user 失败: {e}")
+
+        # 创建任务管理器并启动 cron 计时器。附加：
+        # - WorkspaceReader 以便具有 `context_paths` 的任务可以在触发时将工作区文档预加载到其元提示中
+        # - BudgetGate 覆盖主机的 CostGuard，以便在用户耗尽每日 LLM 预算时拒绝任务触发
+        mission_manager_inner = MissionManager(store, thread_manager)
+        mission_manager_inner = mission_manager_inner.with_effect_executor(effect_adapter)
+
+        if agent.workspace is not None:
+            from bridge.workspace_reader import WorkspaceReaderAdapter
+            reader = WorkspaceReaderAdapter(agent.workspace)
+            mission_manager_inner = mission_manager_inner.with_workspace_reader(reader)
+
+        cost_guard = agent.deps.cost_guard
+        from bridge.cost_guard_gate import CostGuardBudgetGate
+        budget_gate = CostGuardBudgetGate(cost_guard)
+        mission_manager_inner = mission_manager_inner.with_budget_gate(budget_gate)
+
+        # 使用数据库优先的配置系统而不是原始的 std::env::var 读取。
+        # 从数据库支持的设置解析 MissionsConfig，回退到本地 settings.json + 环境变量
+        from settings import Settings
+        if hasattr(agent.deps, 'store') and agent.deps.store is not None:
+            try:
+                settings_map = await agent.deps.store.get_all_settings(owner_id)
+                missions_settings = Settings.from_db_map(settings_map)
+            except Exception:
+                missions_settings = Settings.load()
+        else:
+            missions_settings = Settings.load()
+
+        from config import MissionsConfig
+        try:
+            missions_config = MissionsConfig.resolve(missions_settings)
+        except Exception as e:
+            logger.warning(f"MissionsConfig::resolve 失败；回退到默认值: {e}")
+            missions_config = MissionsConfig()
+
+        mission_manager_inner = mission_manager_inner.with_insights_interval(
+            missions_config.insights_interval
+        )
+        mission_manager = mission_manager_inner
+
+        # 恢复项目线程
+        try:
+            await thread_manager.recover_project_threads(project_id)
+        except Exception as e:
+            logger.debug(f"引擎 v2: recover_project_threads 失败: {e}")
+
+        try:
+            await mission_manager.bootstrap_project(project_id)
+        except Exception as e:
+            logger.debug(f"引擎 v2: bootstrap_project 失败: {e}")
+
+        try:
+            await mission_manager.resume_recoverable_threads(owner_id)
+        except Exception as e:
+            logger.debug(f"引擎 v2: resume_recoverable_threads 失败: {e}")
+
+        try:
+            await thread_manager.resume_background_threads(project_id)
+        except Exception as e:
+            logger.debug(f"引擎 v2: resume_background_threads 失败: {e}")
+
+        # 启动 cron 计时器和事件监听器
+        mission_manager.start_cron_ticker(owner_id)
+        mission_manager.start_event_listener(owner_id)
+
+        # 订阅任务结果通知并将结果路由到频道
+        notification_rx = mission_manager.subscribe_notifications()
+        channels = agent.channels
+        sse_ref = getattr(agent.deps, 'sse_tx', None)
+        db_ref = getattr(agent.deps, 'store', None)
+        conv_mgr_ref = conversation_manager
+        auth_mgr_ref = auth_manager
+        tools_ref = agent.deps.tools if hasattr(agent.deps, 'tools') else None
+        ext_mgr_ref = getattr(agent.deps, 'extension_manager', None)
+
+        async def notification_loop():
+            while True:
+                try:
+                    notif = await notification_rx.get()
+                except Exception:
+                    break
+
+                await handle_mission_notification(
+                    notif,
+                    channels,
+                    sse_ref,
+                    db_ref,
+                    conv_mgr_ref,
+                    auth_mgr_ref,
+                    tools_ref,
+                    ext_mgr_ref,
+                )
+
+        asyncio.create_task(notification_loop())
+
+        # 确保所有者的每用户学习任务存在
+        try:
+            await mission_manager.ensure_learning_missions(project_id, owner_id)
+        except Exception as e:
+            logger.debug(f"引擎 v2: 创建学习任务失败: {e}")
+
+        # 将 v1 技能迁移到 v2 MemoryDocs（技能选择在 Python 编排器中通过 __list_skills__ 在运行时进行）
+        if hasattr(agent.deps, 'skill_registry') and agent.deps.skill_registry is not None:
+            try:
+                registry = agent.deps.skill_registry
+                guard = registry.read() if hasattr(registry, 'read') else registry
+                skills_snapshot = list(guard.skills() if callable(getattr(guard, 'skills', None)) else [])
+            except Exception as e:
+                skills_snapshot = []
+                logger.debug(f"引擎 v2: 读取技能注册表失败: {e}")
+
+            if skills_snapshot:
+                try:
+                    count = await migrate_v1_skill_list(skills_snapshot, store, project_id, owner_id)
+                    if count > 0:
+                        logger.debug(f"引擎 v2: 迁移了 {count} 个 v1 技能")
+                except Exception as e:
+                    logger.debug(f"引擎 v2: 技能迁移失败: {e}")
+
+        # 在效果适配器上安装每项目工作区挂载表
+        resolver = ProjectPathResolver(store)
+        if engine_v2_sandbox_enabled():
+            try:
+                docker = await connect_docker()
+                logger.debug("引擎 v2: SANDBOX_ENABLED=true — 使用容器化挂载工厂")
+                manager = ProjectSandboxManager(docker)
+                factory = ContainerizedMountFactory(manager, resolver)
+            except Exception as e:
+                logger.warning(
+                    f"引擎 v2: SANDBOX_ENABLED=true 但 Docker 不可达；"
+                    f"回退到主机文件系统挂载工厂: {e}"
+                )
+                factory = FilesystemMountFactory(resolver)
+        else:
+            factory = FilesystemMountFactory(resolver)
+
+        mounts = WorkspaceMounts(factory)
+        await effect_adapter.set_workspace_mounts(mounts)
+
+        # 将任务管理器接入效果适配器以处理 mission_* 函数调用
+        await effect_adapter.set_mission_manager(mission_manager)
+
+        # 将任务管理器接入代理以处理 /expected 命令
+        if hasattr(agent, 'set_mission_manager'):
+            await agent.set_mission_manager(mission_manager)
+
+        # 构建挂起门控存储
+        from gate.persistence import FileGatePersistence
+        pending_gates = PendingGateStore(
+            FileGatePersistence.with_default_path()
+        )
+        try:
+            await pending_gates.restore_from_persistence()
+        except Exception as e:
+            logger.debug(f"引擎 v2: 恢复挂起门控失败: {e}")
+
+        # 重启扫描：来自先前启动的任何进行中的 Approval 门控已丢失其内存等待接收器。
+        # 回退到旧版重新进入会重新运行 LLM 步骤并双重执行同一脚本中较早的非幂等工具调用
+        # （内联等待路径存在以防止的正是此错误）。在启动时丢弃它们，以便用户获得干净的
+        # 重试路径而不是旧版重新进入
+        await invalidate_stranded_approval_gates(pending_gates, sse_ref)
+        try:
+            await reconcile_pending_gate_state(store, pending_gates)
+        except Exception as e:
+            logger.debug(f"引擎 v2: 挂起门控协调失败: {e}")
+
+        # 构建每线程外部工具目录。通过 Arc 克隆与效果适配器共享
+        # （在每个动作调用时咨询），并暴露在引擎状态上，以便 Responses API 处理程序
+        # 可以注册/清除调用者提供的工具
+        external_tool_catalog = ExternalToolCatalog()
+        await effect_adapter.set_external_tool_catalog(external_tool_catalog)
+
+        # 后台清理：除了 `await_thread_outcome` 中的每线程终端状态清理之外，
+        # 驱逐超过 `EXTERNAL_TOOL_CATALOG_TTL` 的目录条目以限制内存，
+        # 当调用者注册工具然后放弃对话时（例如在未恢复挂起门控的情况下断开连接）
+        async def catalog_sweep_loop():
+            while True:
+                await asyncio.sleep(EXTERNAL_TOOL_CATALOG_SWEEP_INTERVAL_SECS)
+                evicted = await external_tool_catalog.sweep_older_than(EXTERNAL_TOOL_CATALOG_TTL_SECS)
+                if evicted:
+                    logger.debug(
+                        f"引擎 v2: 外部工具目录清理驱逐了 {len(evicted)} 个过时条目"
+                    )
+
+        asyncio.create_task(catalog_sweep_loop())
+
+        # 构建门控控制器
+        resolutions = GateResolutions()
+        gate_controller = BridgeGateController(
+            pending_gates,
+            sse_ref,
+            effect_adapter.tools_ref(),
+            auth_manager,
+            getattr(agent.deps, 'extension_manager', None),
+            channels,
+            resolutions,
+        )
+        await thread_manager.set_gate_controller(gate_controller)
+
+        # 构建并存储引擎状态
+        _ENGINE_STATE = EngineState(
+            thread_manager=thread_manager,
+            conversation_manager=conversation_manager,
+            effect_adapter=effect_adapter,
+            store=store,
+            default_project_id=project_id,
+            pending_gates=pending_gates,
+            sse=sse_ref,
+            db=db_ref,
+            secrets_store=agent.tools.secrets_store(),
+            auth_manager=auth_manager,
+            extension_manager=getattr(agent.deps, 'extension_manager', None),
+            project_root=resolve_project_root(),
+            external_tool_catalog=external_tool_catalog,
+            capability_registry=capabilities_ref,
+            gate_controller=gate_controller,
+            gate_resolutions=resolutions,
+        )
+
+        logger.debug("引擎 v2: 初始化完成")
 
 
 # ----------流程2: 解析待处理gate----------
@@ -708,7 +1057,7 @@ async def resolve_gate(
 
 # ----------流程4: 执行待处理gate----------
 # 职责说明:
-#   1. 执行
+#   1. 执行gate
 
 async def execute_pending_gate_action(
         agent: Agent,
@@ -896,13 +1245,10 @@ async def handle_with_engine_inner(
 
     # --------Step1: 确保引擎已初始化--------
     await init_engine(agent)
-
-    lock = ENGINE_STATE.get()
-    if lock is None:
+    if ENGINE_STATE_LOCK is None:
         raise RuntimeError("init", "引擎状态未初始化")
-
-    async with lock.read() as guard:
-        state = guard
+    async with ENGINE_STATE_LOCK:
+        state = ENGINE_STATE
         if state is None:
             raise RuntimeError("init", "引擎状态为空")
 
@@ -917,14 +1263,14 @@ async def handle_with_engine_inner(
         scoped_thread_id = parse_engine_thread_id(thread_scope)
 
         # --------Step2: 检查是否有待处理的gate，并按优先级处理--------
-        # --------Step2.1: 解析用户的待处理门控--------
+        # --------Step2.1: 解析因需要用户干预(批准、授权)而暂停的任务--------
         resolution = await resolve_pending_gate_for_user(
             state.pending_gates, message.user_id, thread_scope
         )
         # --------Step2.2: 处理gate--------
-        match resolution.kind:
+        match resolution:
             # 处理解析的gate
-            case PendingGateResolutionKind.Resolved:
+            case PendingGateResolutionResolved():
                 gate = resolution.gate
                 # 处理需要用户提供凭证的情况
                 if gate.resume_kind == ResumeKind.Authentication:
@@ -987,6 +1333,7 @@ async def handle_with_engine_inner(
                 )
 
         # --------Step4: 对输入内容进行安全验证--------
+        # TODO 可以考虑设计拒识模块
 
         # 安全检查——在线程操作 ::process_user_input 中镜像 v1 管道，
         # 确保两条引擎路径执行相同的入站保护措施。
@@ -1062,6 +1409,7 @@ async def handle_with_engine_inner(
         await fire_event_missions_for_message(state, message, effective_content)
 
         # 向通道发送"思考中..."状态
+        # is here
         try:
             await agent.channels.send_status(
                 message.channel,
@@ -1100,7 +1448,7 @@ async def handle_with_engine_inner(
 
         # --------Step8: 规则检测显式执行意图--------
         # 检测执行意图并相应地配置义务
-        thread_config = ThreadConfig.default()
+        thread_config = ThreadConfig()
         if user_signals_execution_intent(content):
             thread_config.require_action_attempt = True
 
@@ -1126,7 +1474,7 @@ async def handle_with_engine_inner(
         # 如果快速工具门控在 `set_execution_context` 落地之前触发，
         # 则控制器的 `pause()` 将找不到对应条目并静默取消门控。
         # 预执行插槽以 user_id 为键，上游的每个对话锁确保每个对话最多只有一个桥接轮次正在执行。
-        scope_thread_id = ExternalThreadId.new(scope) if scope else None
+        scope_thread_id = ExternalThreadId(scope) if scope else None
         per_exec_context = PerExecutionContext(
             conversation_id=conv_id,
             source_channel=message.channel,
@@ -1917,6 +2265,102 @@ async def await_thread_outcome(
 
     return result
 
+async def resolve_user_project(
+        store: Store,
+        user_id: str,
+        fallback: ProjectId,
+) -> ProjectId:
+    """
+    解析用户的默认项目，如果需要则创建一个。
+
+    在多用户部署中，每个用户获得自己的项目，以便线程、任务和内存文档隔离。
+    当用户就是所有者时，使用所有者的项目（作为 `fallback` 传入），
+    避免了在常见的单用户情况下进行额外的存储查找。
+    """
+    # 快速路径：检查回退项目是否属于此用户
+    try:
+        project = await store.load_project(fallback)
+        if project is not None and project.is_owned_by(user_id):
+            return fallback
+    except Exception:
+        pass
+
+    # 查找此用户拥有的现有默认项目
+    projects = await store.list_projects(user_id)
+    for project in projects:
+        if project.name == "default":
+            return project.id
+
+    # 为此用户创建新的默认项目
+    project = Project(user_id=user_id, name="default", description="Default project")
+    pid = project.id
+    await store.save_project(project)
+    logger.debug("为用户创建了默认项目, user_id=%s, project_id=%s", user_id, pid)
+    return pid
+
+async def fire_event_missions_for_message(
+        state: EngineState,
+        message: IncomingMessage,
+        content: str,
+) -> None:
+    """
+触发其模式匹配入站消息的活动 OnEvent 任务。
+
+构建包含消息元数据的负载，任务线程可以通过 `state["trigger_payload"]` 读取。
+跳过空内容和系统通道消息。错误以 debug 级别记录——
+此处的失败绝不能阻塞面向用户的消息流。
+"""
+    trimmed = content.strip()
+    if not trimmed:
+        return
+
+    # 递归守卫。将代理自己的出站文本作为入站事件回显的通道适配器
+    # 必须设置 is_agent_broadcast（Slack/Discord 风格）；
+    # 作为任务触发副作用产生的消息必须设置 triggering_mission_id
+    # （跨不同任务的链式递归）。任一标志意味着：不要重新触发。
+    if message.is_agent_broadcast:
+        logger.debug(
+            "engine v2: 跳过任务触发——消息是代理广播回显, channel=%s",
+            message.channel,
+        )
+        return
+    if message.triggering_mission_id is not None:
+        logger.debug(
+            "engine v2: 跳过任务触发——消息源自任务, channel=%s, upstream_mission_id=%s",
+            message.channel,
+            message.triggering_mission_id,
+        )
+        return
+
+    mission_manager = await state.effect_adapter.mission_manager()
+    if mission_manager is None:
+        return
+
+    payload = {
+        "channel": message.channel,
+        "user_id": message.user_id,
+        "content": content,
+        "metadata": message.metadata,
+    }
+
+    try:
+        spawned = await mission_manager.fire_on_message_event(
+            message.channel, content, message.user_id, payload
+        )
+        if spawned:
+            logger.debug(
+                "engine v2: 从入站消息触发了 %d 个 OnEvent 任务, channel=%s, user_id=%s",
+                len(spawned),
+                message.channel,
+                message.user_id,
+            )
+    except Exception as error:
+        logger.debug(
+            "engine v2: fire_on_message_event 失败；继续正常处理, channel=%s, error=%s",
+            message.channel,
+            error,
+        )
+
 
 def clamp_always_to_resume_kind(always: bool, resume_kind: ResumeKind) -> bool:
     """
@@ -1939,3 +2383,4 @@ def clamp_always_to_resume_kind(always: bool, resume_kind: ResumeKind) -> bool:
             isinstance(resume_kind, ResumeKindApproval)
             and resume_kind.allow_always
     )
+

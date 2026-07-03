@@ -9,15 +9,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Any, Dict
 
-from ..capability.lease import LeaseManager
-from ..capability.policy import PolicyEngine
-from ..runtime.messaging import SignalReceiver, ThreadOutcome
-from ..traits.effect import EffectExecutor
-from ..traits.llm import LlmBackend
-from ..types.error import EngineError
-from ..types.event import EventKind
-from ..types.step import Step, StepId
-from ..types.thread import Thread, ThreadState
+from engine.capability.lease import LeaseManager
+from engine.capability.policy import PolicyEngine
+from engine.capability.registry import CapabilityRegistry
+from engine.runtime.messaging import SignalReceiver, ThreadOutcome
+from engine.traits.effect import EffectExecutor
+from engine.traits.llm import LlmBackend
+from engine.types.error import EngineError
+from engine.types.event import EventKind
+from engine.types.step import Step, StepId
+from engine.types.thread import Thread, ThreadState
+from engine.gate import GateController
+from engine.traits.store import Store
+from engine.memory import RetrievalEngine
+from engine.executor.prompt import PlatformInfo
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +95,7 @@ class ExecutionLoop:
     policy: PolicyEngine
     signal_rx: SignalReceiver
     # 存储以备将来使用（例如用户范围的提示覆盖）
-    _user_id: str
+    user_id: str
     gate_controller: GateController
     # 可选的能力注册表，用于解析能力级别的策略
     capabilities: Optional[CapabilityRegistry] = None

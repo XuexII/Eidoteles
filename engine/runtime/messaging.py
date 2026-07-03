@@ -1,5 +1,6 @@
 # 通过通道进行线程间消息传递。
 
+from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -104,6 +105,8 @@ class ThreadOutcomeGatePaused(ThreadOutcome):
     resume_output: Optional[Dict[str, Any]] = None
     paused_lease: Optional[CapabilityLease] = None
 
+type SignalSender = asyncio.Queue[ThreadSignal]
+type SignalReceiver = asyncio.Queue[ThreadSignal]
 
 def signal_channel(buffer: int) -> tuple:
     """
