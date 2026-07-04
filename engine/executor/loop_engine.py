@@ -19,6 +19,7 @@ from engine.types.error import EngineError
 from engine.types.event import EventKind
 from engine.types.step import Step, StepId
 from engine.types.thread import Thread, ThreadState
+from engine.types.memory import MemoryDoc
 from engine.gate import GateController
 from engine.traits.store import Store
 from engine.memory import RetrievalEngine
@@ -84,13 +85,13 @@ class RuntimeCheckpoint:
 
 
 # ── 执行循环 ─────────────────────────────────────────────────
-
+from bridge.effect_adapter import EffectBridgeAdapter
 @dataclass
 class ExecutionLoop:
     """线程的核心执行循环"""
     thread: Thread
     llm: LlmBackend
-    effects: EffectExecutor
+    effects: EffectBridgeAdapter  # EffectExecutor
     leases: LeaseManager
     policy: PolicyEngine
     signal_rx: SignalReceiver
@@ -184,13 +185,14 @@ class ExecutionLoop:
                 or messages_have_prompt(self.thread.internal_messages)
                 or checkpoint.has_working_messages_system_prompt())
 
-    async def _refresh_system_prompt(
+    async def refresh_system_prompt(
             self,
             system_docs: List[MemoryDoc],
             system_docs_loaded: bool,
             checkpoint: RuntimeCheckpoint,
     ) -> None:
         """刷新系统提示"""
+        from engine.executor.thread_context import thread_execution_context
         active_leases = await self.leases.active_for_thread(self.thread.id)
         prompt_context = thread_execution_context(
             self.thread,
@@ -230,6 +232,7 @@ class ExecutionLoop:
             )
             return
 
+        from engine.executor.prompt import build_codeact_system_prompt_with_docs
         system_prompt = build_codeact_system_prompt_with_docs(
             capabilities,
             compact_actions,
@@ -237,6 +240,7 @@ class ExecutionLoop:
             self.platform_info,
         )
 
+        from engine.executor.prompt import upsert_codeact_system_prompt
         # 更新各种位置中的系统提示
         messages_updated = upsert_codeact_system_prompt(
             self.thread.messages,
@@ -312,7 +316,7 @@ class ExecutionLoop:
                 logger.debug(f"加载编排器共享文档失败: {e}")
                 system_docs_loaded = False
 
-        await self._refresh_system_prompt(system_docs, system_docs_loaded, checkpoint)
+        await self.refresh_system_prompt(system_docs, system_docs_loaded, checkpoint)
         persisted_event_count = await self._persist_runtime_state(None, persisted_event_count)
 
         # 使用预获取的文档加载带版本的 Python 编排器。

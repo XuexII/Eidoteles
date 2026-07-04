@@ -363,6 +363,7 @@ class AppBuilder:
         委托给 `build_provider_chain`，后者应用所有装饰器
         （重试、智能路由、故障转移、断路器、响应缓存）。
         """
+        from llm import build_provider_chain
         llm, cheap_llm, recording_handle, reload_handle = await build_provider_chain(
             self.config.llm, self.session
         )
@@ -385,6 +386,7 @@ class AppBuilder:
         """
         阶段 4：初始化安全层、工具、嵌入和工作区。
         """
+        from safety import SafetyLayer
         safety = SafetyLayer(self.config.safety)
         logger.debug("安全层已初始化")
 
@@ -405,8 +407,11 @@ class AppBuilder:
             registry = registry.with_http_interceptor(http_interceptor)
 
         tools = registry
+        # 注册内置工具
         tools.register_builtin_tools()
+        # 注册 获取工具详情的工具
         tools.register_tool_info()
+        # 查看所有工具列表和版本的 工具
         tools.register_system_tools()
 
         if self.secrets_store is not None:

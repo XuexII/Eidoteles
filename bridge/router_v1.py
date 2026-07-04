@@ -237,6 +237,9 @@ async def init_engine(agent: Agent) -> None:
         # 注册任务功能作为能力，以便线程接收租约。
         # 由 EffectBridgeAdapter::handle_mission_call() 在常规工具执行器之前处理
         capabilities = CapabilityRegistry()
+        # 将任务函数注册为一种能力，以便线程获得租约。
+        # 由 EffectBridgeAdapter::handle_mission_call() 在常规工具执行器之前处理。
+        # 仅使用 "mission_*" 名称——描述中提及 "routine"，以便大语言模型正确映射用户意图。
         capabilities.register(Capability(
             name="missions",
             description="任务和例程生命周期管理",
@@ -406,6 +409,7 @@ async def init_engine(agent: Agent) -> None:
 
             if skills_snapshot:
                 try:
+                    from bridge.skill_migration import migrate_v1_skill_list
                     count = await migrate_v1_skill_list(skills_snapshot, store, project_id, owner_id)
                     if count > 0:
                         logger.debug(f"引擎 v2: 迁移了 {count} 个 v1 技能")
@@ -1410,7 +1414,6 @@ async def handle_with_engine_inner(
         await fire_event_missions_for_message(state, message, effective_content)
 
         # 向通道发送"思考中..."状态
-        # is here
         try:
             await agent.channels.send_status(
                 message.channel,
@@ -1475,7 +1478,10 @@ async def handle_with_engine_inner(
         # 如果快速工具门控在 `set_execution_context` 落地之前触发，
         # 则控制器的 `pause()` 将找不到对应条目并静默取消门控。
         # 预执行插槽以 user_id 为键，上游的每个对话锁确保每个对话最多只有一个桥接轮次正在执行。
+        from ironclaw_common import ExternalThreadId
         scope_thread_id = ExternalThreadId(scope) if scope else None
+
+        from bridge.gate_controller import PerExecutionContext
         per_exec_context = PerExecutionContext(
             conversation_id=conv_id,
             source_channel=message.channel,
@@ -1483,6 +1489,8 @@ async def handle_with_engine_inner(
             channel_metadata=message.metadata,
             original_message=message.content,
         )
+
+        # 执行上下文是 BridgeGateController 中用于在 gate 暂停期间保持状态的机制，确保 gate 解析时能够找到正确的上下文信息
         await state.gate_controller.set_pre_execution_context(
             message.user_id, conv_id, per_exec_context
         )
@@ -1524,6 +1532,7 @@ async def handle_with_engine_inner(
         if scope_uuid is not None:
             await state.external_tool_catalog.transfer(scope_uuid, thread_id)
 
+        # --------Step12: 记忆--------
         if attachment_notes:
             await save_attachment_index_notes(
                 state.store,
@@ -2362,6 +2371,53 @@ async def fire_event_missions_for_message(
             error,
         )
 
+async def save_attachment_index_notes(
+        store: Store,
+        project_id: ProjectId,
+        user_id: str,
+        thread_id: ThreadId,
+        notes: List[AttachmentIndexNote],
+) -> None:
+    """将附件索引笔记保存到存储中。"""
+    for note in notes:
+        doc = MemoryDoc(
+            project_id=project_id,
+            user_id=user_id,
+            doc_type=DocType.Note,
+            title=note.title,
+            content=note.content,
+        )
+        doc.metadata = note.metadata
+        doc.tags = note.tags
+        doc.source_thread_id = thread_id
+        try:
+            await store.save_memory_doc(doc)
+        except Exception as e:
+            logger.warning(
+                "engine v2: 保存附件索引笔记失败, error=%s, title=%s",
+                e,
+                doc.title,
+            )
+
+async def resolve_v1_conversation_for_message(
+        db: Database,
+        message: IncomingMessage,
+) -> uuid.UUID:
+    """
+    为消息解析 v1 对话。
+
+    如果有对话范围，则获取或创建限定范围的对话；
+    否则获取或创建默认助手对话。
+    """
+    scope = message.conversation_scope()
+    if scope is not None:
+        return await db.get_or_create_scoped_conversation(
+            message.user_id, message.channel, scope
+        )
+
+    return await db.get_or_create_assistant_conversation(
+        message.user_id, message.channel
+    )
 
 def clamp_always_to_resume_kind(always: bool, resume_kind: ResumeKind) -> bool:
     """

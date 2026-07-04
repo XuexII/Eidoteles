@@ -603,7 +603,11 @@ class ToolRegistry:
         logger.debug("已注册 %d 个内置工具", self.count())
 
     def register_tool_info(self) -> None:
-        """注册 tool_info 发现工具。"""
+        """注册 tool_info 发现工具。
+
+        需要 `Arc<Self>` 以便该工具能够在运行时向注册表查询其他工具的架构。
+        请在 `register_builtin_tools()` 之后调用。
+        """
         from tools.builtin import ToolInfoTool
         tool = ToolInfoTool(self)
         self.register_sync(tool)
@@ -646,7 +650,12 @@ class ToolRegistry:
             reasoning_llm: Optional["LlmProvider"],
             reasoning_enabled: bool,
     ) -> None:
-        """使用工作空间解析器注册内存工具。"""
+        """
+        使用工作区解析器注册记忆工具。
+
+        记忆工具需要工作区解析器来实现持久化。如果您有可用的工作区，请在 `register_builtin_tools()` 之后调用此方法。
+        接受可选的大语言模型提供者和推理标志，用于 `memory_search` 的推理增强召回。
+        当 `reasoning_llm` 为 `Some` 且 `reasoning_enabled` 为 `true` 时，搜索工具可以在返回结果之前通过大语言模型调用对结果进行综合。"""
         self.register_sync(MemorySearchTool.with_reasoning(resolver, reasoning_llm, reasoning_enabled))
         self.register_sync(MemoryWriteTool(resolver))
         self.register_sync(MemoryReadTool(resolver))

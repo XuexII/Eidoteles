@@ -957,7 +957,9 @@ class EffectBridgeAdapter(EffectExecutor):
         return inventory
 
     async def available_capabilities(
-            self, leases: List[Any], context: Any
+            self,
+            leases: List[CapabilityLease],
+            context: ThreadExecutionContext
     ) -> List[Any]:
         """列出能力后台摘要"""
         auth_manager = self.auth_manager

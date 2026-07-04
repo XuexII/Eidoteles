@@ -3,27 +3,25 @@
 # ConversationManager 是频道 I/O（用户消息、状态更新）与线程执行模型之间的桥梁。
 # 它维护对话界面，并决定是生成新线程还是将消息注入现有线程。
 
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional, List, Dict, Tuple, Any
+
 from engine.runtime.manager import ThreadManager
 from engine.runtime.messaging import ThreadOutcome
 from engine.traits.store import Store
 from engine.types.conversation import ConversationEntry, ConversationId, ConversationSurface
-from engine.types.error import EngineError
-from engine.types.message import ThreadMessage
-from engine.types.project import ProjectId
-from engine.types.thread import ThreadConfig, ThreadId, Thread, ThreadState, ThreadType
-
-import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Tuple, Any
-from enum import Enum
-import logging
 from engine.types.conversation import (
-    EntrySender,
     EntrySenderUser,
     EntrySenderAgent,
     EntrySenderSystem
 )
+from engine.types.error import EngineError
+from engine.types.message import ThreadMessage
+from engine.types.project import ProjectId
+from engine.types.thread import ThreadConfig, ThreadId, Thread, ThreadState, ThreadType
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +135,7 @@ class ConversationManager:
                 return conv_id
 
         # 创建新对话
-        conv = ConversationSurface.new(channel, user_id)
+        conv = ConversationSurface(channel=channel, user_id=user_id)
         conv_id = conv.id
 
         async with self._conv_lock:
@@ -145,7 +143,7 @@ class ConversationManager:
                 # 双重检查：另一个任务可能在我们进行 I/O 时已插入
                 if key in self.channel_user_index:
                     return self.channel_user_index[key]
-                self.conversations[conv_id] = conv.clone()
+                self.conversations[conv_id] = conv
                 self.channel_user_index[key] = conv_id
 
         # 在异步保存之前释放写锁
@@ -193,7 +191,7 @@ class ConversationManager:
         这些线程已存在且有自己的元数据
         """
         # 获取conversation: ConversationSurface
-        conv = await self.get_conversation_lock(conversation_id)
+        conv: ConversationSurface = await self.get_conversation_lock(conversation_id)
 
         # 租户隔离：验证请求用户拥有此对话
         if conv.user_id != user_id:

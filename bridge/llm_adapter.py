@@ -370,8 +370,8 @@ class LlmBridgeAdapter(LlmBackend):
 
     def __init__(
             self,
-            provider: Any,  # LlmProvider
-            cheap_provider: Optional[Any] = None,  # LlmProvider
+            provider: LlmProvider,  # LlmProvider
+            cheap_provider: Optional[LlmProvider] = None,  # LlmProvider
     ):
         self.provider = provider
         self.cheap_provider = cheap_provider
