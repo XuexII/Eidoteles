@@ -186,6 +186,7 @@ class ThreadManager:
         生成的任务拥有其自己的内存 `Thread` 副本，后期更新仅落在运行中任务
         永远不会重新读取的持久化副本上。
         """
+        # 每个 Thread 代表一个独立的任务执行
         thread = Thread(goal, thread_type, project_id, user_id, config)
         if parent_id is not None:
             thread = thread.with_parent(parent_id)
@@ -301,6 +302,7 @@ class ThreadManager:
         """启动线程执行的后台任务。"""
         thread_id = thread.id
 
+        from engine.runtime.lease_refresh import reconcile_dynamic_tool_lease
         await reconcile_dynamic_tool_lease(
             thread, self.effects, self.leases, self.store, self.lease_planner
         )
@@ -309,7 +311,7 @@ class ThreadManager:
         signal_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
 
         # 构建执行循环
-        gate_controller = await self.gate_controller()
+        gate_controller = self.gate_controller
         retrieval = RetrievalEngine(self.store)
         exec_loop = ExecutionLoop(
             thread=thread,

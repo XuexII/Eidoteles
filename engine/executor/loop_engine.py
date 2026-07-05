@@ -146,7 +146,7 @@ class ExecutionLoop:
         self.thread.events.append(event)
         self.thread.updated_at = datetime.now(timezone.utc)
 
-    def _load_runtime_checkpoint(self) -> RuntimeCheckpoint:
+    def load_runtime_checkpoint(self) -> RuntimeCheckpoint:
         """从线程元数据中加载运行时检查点"""
         persisted_state = self.thread.metadata.get(
             RUNTIME_CHECKPOINT_METADATA_KEY, {}
@@ -190,10 +190,21 @@ class ExecutionLoop:
             system_docs: List[MemoryDoc],
             system_docs_loaded: bool,
             checkpoint: RuntimeCheckpoint,
-    ) -> None:
-        """刷新系统提示"""
+    ):
+        """
+        在线程启动或恢复时刷新 LLM 系统提示，确保工具列表和能力定义是最新的。
+        它获取活跃租约、可用能力和动作，构建新的系统提示，然后更新线程消息和运行时检查点
+        :param system_docs:
+        :param system_docs_loaded:
+        :param checkpoint:
+        :return:
+        """
+        # 获取活跃租约
+        # 查询该线程有哪些能力租约（如 "tools"、"slack" 等
         from engine.executor.thread_context import thread_execution_context
         active_leases = await self.leases.active_for_thread(self.thread.id)
+        # 构建执行上下文
+        # 为后续的能力和动作查询提供执行上下文
         prompt_context = thread_execution_context(
             self.thread,
             StepId(),
@@ -201,7 +212,8 @@ class ExecutionLoop:
             self.gate_controller,
         )
 
-        # 加载能力
+        # 获取可用能力
+        # 根据租约查询线程可以使用哪些能力
         capabilities_result = await self.effects.available_capabilities(active_leases, prompt_context)
         capabilities_loaded = True
         if isinstance(capabilities_result, Exception):
@@ -212,6 +224,7 @@ class ExecutionLoop:
             capabilities = capabilities_result
 
         # 加载动作
+        # 根据租约查询线程可以调用哪些具体工具动作
         actions_result = await self.effects.available_actions(active_leases, prompt_context)
         actions_loaded = True
         if isinstance(actions_result, Exception):
@@ -232,6 +245,7 @@ class ExecutionLoop:
             )
             return
 
+        # 构建系统提示
         from engine.executor.prompt import build_codeact_system_prompt_with_docs
         system_prompt = build_codeact_system_prompt_with_docs(
             capabilities,
@@ -253,7 +267,7 @@ class ExecutionLoop:
                 self.thread.internal_messages,
                 system_prompt,
             )
-
+        # 更新运行时检查点
         checkpoint_updated = checkpoint.update_working_messages_system_prompt(system_prompt)
 
         # 持久化更新
@@ -299,7 +313,7 @@ class ExecutionLoop:
     async def run(self) -> ThreadOutcome:
         """运行执行循环直到完成"""
         persisted_event_count = len(self.thread.events)
-        checkpoint = self._load_runtime_checkpoint()
+        checkpoint = self.load_runtime_checkpoint()
 
         # 如果这是全新启动或从可恢复状态重新启动，则转换为 Running
         if self.thread.state != ThreadState.Running:
@@ -324,7 +338,9 @@ class ExecutionLoop:
         # ORCHESTRATOR_SELF_MODIFY=true 显式选择加入。
         # 该标志从进程级快照读取（在首次调用时设置一次），
         # 因此运行时环境变更无法在任务中途切换门控
+        from engine.runtime.internal_write import self_modify_enabled
         allow_self_modify = self_modify_enabled()
+        from engine.executor.orchestrator import load_orchestrator_from_docs
         orchestrator_code, orchestrator_version = load_orchestrator_from_docs(
             system_docs,
             allow_self_modify,
@@ -340,6 +356,7 @@ class ExecutionLoop:
 
         # 通过主机函数调度执行 Python 编排器
         try:
+            from engine.executor.orchestrator import execute_orchestrator
             orch_result = await execute_orchestrator(
                 orchestrator_code,
                 self.thread,

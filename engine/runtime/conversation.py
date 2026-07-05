@@ -237,6 +237,7 @@ class ConversationManager:
         else:
             # 生成新的前台线程
             # 从先前的条目构建对话历史以保持上下文连续性
+            # history = []
             history = build_history_from_entries(conv.entries)
 
             # 构建初始线程元数据。必须在执行器后台任务启动*之前*应用 —

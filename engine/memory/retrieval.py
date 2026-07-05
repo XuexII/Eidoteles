@@ -10,6 +10,7 @@ from typing import List
 
 from ..types.memory import DocType, MemoryDoc
 from ..types.project import ProjectId
+from engine.traits.store import Store
 
 logger = logging.getLogger(__name__)
 

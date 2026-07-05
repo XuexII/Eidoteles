@@ -41,6 +41,9 @@ effect_adapter = EffectBridgeAdapter(
 # 作用: 基于工作区的持久化；知识文档使用 frontmatter+markdown 以提升人类可读性。
 from bridge.store_adapter import HybridStore
 store = HybridStore(workspace=agent.workspace)
+store.load_state_from_workspace()
+store.cleanup_terminal_state(timedelta(minutes=5))
+store.generate_engine_readme()
 
 from engine.capability import LeaseManager, PolicyEngine, CapabilityRegistry
 leases = LeaseManager()
@@ -86,8 +89,14 @@ from engine.runtime.conversation import ConversationManager
     # 初始化需要用到的参数 ThreadManager 和 Store
 conversation_manager = ConversationManager(thread_manager, store)
 
+scope = message.conversation_scope
+channel_key = (
+    f"{message.channel}:{scope}" if scope is not None else message.channel
+)
+
+# "New Chat"按钮
 conv_id = conversation_manager.get_or_create_conversation(
-            message.channel, message.user_id
+            channel_key, message.user_id
         )
 
 # 7.2 处理用户消息
@@ -114,3 +123,42 @@ conversation_manager.handle_user_message(
                 None,
                 extra_metadata,
             )
+
+# 执行流程:
+#   1. 创建新的Thread
+#   2. 线程类型授予显式能力租约
+#   3. 添加来自先前线程的对话历史
+#   4. 执行线程
+thread_id = await conversation_manager.thread_manager.spawn_thread_with_history(
+                goal=effective_content,  # 使用消息作为目标
+                title=None,
+                thread_type=ThreadType.Foreground,
+                project_id=project_id,
+                config=thread_config,
+                parent_id=None,
+                user_id=message.user_id,
+                initial_messages=[],
+                initial_metadata=extra_metadata,
+            )
+# 执行线程流程:
+from engine.types.thread import Thread
+thread = Thread(effective_content, ThreadType.Foreground, project_id, message.user_id, thread_config)
+conversation_manager.thread_manager.start_thread(thread, message.user_id, False)
+
+
+from engine.executor.loop_engine import ExecutionLoop
+
+exec_loop = ExecutionLoop(
+            thread=thread,
+            llm=thread_manager.llm,
+            effects=thread_manager.effects,
+            leases=thread_manager.leases,
+            policy=thread_manager.policy,
+            signal_rx=signal_queue,
+            user_id=message.user_id,
+            gate_controller=gate_controller,
+capabilities=thread_manager.capabilities,
+event_queue=thread_manager.event_queue,
+store=thread_manager.store,
+        )
+exec_loop.run()

@@ -1,20 +1,29 @@
-# Python 编排器——可自我修改的执行循环。
+# 引擎 v2 编排器（默认，v0）
 #
-# 将 Rust `ExecutionLoop::run()` 替换为通过 Monty 执行的带版本 Python 代码。
-# 编排器是大语言模型与工具之间的“粘合层”——工具分发、输出格式化、状态管理、截断等均在 Python 中实现，可由自我改进任务修补。
+# 这是可自我修改的执行循环。它将 Rust ExecutionLoop::run() 替换为可在运行时由自我改进任务修补的 Python。
 #
-# 向编排器 Python 公开的主机函数：
-# - `__llm_complete__` —— 发起大语言模型调用
-# - `__execute_code_step__` —— 在嵌套的 Monty VM 中运行用户 CodeAct 代码
-# - `__execute_action__` —— 执行单个工具动作
-# - `__execute_actions_parallel__` —— 并发执行多个工具动作
-# - `__check_signals__` —— 轮询停止/注入信号
-# - `__emit_event__` —— 广播 ThreadEvent
-# - `__save_checkpoint__` —— 持久化线程状态
-# - `__transition_to__` —— 更改线程状态（经过验证）
-# - `__retrieve_docs__` —— 查询记忆文档
-# - `__check_budget__` —— 剩余令牌/时间/美元额度
-# - `__get_actions__` —— 可用的工具定义
+# 主机函数（由 Rust 通过 Monty 挂起机制提供）：
+#   __llm_complete__(messages, actions, config)  -> 响应字典
+#   __execute_code_step__(code, state)           -> 结果字典
+#   __execute_action__(name, params)             -> 结果字典
+#   __execute_actions_parallel__(calls)          -> 结果字典列表（并行执行）
+#   __check_signals__()                          -> None | "stop" | {"inject": 消息}
+#   __emit_event__(kind, **data)                 -> None
+#   __save_checkpoint__(state, counters)         -> None
+#   __transition_to__(state, reason)             -> None
+#   __retrieve_docs__(goal, max_docs)            -> 文档字典列表
+#   __check_budget__()                           -> 预算字典
+#   __get_actions__()                            -> 动作字典列表
+#   __list_skills__()                            -> 技能字典列表
+#   __record_skill_usage__(doc_id, success)      -> None
+#   __regex_match__(pattern, text)               -> bool
+#
+# 上下文变量（由 Rust 在执行前注入）：
+#   context  - 先前的消息列表 [{role, content}]
+#   goal     - 线程目标字符串
+#   actions  - 可用动作定义列表
+#   state    - 来自先前步骤的持久化状态字典
+#   config   - 线程配置字典
 
 
 import os
@@ -55,9 +64,7 @@ logger = logging.getLogger(__name__)
 
 # 编译时的默认编排器（v0）
 # 注意：实际内容应从文件加载，此处为占位符
-DEFAULT_ORCHESTRATOR = """# Default orchestrator v0
-# 此文件内容应从 ../../orchestrator/default.py 加载
-"""
+DEFAULT_ORCHESTRATOR = "../../orchestrator/default.py"
 
 # Store 中编排器代码的知名标题
 ORCHESTRATOR_TITLE = "orchestrator:main"
@@ -514,6 +521,8 @@ async def execute_orchestrator(
 
     # 解析并编译编排器代码
     try:
+        # orchestrator.py是标识，，用于错误信息和调试
+        # 解析和编译整个 default.py 文件，但不执行任何代码
         runner = MontyRun(code, "orchestrator.py", input_names)
     except Exception as e:
         # 通过相同的类型化清理器路由解析失败，
@@ -523,11 +532,41 @@ async def execute_orchestrator(
     # 启动执行
     limits = orchestrator_limits()
     try:
+        # 执行的 Python 代码：从 default.py 的第一行开始执行，直到遇到第一个 host function 调用或函数定义
         progress = runner.start(input_values, limits, stdout)
     except Exception as e:
         raise EngineError(f"Orchestrator: {classify_orchestrator_failure('编排器运行时错误', str(e))}")
 
     # 驱动编排器调度循环
+    # 1. 检查信号
+    #   1.1 `__check_signals__` —— 轮询停止/注入信号
+
+    # 2. 检查预算
+    #   2.1 `__check_budget__` —— 剩余令牌/时间/美元额度
+
+    # 3. 在第一步(step=0)注入先验知识并激活技能
+    #   3.1 `__retrieve_docs__` —— 查询记忆文档
+    #   3.2 __list_skills__()                            -> 技能字典列表
+    #   3.2 __set_active_skills__  设置激活的技能
+
+    # 4. 调用llm
+    #   4.1 __llm_complete__(messages, actions, config)  -> 响应字典
+
+    # 5. 根据类型处理响应。
+
+    #   __llm_complete__(messages, actions, config)  -> 响应字典
+    #   __execute_code_step__(code, state)           -> 结果字典
+    #   __execute_action__(name, params)             -> 结果字典
+    #   __execute_actions_parallel__(calls)          -> 结果字典列表（并行执行）
+    #   __check_signals__()                          -> None | "stop" | {"inject": 消息}
+    #   __emit_event__(kind, **data)                 -> None
+    #   __save_checkpoint__(state, counters)         -> None
+    #   __transition_to__(state, reason)             -> None
+    #   __retrieve_docs__(goal, max_docs)            -> 文档字典列表
+    #   __check_budget__()                           -> 预算字典
+    #   __get_actions__()                            -> 动作字典列表
+    #   __record_skill_usage__(doc_id, success)      -> None
+    #   __regex_match__(pattern, text)               -> bool
     while True:
         if isinstance(progress, RunComplete):
             # 如果设置了 FINAL 结果则使用，否则回退到 VM 返回值
@@ -555,6 +594,10 @@ async def execute_orchestrator(
                 final_result = val
                 ext_result = ExtFunctionResult.Return(None)
 
+            # Step1:
+            elif action_name == "__check_signals__":
+                ext_result = _handle_check_signals(signal_rx, thread)
+
             elif action_name == "__llm_complete__":
                 ext_result = await _handle_llm_complete(
                     args, kwargs, thread, llm, effects, leases, store, platform_info, total_tokens,
@@ -574,9 +617,6 @@ async def execute_orchestrator(
                 ext_result = await _handle_execute_actions_parallel(
                     args, thread, effects, leases, policy, event_tx, gate_controller,
                 )
-
-            elif action_name == "__check_signals__":
-                ext_result = _handle_check_signals(signal_rx, thread)
 
             elif action_name == "__emit_event__":
                 ext_result = _handle_emit_event(args, kwargs, thread, event_tx)
@@ -2534,20 +2574,34 @@ def build_orchestrator_inputs(
 
     # 构建配置
     config = {
+        # 最大迭代次数: 限制 LLM 调用的总次数，防止无限循环
         "max_iterations": thread.config.max_iterations,
-        "max_tool_intent_nudges": thread.config.max_tool_intent_nudges,
-        "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
-        "require_action_attempt": thread.config.require_action_attempt,
-        "max_action_requirement_nudges": thread.config.max_action_requirement_nudges,
-        "max_consecutive_errors": thread.config.max_consecutive_errors,
-        "max_tokens_total": thread.config.max_tokens_total,
-        "max_budget_usd": thread.config.max_budget_usd,
-        "model_context_limit": thread.config.model_context_limit,
-        "enable_compaction": thread.config.enable_compaction,
-        "compaction_threshold": thread.config.compaction_threshold,
-        "depth": thread.config.depth,
-        "max_depth": thread.config.max_depth,
+        # 当前步数
         "step_count": thread.step_count,
+        # 最大工具意图提示次数: 限制提示消息的注入次数，避免无限循环
+        "max_tool_intent_nudges": thread.config.max_tool_intent_nudges,
+        # 是否启用工具意图提示: 当 LLM 说"我会搜索"但没有实际调用工具时，自动注入提示消息
+        "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
+        # 是否要求尝试执行动作: 强制 LLM 必须调用工具，不能只返回文本
+        "require_action_attempt": thread.config.require_action_attempt,
+        # 最大动作要求提示次数: 限制"请调用工具"提示的注入次数
+        "max_action_requirement_nudges": thread.config.max_action_requirement_nudges,
+        # 最大连续错误次数: 连续出现指定次数错误后终止线程
+        "max_consecutive_errors": thread.config.max_consecutive_errors,
+        # 最大总 token 数: 限制整个线程使用的 token 总量（输入+输出）
+        "max_tokens_total": thread.config.max_tokens_total,
+        # 最大预算: 限制整个线程的 USD 成本
+        "max_budget_usd": thread.config.max_budget_usd,
+        # 模型上下文限制: LLM 模型的最大上下文窗口大小，用于触发压缩
+        "model_context_limit": thread.config.model_context_limit,
+        # 是否启用压缩: 当上下文超过阈值时自动压缩历史消息
+        "enable_compaction": thread.config.enable_compaction,
+        # 压缩阈值: 当上下文达到模型限制的 85% 时触发压缩
+        "compaction_threshold": thread.config.compaction_threshold,
+        # 当前递归深度: 当前线程在递归调用树中的深度（0 为根线程）
+        "depth": thread.config.depth,
+        # 最大递归深度: 限制 rlm_query() 的最大递归深度，防止无限递归
+        "max_depth": thread.config.max_depth,
     }
 
     values = [

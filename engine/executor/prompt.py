@@ -20,6 +20,7 @@ logger = logging.getLogger(__file__)
 # ── 提示词常量 ───────────────────────────────────────────────
 
 # 工具列表之前的主要指令块
+# "../../prompts/codeact_preamble.md"
 CODEACT_PREAMBLE = """你是一个 AI 助手，拥有 Python REPL 环境。
 
 ## 执行模式
@@ -33,6 +34,7 @@ CODEACT_PREAMBLE = """你是一个 AI 助手，拥有 Python REPL 环境。
 """
 
 # 在动态元数据部分之后追加的策略/结束块
+# "../../prompts/codeact_postamble.md"
 CODEACT_POSTAMBLE = """
 ## 策略
 
@@ -359,7 +361,9 @@ def build_codeact_system_prompt_inner(
     logger.debug(f"引擎 v2 提示模式: codeact_disabled={disable_codeact}")
 
     if disable_codeact:
+        # 前言
         preamble = STRUCTURED_TOOL_PREAMBLE
+        # 后记
         postamble = STRUCTURED_TOOL_POSTAMBLE
     else:
         preamble = CODEACT_PREAMBLE
