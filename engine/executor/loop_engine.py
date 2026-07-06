@@ -89,20 +89,27 @@ from bridge.effect_adapter import EffectBridgeAdapter
 @dataclass
 class ExecutionLoop:
     """线程的核心执行循环"""
+    # 每个任务一个thread
     thread: Thread
+    # 大模型
     llm: LlmBackend
+    # 效果执行器，负责执行工具调用和动作
     effects: EffectBridgeAdapter  # EffectExecutor
+    # 租约管理器，管理能力租约的授予、检查、消耗和撤销
     leases: LeaseManager
+    # 策略引擎，执行确定性的效果级别安全策略（允许/拒绝/需要审批
     policy: PolicyEngine
+    # 信号接收器，接收停止、注入消息等外部控制信号
     signal_rx: SignalReceiver
-    # 存储以备将来使用（例如用户范围的提示覆盖）
+    # 存用户ID，保留用于未来的用户级提示覆盖
     user_id: str
+    # 门控控制器，附加到每个ThreadExecutionContext，使执行器可以在审批门上暂停
     gate_controller: GateController
     # 可选的能力注册表，用于解析能力级别的策略
     capabilities: Optional[CapabilityRegistry] = None
-    # 可选的事件广播发送器，用于实时事件流
+    # 可选的事件广播发送器，用于实时状态更新流
     event_tx: Optional[asyncio.Queue] = None
-    # 可选的检索引擎，用于向上下文中注入先前知识
+    # 可选的检索引擎，用于注入先验知识到上下文
     retrieval: Optional[RetrievalEngine] = None
     # 可选的 Store，用于运行时提示覆盖加载和技能检索
     store: Optional[Store] = None

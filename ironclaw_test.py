@@ -32,9 +32,14 @@ llm_adapter = LlmBridgeAdapter(
 # 初始化: EffectBridgeAdapter
 # 作用: 统一管理工具批准、执行、速率等
 from bridge.effect_adapter import EffectBridgeAdapter
+from tools.registry import ToolRegistry
+from safety import SafetyLayer
+
+tools = ToolRegistry()
+safety = SafetyLayer()
 effect_adapter = EffectBridgeAdapter(
-            agent.tools,
-            agent.safety,
+            tools,
+            safety,
             agent.hooks,
         )
 # 初始化: HybridStore

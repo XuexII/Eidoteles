@@ -34,29 +34,27 @@ import threading
 from dataclasses import dataclass, field
 from typing import Optional, List, Any, Dict
 import logging
-from monty import (
-    ExtFunctionResult, LimitedTracker, MontyObject, MontyRun, NameLookupResult, PrintWriter,
-    ResourceLimits, RunProgress,
-)
 
 from scripting import (execute_code, json_to_monty, monty_to_json, monty_to_string)
 from thread_context import thread_execution_context
 
 from ..capability.lease import LeaseManager
 from ..capability.policy import PolicyEngine
-from ..memory.RetrievalEngine
+from ..memory import RetrievalEngine
 from ..runtime.lease_refresh import reconcile_dynamic_tool_lease
 from ..runtime.messaging import (SignalReceiver, ThreadOutcome, ThreadSignal)
 from ..traits.effect import (EffectExecutor, ThreadExecutionContext)
 from ..traits.llm import (LlmBackend, LlmCallConfig)
 from ..traits.store import Store
-from ..types.error import (EngineError, OrchestratorFailure, OrchestratorFailureKind)
 from ..types.event import (EventKind, ThreadEvent, summarize_params)
 from ..types.message import ThreadMessage
 from ..types.project import ProjectId
 from ..types import shared_owner_id
 from ..types.step import (ActionCall, StepId, TokenUsage)
 from ..types.thread import (ActiveSkillProvenance, Thread, ThreadState)
+from engine.executor.prompt import PlatformInfo
+from engine.gate import GateController
+import regex as re
 
 logger = logging.getLogger(__name__)
 
@@ -160,334 +158,6 @@ class ResourceLimits:
     max_memory: int = 128 * 1024 * 1024  # 128 MB
 
 
-# ── 辅助函数 ─────────────────────────────────────────────────
-
-def _orchestrator_max_duration() -> int:
-    """从环境变量解析编排器 VM 实际时间预算
-
-    从 `IRONCLAW_ORCHESTRATOR_MAX_DURATION_SECS` 解析。
-    进程生命周期内缓存
-    """
-    # 使用模块级变量模拟 OnceLock
-    if not hasattr(_orchestrator_max_duration, '_cached'):
-        secs_str = os.environ.get("IRONCLAW_ORCHESTRATOR_MAX_DURATION_SECS", "")
-        try:
-            secs = int(secs_str.strip())
-        except (ValueError, AttributeError):
-            secs = ORCHESTRATOR_DEFAULT_MAX_DURATION_SECS
-
-        # 限制在合理范围内
-        secs = max(ORCHESTRATOR_MIN_MAX_DURATION_SECS,
-                   min(secs, ORCHESTRATOR_MAX_MAX_DURATION_SECS))
-        _orchestrator_max_duration._cached = secs
-
-    return _orchestrator_max_duration._cached
-
-
-def orchestrator_limits() -> ResourceLimits:
-    """获取编排器 VM 的资源限制"""
-    return ResourceLimits(
-        max_duration_secs=_orchestrator_max_duration(),
-        max_allocations=5_000_000,
-        max_memory=128 * 1024 * 1024,  # 128 MB
-    )
-
-
-def apply_snapshot_inventory(
-        exec_ctx: ThreadExecutionContext,
-        inventory: Optional[ActionInventory] = None,
-) -> List[ActionDef]:
-    """将快照清单应用到执行上下文"""
-    if inventory is not None:
-        available_actions = list(inventory.inline)
-        exec_ctx.available_actions_snapshot = available_actions
-        exec_ctx.available_action_inventory_snapshot = inventory
-    else:
-        available_actions = []
-
-    return available_actions
-
-
-def normalize_pause_outcome(thread: Thread, outcome: ThreadOutcome) -> None:
-    """规范化暂停结果：如果结果是 GatePaused 且线程不在 Waiting 状态，则转换"""
-    if isinstance(outcome, ThreadOutcome) and hasattr(outcome, 'gate_name'):
-        if thread.state != ThreadState.Waiting:
-            thread.transition_to(
-                ThreadState.Waiting,
-                "等待外部门控解决方案",
-            )
-
-
-def classify_orchestrator_failure(prefix: str, err_msg: str) -> OrchestratorFailure:
-    """将 Monty 编排器故障分类为类型化的 [`OrchestratorFailure`]
-
-    携带用户安全分类和保留的低级详细信息以供网关调试模式使用
-
-    原始 `err_msg`（通常包含内部文件路径和上游 HTTP 正文的 Python 回溯）
-    始终存储在返回结构体的 `debug_detail` 字段中并以 `debug` 级别发出，
-    永远不会放入用户可见的分类中 — 参见 `.claude/rules/error-handling.md`，
-    "Error Boundaries at the Channel Edge" (#2546)
-    """
-    logger.debug(f"编排器 VM 故障: {prefix}: {err_msg}")
-
-    lower = err_msg.lower()
-
-    # 保留 `TimeLimit` 用于明确的 Monty 实际时间标记 —
-    # 面向用户的消息告诉操作员提高 `IRONCLAW_ORCHESTRATOR_MAX_DURATION_SECS`，
-    # 这对于上游 LLM/网络超时是错误的建议。
-    # 裸露的 "timeout"/"timed out" 过去会捕获这些
-    # （例如 `reqwest` 的 "Request timed out"、提供者的 "Connection timed out"）
-    # 并将用户指向预算旋钮而不是真正的故障类别。
-    # 这些现在落入 `Other`（通用内部故障）。
-    # 参考：PR #2753 的 serrrfirat 审查，提交 82d06410
-    #
-    # 我们保留的谓词要么是 VM 自身错误文本中的显式环境变量名，
-    # 要么是 Monty 运行时用于其持续时间限制的短语，
-    # 要么是引擎在编排器自身超时步骤时发出的哨兵。
-    # 重复 `ResourceLimits` 措辞是可以的 — 这些字符串与此分类器位于同一 crate 中
-    hit_time_limit = (
-            "duration limit" in lower
-            or "max_duration" in lower
-            or "maximum duration" in lower
-            or "execution duration exceeded" in lower
-            or "orchestrator timed out" in lower
-    )
-    hit_memory_limit = "memory limit" in lower or "allocation limit" in lower
-    hit_resource_limit = (
-            "resource limit" in lower
-            or "out of fuel" in lower
-            or "fuel exhausted" in lower
-    )
-    has_python_traceback = (
-            "traceback (most recent call last)" in lower
-            or "traceback:" in lower
-    )
-
-    if hit_time_limit:
-        kind = TimeLimit(
-            prefix=prefix,
-            limit_secs=_orchestrator_max_duration(),
-        )
-    elif hit_memory_limit or hit_resource_limit:
-        kind = ResourceLimit(prefix=prefix)
-    elif has_python_traceback:
-        kind = Traceback(prefix=prefix)
-    else:
-        kind = Other(prefix=prefix)
-
-    return OrchestratorFailure(kind=kind, debug_detail=err_msg)
-
-
-def orchestrator_vm_panic(prefix: str, phase: str) -> OrchestratorFailure:
-    """将 Monty VM 恐慌（解析/启动/恢复阶段）包装为类型化的编排器故障
-
-    恐慌本身没有文本负载 — 我们可以字符串化的 `panic_payload`
-    始终是来自 `catch_unwind` 的 `str` 或 `String` —
-    因此 `debug_detail` 携带阶段标签以便关联
-    """
-    logger.debug(f"编排器 VM 恐慌: {prefix}, 阶段: {phase}")
-    return OrchestratorFailure(
-        kind=VmPanic(prefix=prefix, phase=phase),
-        debug_detail=f"Monty VM 在 {phase} 期间发生恐慌",
-    )
-
-
-def warn_on_lease_refresh_failure(context: str, error: EngineError) -> None:
-    """限流租约刷新失败的警告日志"""
-    global _last_lease_warn_ts
-
-    now = int(time.time())
-
-    with _last_lease_warn_lock:
-        if now - _last_lease_warn_ts >= LEASE_REFRESH_WARN_INTERVAL_SECS:
-            _last_lease_warn_ts = now
-            logger.warning(f"动态租约刷新失败: {context}: {error}")
-        else:
-            logger.debug(f"动态租约刷新失败: {context}: {error}")
-
-
-def load_failure_count(docs: List[MemoryDoc]) -> int:
-    """加载最新编排器版本的故障计数"""
-    for doc in docs:
-        if doc.title == FAILURE_TRACKER_TITLE:
-            try:
-                data = json.loads(doc.content)
-                return data.get("count", 0)
-            except (json.JSONDecodeError, TypeError):
-                return 0
-    return 0
-
-
-def load_orchestrator_from_docs(
-        docs: List[MemoryDoc],
-        allow_self_modify: bool,
-) -> tuple:
-    """从预获取的系统记忆文档加载编排器
-
-    当调用者已经拥有 `list_memory_docs` 结果时，使用此函数
-    以避免重复的 Store 查询。返回 `(code, version)`
-
-    尊重 `allow_self_modify` — 为 false 时，始终返回编译时的默认值。
-    `loop_engine.rs` 中的调用者从引擎配置传入此参数
-    """
-    if not allow_self_modify:
-        return (DEFAULT_ORCHESTRATOR, 0)
-
-    # 查找所有编排器版本，按版本号降序排序
-    versions = []
-    for doc in docs:
-        if doc.title == ORCHESTRATOR_TITLE and ORCHESTRATOR_TAG in doc.tags:
-            versions.append(doc)
-
-    # 按版本降序排序
-    versions.sort(
-        key=lambda d: d.metadata.get("version", 0) if isinstance(d.metadata, dict) else 0,
-        reverse=True,
-    )
-
-    if not versions:
-        logger.debug("使用编译时默认编排器 (v0)")
-        return (DEFAULT_ORCHESTRATOR, 0)
-
-    # 检查最新版本的故障计数
-    failures = load_failure_count(docs)
-
-    for doc in versions:
-        version = doc.metadata.get("version", 1) if isinstance(doc.metadata, dict) else 1
-
-        # 跳过故障过多的版本（仅检查最新的）
-        latest_version = versions[0].metadata.get("version", 1) if isinstance(versions[0].metadata, dict) else 1
-        if version == latest_version and failures >= MAX_FAILURES_BEFORE_ROLLBACK:
-            logger.debug(f"编排器版本 {version} 故障过多 ({failures})，跳过")
-            continue
-
-        logger.debug(f"已加载运行时编排器 (v{version})")
-        return (doc.content, version)
-
-    # 所有版本都失败 — 回退到编译时默认值
-    logger.debug("所有编排器版本均失败，使用编译时默认编排器 (v0)")
-    return (DEFAULT_ORCHESTRATOR, 0)
-
-
-async def load_orchestrator(
-        store: Optional[Store],
-        project_id: ProjectId,
-        allow_self_modify: bool,
-) -> tuple:
-    """加载编排器代码：来自 Store 的运行时版本，或编译时的默认值
-
-    当 `allow_self_modify` 为 false 时，无论 Store 中有任何运行时版本，
-    始终使用编译时的默认值。这是生产环境的安全默认值 —
-    运行时编排器修补是选择加入的
-
-    检查故障跟踪器 — 如果最新版本有 >= 3 次连续故障，
-    回退到前一个版本（或编译时默认值）
-    """
-    if not allow_self_modify:
-        logger.debug("编排器自我修改已禁用，使用编译时默认编排器 (v0)")
-        return (DEFAULT_ORCHESTRATOR, 0)
-
-    if store is None:
-        logger.debug("使用编译时默认编排器 (v0，无 Store)")
-        return (DEFAULT_ORCHESTRATOR, 0)
-
-    try:
-        docs = await store.list_shared_memory_docs(project_id)
-    except Exception:
-        logger.debug("使用编译时默认编排器 (v0，Store 错误)")
-        return (DEFAULT_ORCHESTRATOR, 0)
-
-    return load_orchestrator_from_docs(docs, allow_self_modify)
-
-
-async def record_orchestrator_failure(
-        store: Store,
-        project_id: ProjectId,
-        version: int,
-) -> None:
-    """记录当前编排器版本的故障"""
-    try:
-        docs = await store.list_shared_memory_docs(project_id)
-    except Exception as e:
-        logger.debug(f"列出故障跟踪器的记忆文档失败: {e}")
-        return
-
-    existing = None
-    for doc in docs:
-        if doc.title == FAILURE_TRACKER_TITLE:
-            existing = doc
-            break
-
-    if existing is not None:
-        tracker = existing.clone()
-    else:
-        tracker = MemoryDoc.new(
-            project_id,
-            shared_owner_id(),
-            DocType.Note,
-            FAILURE_TRACKER_TITLE,
-            "",
-        )
-        tracker = tracker.with_tags(["orchestrator_meta"])
-
-    # 将故障计数存储为内容中的 JSON: {"version": N, "count": M}
-    try:
-        current = json.loads(tracker.content)
-    except (json.JSONDecodeError, TypeError):
-        current = {}
-
-    current_version = current.get("version", 0)
-    current_count = current.get("count", 0)
-
-    if current_version == version:
-        new_count = current_count + 1
-    else:
-        new_count = 1  # 新版本，重置计数
-
-    tracker.content = json.dumps({
-        "version": version,
-        "count": new_count,
-    })
-    tracker.updated_at = datetime.now(timezone.utc)
-
-    # 故障跟踪器携带 `orchestrator:` 标题前缀，因此被 Store 中的
-    # `is_protected_orchestrator_doc` 门控。
-    # 进入受信任的内部写入作用域，以便系统发起的保存被接纳，
-    # 而不会被误认为是 LLM 编写的补丁
-    try:
-        await with_trusted_internal_writes(store.save_memory_doc(tracker))
-    except Exception as e:
-        logger.debug(f"保存编排器故障跟踪器失败: {e}")
-
-    logger.debug(f"已记录编排器故障: version={version}, count={new_count}")
-
-
-async def reset_orchestrator_failures(store: Store, project_id: ProjectId) -> None:
-    """重置故障计数器（成功执行后调用）"""
-    try:
-        docs = await store.list_shared_memory_docs(project_id)
-    except Exception:
-        docs = []
-
-    existing = None
-    for doc in docs:
-        if doc.title == FAILURE_TRACKER_TITLE:
-            existing = doc
-            break
-
-    if existing is not None:
-        tracker = existing.clone()
-        tracker.content = json.dumps({"version": 0, "count": 0})
-        tracker.updated_at = datetime.now(timezone.utc)
-        # 与 `record_orchestrator_failure` 相同的理由：跟踪器文档
-        # 具有 `orchestrator:` 标题，因此 Store 门控会触发。
-        # 进入受信任的写入作用域以进行此系统发起的重置
-        try:
-            await with_trusted_internal_writes(store.save_memory_doc(tracker))
-        except Exception:
-            pass
-
-
 # ── 编排器执行 ───────────────────────────────────────────────
 
 async def execute_orchestrator(
@@ -504,7 +174,7 @@ async def execute_orchestrator(
         platform_info: Optional[PlatformInfo] = None,
         gate_controller: GateController = None,
         persisted_state: dict = None,
-) -> OrchestratorResult:
+):
     """通过主机函数调度执行编排器 Python 代码
 
     这是替代 `ExecutionLoop::run()` 内部循环的核心函数。
@@ -517,174 +187,1303 @@ async def execute_orchestrator(
     persisted_state = persisted_state or {}
 
     # 构建编排器的上下文变量
-    input_names, input_values = build_orchestrator_inputs(thread, persisted_state)
+    # context, goal, actions, state, config
+    context, goal, actions, state, config = build_orchestrator_inputs(thread, persisted_state)
 
-    # 解析并编译编排器代码
-    try:
-        # orchestrator.py是标识，，用于错误信息和调试
-        # 解析和编译整个 default.py 文件，但不执行任何代码
-        runner = MontyRun(code, "orchestrator.py", input_names)
-    except Exception as e:
-        # 通过相同的类型化清理器路由解析失败，
-        # 这样错误的 `default.py` 部署不会将 Monty 内部信息泄露到频道边缘
-        raise EngineError(f"Orchestrator: {classify_orchestrator_failure('编排器解析错误', str(e))}")
+    max_iterations = config.get("max_iterations", 30)
+    max_nudges = config.get("max_tool_intent_nudges", 2)
+    nudge_enabled = config.get("enable_tool_intent_nudge", True)
+    # None means "no limit" — callers can disable the guard explicitly.
+    max_consecutive_errors = config.get("max_consecutive_errors", 5)
+    # None means "no limit" (matches Option::None semantics from Rust caller).
+    # Use a sentinel larger than any realistic counter so comparisons stay well-typed.
+    if max_consecutive_errors is None:
+        max_consecutive_errors = 10 ** 9
+    obligation_enabled = config.get("require_action_attempt", False)
+    max_obligation_nudges = config.get("max_action_requirement_nudges", 2)
 
-    # 启动执行
-    limits = orchestrator_limits()
-    try:
-        # 执行的 Python 代码：从 default.py 的第一行开始执行，直到遇到第一个 host function 调用或函数定义
-        progress = runner.start(input_values, limits, stdout)
-    except Exception as e:
-        raise EngineError(f"Orchestrator: {classify_orchestrator_failure('编排器运行时错误', str(e))}")
+    consecutive_nudges = 0
+    consecutive_errors = 0
+    consecutive_action_errors = 0
+    step_count = config.get("step_count", 0)
+    if not isinstance(state, dict):
+        state = {}
+    state.setdefault("history", [])
+    state.setdefault("compaction_count", 0)
 
-    # 驱动编排器调度循环
-    # 1. 检查信号
-    #   1.1 `__check_signals__` —— 轮询停止/注入信号
+    # ----------Step1: 执行显示命令----------
 
-    # 2. 检查预算
-    #   2.1 `__check_budget__` —— 剩余令牌/时间/美元额度
+    # ----------Step2: 执行显示命令----------
+    working_messages = ensure_working_messages(state, context)
 
-    # 3. 在第一步(step=0)注入先验知识并激活技能
-    #   3.1 `__retrieve_docs__` —— 查询记忆文档
-    #   3.2 __list_skills__()                            -> 技能字典列表
-    #   3.2 __set_active_skills__  设置激活的技能
+    for step in range(step_count, max_iterations):
+        # ----------Step3: 检查信号----------
+        signal = handle_check_signals(signal_rx, thread)
 
-    # 4. 调用llm
-    #   4.1 __llm_complete__(messages, actions, config)  -> 响应字典
+        # ----------Step4: 检查预算----------
+        budget = handle_check_budget(thread)
 
-    # 5. 根据类型处理响应。
+        # ----------Step5: 在第一步注入先验知识并激活技能----------
+        if step == 0:
+            # ----------Step5-1: 查询记忆文档----------
+            if docs := await handle_retrieve_docs(goal, 5, thread, retrieval):
+                # 格式化
+                knowledge = format_docs(docs)
+                # 加到第一条的system中
+                append_system_append(working_messages, knowledge)
 
-    #   __llm_complete__(messages, actions, config)  -> 响应字典
-    #   __execute_code_step__(code, state)           -> 结果字典
-    #   __execute_action__(name, params)             -> 结果字典
-    #   __execute_actions_parallel__(calls)          -> 结果字典列表（并行执行）
-    #   __check_signals__()                          -> None | "stop" | {"inject": 消息}
-    #   __emit_event__(kind, **data)                 -> None
-    #   __save_checkpoint__(state, counters)         -> None
-    #   __transition_to__(state, reason)             -> None
-    #   __retrieve_docs__(goal, max_docs)            -> 文档字典列表
-    #   __check_budget__()                           -> 预算字典
-    #   __get_actions__()                            -> 动作字典列表
-    #   __record_skill_usage__(doc_id, success)      -> None
-    #   __regex_match__(pattern, text)               -> bool
-    while True:
-        if isinstance(progress, RunComplete):
-            # 如果设置了 FINAL 结果则使用，否则回退到 VM 返回值
-            result = final_result if final_result is not None else progress.value
-            sync_runtime_state(thread, result.get("state"))
-            outcome = parse_outcome(result)
-            sync_visible_outcome(thread, outcome)
-            normalize_pause_outcome(thread, outcome)
-            return OrchestratorResult(
-                outcome=outcome,
-                tokens_used=total_tokens,
-            )
+            # ----------Step5-2: 根据目标关键词选择并注入技能----------
+            all_skills = handle_list_skills(thread, store)
+            explicit_skills, _rewritten_goal, missing_explicit_skills = extract_explicit_skills(all_skills, goal)
+            if active_skills := select_skills(all_skills, goal, max_candidates=3, max_tokens=6000):
+                explicit_names = set(
+                    str(s.get("metadata", {}).get("name", ""))
+                    for s in explicit_skills
+                )
+                skills_json = [
+                    {
+                        "doc_id": s.get("doc_id", ""),
+                        "name": s.get("metadata", {}).get("name", "?"),
+                        "version": s.get("metadata", {}).get("version", 1),
+                        "snippet_names": [
+                            sn.get("name", "")
+                            for sn in s.get("metadata", {}).get("code_snippets", [])
+                            if sn.get("name")
+                        ],
+                        "force_activated": (
+                                s.get("metadata", {}).get("name", "") in explicit_names
+                        ),
+                    }
+                    for s in active_skills
+                ]
+                ext_result = handle_set_active_skills(skills_json, thread)
+                skill_text = format_skills(active_skills)
+                append_system_append(working_messages, skill_text)
+                # 为 CLI/网关显示发出技能激活事件——通知用户
+                skill_names = ",".join(s.get("metadata", {}).get("name", "?") for s in active_skills)
+                logger.info(f"选择使用技能: {skill_names}")
+                # handle_emit_event("skill_activated", skill_names=skill_names)
+                # 将活动技能 ID 存储在状态中以供追踪。
+                state["active_skill_ids"] = [s.get("doc_id", "") for s in active_skills]
+                state["skill_snippet_names"] = []
+                for s in active_skills:
+                    for sn in s.get("metadata", {}).get("code_snippets", []):
+                        state["skill_snippet_names"].append(sn.get("name", ""))
 
-        elif isinstance(progress, RunFunctionCall):
-            action_name = progress.function_name
-            args = progress.args
-            kwargs = progress.kwargs
+            if missing_explicit_skills:
+                rendered = ", ".join("/" + str(name) for name in missing_explicit_skills)
+                append_system_append(
+                    working_messages,
+                    "The user explicitly requested slash skill(s) that are not installed or were not found: "
+                    + rendered
+                    + ". Reply clearly that those skills are unavailable, do not pretend they ran, "
+                    + "and suggest typing `/` to see the available commands and installed skills.",
+                )
 
-            logger.debug(f"编排器: 主机函数调用 {action_name}")
+        # ----------Step6: 在需要时，于下次模型调用之前压缩上下文----------
+        compact_if_needed(state, config)
+        working_messages = ensure_working_messages(state, context)
 
-            # 根据函数名分派到对应的处理函数
-            if action_name == "FINAL":
-                # FINAL(result) — 编排器返回其结果
-                val = args[0] if args else {}
-                final_result = val
-                ext_result = ExtFunctionResult.Return(None)
+        # ----------Step7: 调用LLM----------
+        # 发送通知
+        logger.info(f"step_started: {step}")
 
-            # Step1:
-            elif action_name == "__check_signals__":
-                ext_result = _handle_check_signals(signal_rx, thread)
-
-            elif action_name == "__llm_complete__":
-                ext_result = await _handle_llm_complete(
+        args = (working_messages, actions, None)
+        kwargs = {}
+        response = await handle_llm_complete(
                     args, kwargs, thread, llm, effects, leases, store, platform_info, total_tokens,
                 )
+        logger.info(f"step_completed: {step}")
 
-            elif action_name == "__execute_code_step__":
-                ext_result = await _handle_execute_code_step(
-                    args, kwargs, thread, llm, effects, leases, policy, event_tx, gate_controller,
+        # ----------Step7: 根据类型处理响应----------
+        resp_type = response.get("type", "text")
+
+        if resp_type == "text":
+            text = response.get("content", "")
+            append_message(working_messages, "Assistant", text)
+
+            # Check for FINAL()
+            if final_answer := extract_final(text):
+                # 返回结果
+                return complete_result(state, "completed", final_answer)
+            # 检查工具意图提示（V1 语义：连续计数器，
+            # 仅在非意图文本响应时重置，不在动作/代码响应时重置）
+            if nudge_enabled and consecutive_nudges < max_nudges and signals_tool_intent(text):
+                consecutive_nudges += 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "你说过要执行某个操作，但没有包含任何工具调用。"
+                    "不要仅仅描述你想做什么——现在请实际调用工具。"
+                    "请使用 tool_calls 机制来调用相应的工具。",
                 )
-
-            elif action_name == "__execute_action__":
-                ext_result = await _handle_execute_action(
-                    args, kwargs, thread, effects, leases, policy, event_tx, gate_controller,
-                )
-
-            elif action_name == "__execute_actions_parallel__":
-                ext_result = await _handle_execute_actions_parallel(
-                    args, thread, effects, leases, policy, event_tx, gate_controller,
-                )
-
-            elif action_name == "__emit_event__":
-                ext_result = _handle_emit_event(args, kwargs, thread, event_tx)
-
-            elif action_name == "__save_checkpoint__":
-                ext_result = _handle_save_checkpoint(args, kwargs, thread)
-
-            elif action_name == "__transition_to__":
-                ext_result = _handle_transition_to(args, kwargs, thread)
-
-            elif action_name == "__retrieve_docs__":
-                ext_result = await _handle_retrieve_docs(args, kwargs, thread, retrieval)
-
-            elif action_name == "__check_budget__":
-                ext_result = _handle_check_budget(thread)
-
-            elif action_name == "__get_actions__":
-                ext_result = await _handle_get_actions(thread, effects, leases, store)
-
-            elif action_name == "__list_skills__":
-                ext_result = await _handle_list_skills(args, thread, store)
-
-            elif action_name == "__record_skill_usage__":
-                ext_result = await _handle_record_skill_usage(args, store)
-
-            elif action_name == "__regex_match__":
-                # 使用 Python 的 re 模块评估正则表达式。
-                # 无效模式静默返回 False。
-                # Monty 没有 `re` 模块，因此此主机函数为技能选择器的
-                # 基于模式的评分桥接了差距
-                ext_result = _handle_regex_match(args)
-
-            elif action_name == "__set_active_skills__":
-                ext_result = _handle_set_active_skills(args, thread)
-
-            else:
-                # 未知 — 让 Monty 解析（用户定义的函数、内置函数）
-                ext_result = ExtFunctionResult.NotFound(action_name)
-
-            # 恢复编排器 VM
-            try:
-                progress = progress.resume(ext_result, stdout)
-            except Exception as e:
-                raise EngineError(f"Orchestrator: {classify_orchestrator_failure('恢复后编排器错误', str(e))}")
-
-            # 如果调用了 FINAL，VM 应在下次迭代时完成
-            if final_result is not None:
                 continue
 
-        elif isinstance(progress, RunNameLookup):
-            # 未定义的变量 — 以 NameError 恢复
-            name = progress.name
-            logger.debug(f"编排器: 未解析的名称 {name}")
-            try:
-                progress = progress.resume(NameLookupResult.Undefined, stdout)
-            except Exception as e:
-                raise EngineError(f"Orchestrator: {classify_orchestrator_failure(f'编排器 NameError {name}', str(e))}")
+            # 在重置 consecutive_nudges 之前检查执行义务。
+            # 这确保互斥守卫（consecutive_nudges == 0）
+            # 正确反映了本轮是否触发了工具意图提示。
+            # 如果工具意图提示触发并耗尽预算，则 consecutive_nudges > 0
+            # 且义务被跳过。重置操作在之后执行。
+            available_actions = await handle_get_actions(thread, effects, leases, store)
+            if (obligation_enabled
+                    and consecutive_nudges == 0
+                    and len(available_actions) > 0
+                    and not state.get("_obligation_resolved", False)
+                    and state.get("_obligation_nudge_count", 0) < max_obligation_nudges):
+                state["_obligation_nudge_count"] = state.get("_obligation_nudge_count", 0) + 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "你被要求执行某个操作，但你仅以文本作出了回应。"
+                    "不要描述或解释——现在请调用相应的工具。"
+                    "请使用 tool_calls 机制来调用工具。",
+                )
+                continue
 
-        elif isinstance(progress, RunOsCall):
-            raise EngineError("Effect: 编排器尝试了 OS 调用（已阻止）")
+            # 非意图文本响应——重置提示计数器
+            if not signals_tool_intent(text):
+                consecutive_nudges = 0
+            # 纯文本响应——完成
+            return complete_result(state, "completed", text)
 
-        elif isinstance(progress, RunResolveFutures):
-            raise EngineError("Effect: 编排器尝试了异步操作（不支持）")
+
+        elif resp_type == "code":
+
+            state["_obligation_resolved"] = True  # code attempt satisfies obligation
+
+            code = response.get("code", "")
+
+            append_message(working_messages, "Assistant", "```repl\n" + code + "\n```")
+
+            # 在嵌套的 Monty VM 中执行代码。
+
+            result = handle_execute_code_step(code, state)
+
+            # Update persisted state with results
+
+            if result.get("return_value") is not None:
+                state["step_" + str(step) + "_return"] = result["return_value"]
+
+                state["last_return"] = result["return_value"]
+
+            for r in result.get("action_results", []):
+                state[r.get("action_name", "unknown")] = r.get("output")
+
+            # Format output for next LLM context
+
+            output = format_output(result)
+
+            append_message(working_messages, "User", output)
+
+            # Check for FINAL() in code output
+
+            if result.get("final_answer") is not None:
+                __transition_to__("completed", "FINAL() in code")
+
+                return complete_result(state, "completed", result["final_answer"])
+
+            # Check for unified gate pause (new path)
+
+            gate = result.get("pending_gate")
+
+            if gate is None:
+                gate = result.get("need_approval")
+
+            if gate is not None and isinstance(gate, dict) and gate.get("gate_paused"):
+                __save_checkpoint__(state, {
+
+                    "nudge_count": consecutive_nudges,
+
+                    "consecutive_errors": consecutive_errors,
+
+                    "consecutive_action_errors": consecutive_action_errors,
+
+                    "compaction_count": state.get("compaction_count", 0),
+
+                    "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+
+                })
+
+                __transition_to__("waiting", "gate paused: " + gate.get("gate_name", "unknown"))
+
+                return {
+
+                    "outcome": "gate_paused",
+
+                    "state": state,
+
+                    "gate_name": gate.get("gate_name", ""),
+
+                    "action_name": gate.get("action_name", ""),
+
+                    "call_id": gate.get("call_id", ""),
+
+                    "parameters": gate.get("parameters", {}),
+
+                    "resume_kind": gate.get("resume_kind", {}),
+
+                }
+
+            # Check for approval or authentication needed (legacy path)
+
+            if result.get("need_approval") is not None:
+
+                approval = result["need_approval"]
+
+                __save_checkpoint__(state, {
+
+                    "nudge_count": consecutive_nudges,
+
+                    "consecutive_errors": consecutive_errors,
+
+                    "consecutive_action_errors": consecutive_action_errors,
+
+                    "compaction_count": state.get("compaction_count", 0),
+
+                    "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+
+                })
+
+                if approval.get("need_authentication"):
+                    __transition_to__("waiting", "authentication needed")
+
+                    return {
+
+                        "outcome": "need_authentication",
+
+                        "state": state,
+
+                        "credential_name": approval.get("credential_name", ""),
+
+                        "action_name": approval.get("action_name", ""),
+
+                        "call_id": approval.get("call_id", ""),
+
+                        "parameters": approval.get("parameters", {}),
+
+                    }
+
+                __transition_to__("waiting", "approval needed")
+
+                return {
+
+                    "outcome": "need_approval",
+
+                    "state": state,
+
+                    "action_name": approval.get("action_name", ""),
+
+                    "call_id": approval.get("call_id", ""),
+
+                    "parameters": approval.get("parameters", {}),
+
+                }
+
+            # Track consecutive errors
+
+            if result.get("had_error"):
+
+                consecutive_errors += 1
+
+                if max_consecutive_errors is not None and consecutive_errors >= max_consecutive_errors:
+                    __transition_to__("failed", "too many consecutive errors")
+
+                    return complete_result(
+
+                        state,
+
+                        "failed",
+
+                        error=str(max_consecutive_errors) + " consecutive code errors",
+
+                    )
+
+            else:
+
+                consecutive_errors = 0
+
+            __save_checkpoint__(state, {
+
+                "nudge_count": consecutive_nudges,
+
+                "consecutive_errors": consecutive_errors,
+
+                "consecutive_action_errors": consecutive_action_errors,
+
+                "compaction_count": state.get("compaction_count", 0),
+
+                "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+
+            })
+
+        elif resp_type == "actions":
+            # 动作尝试满足义务要求
+            state["_obligation_resolved"] = True
+            # 第 0 层：结构化工具调用。
+            # 注意：此处不重置 consecutive_nudges（V1 语义）。
+            # 只有非意图文本响应会重置计数器。
+            calls = response.get("calls", [])
+
+            # 处理作为结构化工具调用发出的 FINAL。FINAL 是 CodeAct 完成哨兵——
+            # 当大语言模型尝试通过 tool_calls 而非在代码块内部调用它时，
+            # 引擎的动作执行器没有相应的租约，调用将失败。如果 FINAL
+            # 与其他调用一同发出，先执行非 FINAL 调用，
+            # 以避免持久化副作用被静默丢弃。
+            final_call = None
+            duplicate_finals_dropped = 0
+            executable_calls = []
+            for c in calls:
+                if c.get("name", "") == "FINAL":
+                    # 第一个 FINAL 胜出；多余的将被丢弃（不追加到
+                    # executable_calls），以免它们作为普通动作执行
+                    # 并因租约错误而失败。
+                    if final_call is None:
+                        final_call = c
+                    else:
+                        duplicate_finals_dropped += 1
+                    continue
+                executable_calls.append(c)
+
+            if duplicate_finals_dropped > 0:
+                # 将丢弃操作暴露出来，以便追踪显示执行的 FINAL 数量
+                # 少于大语言模型发出的数量的原因。
+                logger.info(f"duplicate_final_dropped数量: duplicate_finals_dropped")
+
+            # 追加仅包含可执行调用的助手消息。
+            # FINAL 会从 `action_calls` 中被过滤掉，这样消息历史
+            # 就不会记录一个没有匹配 ActionResult 的 FINAL 动作，
+            # 从而避免在恢复时混淆上下文重放。
+            append_message(
+                working_messages,
+                "Assistant",
+                response.get("content", "") or "",
+                action_calls=executable_calls,
+            )
+
+            # 通过批量主机函数并行执行所有工具调用。
+            # Rust 处理预检（租约/策略）、通过 JoinSet 并行执行，
+            # 以及按调用顺序发出事件。
+            results = await handle_execute_actions_parallel(
+                executable_calls, thread, effects, leases, policy, event_tx, gate_controller,
+            )
+            # 助手消息中的每个工具调用都必须有匹配的 ActionResult，
+            # 否则大语言模型 API 会以“未找到函数调用 <id> 的工具输出”为由拒绝该序列。
+            # 遍历 executable_calls（而非 results），以覆盖被 Rust
+            # 批量处理程序跳过的调用（例如 RequireApproval 提前返回的情况）。
+            batch_error_count = 0
+            batch_success_count = 0
+            for idx in range(len(executable_calls)):
+                call = executable_calls[idx]
+                call_id = call.get("call_id", "")
+                r = results[idx] if idx < len(results) else None
+                if r is not None:
+                    action_name = r.get("action_name", call.get("name", ""))
+                    output = r.get("output")
+                    output_str = str(output) if output is not None else "[no output]"
+                    if r.get("is_error"):
+                        output_str = "[ACTION FAILED] " + action_name + ": " + output_str
+                        batch_error_count += 1
+                    else:
+                        batch_success_count += 1
+                else:
+                    action_name = call.get("name", "unknown")
+                    output_str = "[execution skipped]"
+                    batch_error_count += 1
+                append_message(
+                    working_messages,
+                    "ActionResult",
+                    output_str,
+                    action_name=action_name,
+                    action_call_id=call_id,
+                )
+
+            # TODO(#2325)：在此处追踪连续动作错误，镜像上面（第 623-634 行）的
+            # 代码错误追踪。需要在两条执行路径上统一进度追踪设计。
+
+            # Check results for auth/approval interrupts
+            for r_idx, r in enumerate(results):
+                if r is None:
+                    continue
+
+                if r.get("gate_paused"):
+                    # 统一门控暂停（取代单独的 need_approval/need_authentication）
+                    args = (state, {
+                        "nudge_count": consecutive_nudges,
+                        "consecutive_errors": consecutive_errors,
+                        "consecutive_action_errors": consecutive_action_errors,
+                        "compaction_count": state.get("compaction_count", 0),
+                        "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+                    })
+                    handle_save_checkpoint(args, {}, thread)
+                    gate = r
+                    # 从原始调用或结果中获取动作信息。
+                    orig_call = executable_calls[r_idx] if r_idx < len(executable_calls) else {}
+                    handle_transition_to("waiting", "gate paused: " + gate.get("gate_name", "unknown"), {}, thread)
+                    return {
+                        "outcome": "gate_paused",
+                        "state": state,
+                        "gate_name": gate.get("gate_name", ""),
+                        "action_name": gate.get("action_name", orig_call.get("name", "")),
+                        "call_id": orig_call.get("call_id", ""),
+                        "parameters": orig_call.get("params", {}),
+                        "resume_kind": gate.get("resume_kind", {}),
+                    }
+
+                if r.get("need_authentication"):
+                    args = (state, {
+                        "nudge_count": consecutive_nudges,
+                        "consecutive_errors": consecutive_errors,
+                        "consecutive_action_errors": consecutive_action_errors,
+                        "compaction_count": state.get("compaction_count", 0),
+                        "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+                    })
+                    handle_save_checkpoint(args, kwargs, thread)
+
+                    handle_transition_to("waiting", "authentication needed", {}, thread)
+                    return {
+                        "outcome": "need_authentication",
+                        "state": state,
+                        "credential_name": r.get("credential_name", ""),
+                        "action_name": r.get("action_name", ""),
+                        "call_id": r.get("call_id", ""),
+                        "parameters": r.get("parameters", {}),
+                    }
+
+                if r.get("need_approval"):
+                    handle_save_checkpoint(state, {
+                        "nudge_count": consecutive_nudges,
+                        "consecutive_errors": consecutive_errors,
+                        "consecutive_action_errors": consecutive_action_errors,
+                        "compaction_count": state.get("compaction_count", 0),
+                        "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+                    })
+                    handle_transition_to("waiting", "approval needed")
+                    return {
+                        "outcome": "need_approval",
+                        "state": state,
+                        "action_name": r.get("action_name", ""),
+                        "call_id": r.get("call_id", ""),
+                        "parameters": r.get("parameters", {}),
+                    }
+
+            if final_call is not None:
+                raw_params = final_call.get("params", {})
+                # Some LLMs pass FINAL with the answer as a positional string
+                # argument instead of a named param dict. Handle that case so
+                # the answer is not silently dropped.
+                if isinstance(raw_params, str):
+                    answer = raw_params
+                else:
+                    params = raw_params or {}
+                    answer = (
+                            params.get("answer")
+                            or params.get("result")
+                            or params.get("value")
+                            or params.get("content")
+                            or params.get("text")
+                    )
+                    if not answer:
+                        # 回退到助手的文本内容。这可能包含模型的完整解释，
+                        # 而非预期的简洁答案——激进截断，以免将数千个
+                        # 令牌的推理内容作为最终答案输出，并发出追踪
+                        # 事件以便模糊性可见。
+                        fallback_content = response.get("content", "") or ""
+                        FINAL_FALLBACK_MAX_CHARS = 500
+                        truncated = False
+                        if len(fallback_content) > FINAL_FALLBACK_MAX_CHARS:
+                            fallback_content = (
+                                    fallback_content[:FINAL_FALLBACK_MAX_CHARS]
+                                    + "… [truncated by orchestrator: FINAL was emitted with no recognizable answer param]"
+                            )
+                            truncated = True
+                        answer = fallback_content
+                        __emit_event__(
+                            "final_fallback",
+                            reason="no recognizable answer param on FINAL",
+                            truncated=truncated,
+                            original_length=len(response.get("content", "") or ""),
+                        )
+                handle_transition_to("completed", "FINAL via tool_calls")
+                return complete_result(state, "completed", str(answer))
+
+            # Track consecutive action errors (separate from code errors).
+            # Partial batch failures: increment only if ALL actions failed,
+            # reset if ANY succeeded.
+            if batch_success_count > 0:
+                consecutive_action_errors = 0
+            elif batch_error_count > 0:
+                consecutive_action_errors += 1
+
+            if max_consecutive_errors is not None and consecutive_action_errors > 0 and consecutive_action_errors >= max_consecutive_errors + 2:
+                __transition_to__("failed", "too many consecutive action errors")
+                return complete_result(
+                    state,
+                    "failed",
+                    error=str(consecutive_action_errors) + " consecutive action errors — all recent tool calls failed",
+                )
+            elif max_consecutive_errors is not None and consecutive_action_errors > 0 and consecutive_action_errors >= max_consecutive_errors:
+                append_message(
+                    working_messages,
+                    "User",
+                    "[SYSTEM] Your last " + str(consecutive_action_errors) +
+                    " action calls have all failed. You appear to be stuck in a loop. "
+                    "Try a completely different approach: use different tools, different "
+                    "parameters, or break the problem down differently. If you cannot "
+                    "make progress, call FINAL() with an honest explanation of what failed.",
+                )
+
+            __save_checkpoint__(state, {
+                "nudge_count": consecutive_nudges,
+                "consecutive_errors": consecutive_errors,
+                "consecutive_action_errors": consecutive_action_errors,
+                "compaction_count": state.get("compaction_count", 0),
+                "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+            })
+
+    return complete_result(state, "max_iterations")
 
 
-# ── 主机函数处理函数 ─────────────────────────────────────────
 
-async def _handle_llm_complete(
+
+# ----------辅助函数----------
+
+def format_output(result, max_chars=8000):
+    """Format code execution result for the next LLM context message."""
+    parts = []
+
+    stdout = result.get("stdout", "")
+    if stdout:
+        parts.append("[stdout]\n" + stdout)
+
+    for r in result.get("action_results", []):
+        name = r.get("action_name", "?")
+        output = str(r.get("output", ""))
+        if r.get("is_error"):
+            parts.append("[" + name + " ERROR] " + output)
+        else:
+            if len(output) > 500:
+                preview = output[:500] + "..."
+                parts.append(
+                    "[" + name + "] " + preview +
+                    "\n(full result stored in state['" + name + "']; "
+                    "do NOT retype the data — reference the variable in your next call.)"
+                )
+            else:
+                parts.append("[" + name + "] " + output)
+
+    ret = result.get("return_value")
+    if ret is not None:
+        parts.append("[return] " + str(ret))
+
+    text = "\n\n".join(parts)
+
+    # Truncate from the front (keep the tail with most recent results)
+    if len(text) > max_chars:
+        text = "... (truncated) ...\n" + text[-max_chars:]
+
+    if not text:
+        text = "[code executed, no output]"
+
+    return text
+
+def strip_quoted_strings(line):
+    """
+    从一行中移除双引号字符串字面量。
+    """
+    result = []
+    in_quote = False
+    prev = ""
+    for ch in line:
+        if ch == '"' and prev != "\\":
+            in_quote = not in_quote
+            prev = ch
+            continue
+        if not in_quote:
+            result.append(ch)
+        prev = ch
+    return "".join(result)
+
+def strip_code_blocks(text):
+    """
+    移除围栏代码块、缩进代码行和双引号字符串。
+    """
+    result = []
+    in_fence = False
+    for line in text.split("\n"):
+        trimmed = line.lstrip()
+        if trimmed.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if line.startswith("    ") or line.startswith("\t"):
+            continue
+        result.append(strip_quoted_strings(line))
+    return "\n".join(result)
+
+def signals_tool_intent(text):
+    """
+    检测文本何时表达了调用工具的意图但实际并未执行。
+    从 V1 Rust llm_signals_tool_intent() 移植而来：
+    移除代码块和引号字符串，检查排除短语，
+    然后要求将来时前缀（"let me"、"I'll"、"I will"、"I'm going to"）后紧跟动作动词（"search"、"fetch"、"check" 等）。
+    """
+    stripped = strip_code_blocks(text)
+    lower = stripped.lower()
+
+    EXCLUSIONS = [
+        "let me explain", "let me know", "let me think",
+        "let me summarize", "let me clarify", "let me describe",
+        "let me help", "let me understand", "let me break",
+        "let me outline", "let me walk you", "let me provide",
+        "let me suggest", "let me elaborate", "let me start by",
+    ]
+    for exc in EXCLUSIONS:
+        if exc in lower:
+            return False
+
+    PREFIXES = ["let me ", "i'll ", "i will ", "i'm going to "]
+    ACTION_VERBS = [
+        "search", "look up", "check", "fetch", "find",
+        "read the", "write the", "create", "run the", "execute",
+        "query", "retrieve", "add it", "add the", "add this",
+        "add that", "update the", "delete", "remove the", "look into",
+        "stop", "pause", "cancel", "halt", "disable",
+    ]
+
+    for prefix in PREFIXES:
+        start = 0
+        while True:
+            i = lower.find(prefix, start)
+            if i < 0:
+                break
+            after = lower[i + len(prefix):]
+            for verb in ACTION_VERBS:
+                if after.startswith(verb) or (" " + verb) in after.split("\n")[0]:
+                    return True
+            start = i + 1
+
+    return False
+
+def complete_result(state, outcome, response=None, error=None, extra=None):
+    """Return a standard orchestrator result with persisted state."""
+    result = {"outcome": outcome, "state": state}
+    if response is not None:
+        result["response"] = response
+    if error is not None:
+        result["error"] = error
+    if isinstance(extra, dict):
+        for key in extra:
+            result[key] = extra[key]
+    return result
+
+def extract_final(text):
+    """
+    从文本中提取 FINAL() 内容。如果未找到则返回 None。
+    """
+    idx = text.find("FINAL(")
+    if idx < 0:
+        return None
+    after = text[idx + 6:]
+    # Handle triple-quoted strings
+    for q in ['"""', "'''"]:
+        if after.startswith(q):
+            end = after.find(q, len(q))
+            if end >= 0:
+                return after[len(q):end]
+    # Handle single/double quoted strings
+    if after and after[0] in ('"', "'"):
+        quote = after[0]
+        end = after.find(quote, 1)
+        if end >= 0:
+            return after[1:end]
+    # Handle balanced parens
+    depth = 1
+    for i, ch in enumerate(after):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return after[:i]
+    return None
+
+def append_message(messages, role, content, action_name=None, action_call_id=None, action_calls=None):
+    """Append a normalized message to the working transcript."""
+    msg = {"role": role, "content": content}
+    if action_name is not None:
+        msg["action_name"] = action_name
+    if action_call_id is not None:
+        msg["action_call_id"] = action_call_id
+    if action_calls is not None:
+        msg["action_calls"] = action_calls
+    messages.append(msg)
+
+
+# 保守的回退启发式，与旧的 Rust 端估算器匹配。
+# 这些必须在 `estimate_context_tokens` 之前定义（因此在下面的 `FINAL(result)` 入口点调用之前）。
+# 如果将它们移到入口点之后，每次运行 `compact_if_needed` 时都会产生潜在的 NameError。
+CHARS_PER_TOKEN = 4
+MESSAGE_OVERHEAD_CHARS = 4
+
+def estimate_context_tokens(messages):
+    """
+    使用粗略的字符/令牌启发式方法估算记录的令牌计数。
+    """
+    total_chars = 0
+    for msg in messages:
+        total_chars += len(msg.get("content", ""))
+        total_chars += len(msg.get("action_name", "") or "")
+        total_chars += MESSAGE_OVERHEAD_CHARS
+    return (total_chars + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+
+def compact_if_needed(state, config):
+    """
+    当活动消息历史过大时压缩线程上下文。
+
+    编排器拥有压缩策略。Rust 仅提供令牌估算、显式大语言模型调用以及在生成摘要后替换活动消息骨架的辅助函数。
+    """
+    if not config.get("enable_compaction", False):
+        return False
+
+    context_limit = config.get("model_context_limit", 128000)
+    threshold_pct = config.get("compaction_threshold", 0.85)
+    threshold = int(context_limit * threshold_pct)
+    working_messages = state.get("working_messages")
+    if not isinstance(working_messages, list) or not working_messages:
+        return False
+
+    current_tokens = estimate_context_tokens(working_messages)
+    if current_tokens < threshold:
+        return False
+
+    snapshot = list(working_messages)
+
+    history = state.get("history")
+    if not isinstance(history, list):
+        history = []
+        state["history"] = history
+
+    compaction_count = state.get("compaction_count", 0) + 1
+    history.append({
+        "kind": "compaction",
+        "index": compaction_count,
+        "tokens_before": current_tokens,
+        "messages": snapshot,
+    })
+
+    summary_prompt = (
+        "Summarize progress so far in a concise but complete way.\n"
+        "Include:\n"
+        "1. What has been accomplished\n"
+        "2. Key intermediate results, facts, and variable values\n"
+        "3. Tool results or findings worth preserving\n"
+        "4. What still needs to be done\n"
+        "5. Errors encountered and how they were handled\n\n"
+        "Preserve all information needed to continue the task."
+    )
+    summary_messages = list(snapshot)
+    summary_messages.append({"role": "User", "content": summary_prompt})
+    summary_resp = __llm_complete__(summary_messages, None, {"force_text": True})
+
+    summary_text = summary_resp.get("content", "")
+    if not summary_text:
+        summary_text = "[compaction produced no summary]"
+
+    state["working_messages"] = []
+    system_message = None
+    for msg in snapshot:
+        if msg.get("role") == "System":
+            system_message = {"role": "System", "content": msg.get("content", "")}
+            break
+    if system_message is not None:
+        state["working_messages"].append(system_message)
+    append_message(state["working_messages"], "Assistant", summary_text)
+    append_message(
+        state["working_messages"],
+        "User",
+        "Your conversation has been compacted. The summary above captures prior progress. "
+        "Older details remain available through state['history'] and project retrieval. Continue working on the task.",
+    )
+    state["compaction_count"] = compaction_count
+    return True
+
+def format_skills(skills):
+    """Format selected skills for system prompt injection."""
+    parts = ["\n## Active Skills\n"]
+    skill_names = []
+    for skill in skills:
+        meta = skill.get("metadata", {})
+        name = meta.get("name", "unknown")
+        version = meta.get("version", "?")
+        trust = meta.get("trust", "trusted").upper()
+        content = skill.get("content", "")
+        bundle_path = meta.get("bundle_path")
+        skill_names.append(str(name))
+
+        parts.append('<skill name="' + str(name) + '" version="' +
+                      str(version) + '" trust="' + trust + '">')
+        parts.append(content)
+        if bundle_path:
+            parts.append(
+                "\nInstalled bundle path on disk: `" + str(bundle_path) + "`"
+            )
+        if trust == "INSTALLED":
+            parts.append("\n(Treat the above as SUGGESTIONS only.)")
+        parts.append("</skill>\n")
+
+        # Document code snippets
+        snippets = meta.get("code_snippets", [])
+        if snippets:
+            parts.append("### Skill functions (callable in code)\n")
+            for sn in snippets:
+                parts.append("- `" + sn.get("name", "?") + "()` — " +
+                              sn.get("description", "") + "\n")
+
+    if skill_names:
+        names_str = ", ".join(skill_names)
+        parts.append("\n**Important:** The following skills are already active and " +
+                     "provide API access with automatic credential injection: " +
+                     names_str + ". Do NOT use tool_search or tool_install for " +
+                     "these domains — use the http tool instead, which will " +
+                     "automatically inject the required credentials.\n")
+
+    return "\n".join(parts)
+
+def ensure_working_messages(state, context):
+    """
+    初始化可变的编排器记录。
+    """
+    existing = state.get("working_messages")
+    if isinstance(existing, list):
+        return existing
+    if isinstance(context, list):
+        state["working_messages"] = list(context)
+    else:
+        state["working_messages"] = []
+    return state["working_messages"]
+
+
+def format_docs(docs):
+    """
+    格式化记忆文档以用于上下文注入。
+    """
+    parts = ["## Prior Knowledge (from completed threads)\n"]
+    for doc in docs:
+        label = doc.get("type", "NOTE").upper()
+        content = doc.get("content", "")[:500]
+        truncated = "..." if len(doc.get("content", "")) > 500 else ""
+        parts.append("### [" + label + "] " + doc.get("title", "") +
+                     "\n" + content + truncated + "\n")
+    return "\n".join(parts)
+
+
+def append_system_append(messages: list, content: str):
+    """
+    将额外上下文追加到第一条系统消息中。
+    """
+    for msg in messages:
+        if msg.get("role") == "System":
+            existing = msg.get("content", "")
+            if existing:
+                msg["content"] = existing + "\n\n" + content
+            else:
+                msg["content"] = content
+            return
+    messages.insert(0, {"role": "System", "content": content})
+
+
+def extract_explicit_skills(skills, goal):
+    """强制激活 `/<skill-name>` 提及并将其自然重写。"""
+    if not skills or not goal:
+        return [], goal, []
+
+    skill_map = {}
+    for skill in skills:
+        meta = skill.get("metadata", {})
+        name = str(meta.get("name", "")).strip()
+        if name:
+            skill_map[name.lower()] = skill
+
+    matched = []
+    matched_names = set()
+    missing = []
+    missing_names = set()
+    rewritten = goal
+    replacements = []
+
+    for match in re.finditer(r'(^|[\s"\(])/(?P<name>[A-Za-z0-9._-]+)(?=$|[\s"\)])', goal):
+        name = match.group("name")
+        skill = skill_map.get(name.lower())
+        if not skill:
+            lowered = name.lower()
+            if lowered not in missing_names:
+                missing.append(name)
+                missing_names.add(lowered)
+            continue
+        meta = skill.get("metadata", {})
+        description = str(meta.get("description", "")).strip()
+        replacement = description or name.replace("-", " ")
+        prefix = match.group(1) or ""
+        slash_start = match.start() + len(prefix)
+        slash_end = slash_start + 1 + len(name)
+        replacements.append((slash_start, slash_end, replacement))
+        lowered = name.lower()
+        if lowered not in matched_names:
+            matched.append(skill)
+            matched_names.add(lowered)
+
+    for start, end, replacement in reversed(replacements):
+        rewritten = rewritten[:start] + replacement + rewritten[end:]
+
+    return matched, rewritten, missing
+
+
+# ── 技能选择与注入（可自我修改）────────────────────────
+
+# iOS、macOS 及大多数富文本输入中自动校正产生的智能引号/智能破折号字符。
+# 技能激活模式和关键词是使用 ASCII 标点编写的，因此输入的 `I'm a CEO`
+# （弯引号 U+2019）会静默地无法匹配 `I'm a CEO`（ASCII U+0027），
+# 除非我们在边界处进行归一化。每轮评分前执行一次，因此每个技能都能受益，
+# 而无需每个清单都在其正则表达式中拼写备选 `[\u2019']`。
+#
+# 配对为（排印字符，ASCII 字符）。`str.maketrans` / `.translate()`
+# 在 Monty 中不可用，因此我们使用链式 `.replace()` 调用来应用——
+# 对于每轮单个目标字符串上的 10 条目表来说足够。
+
+_PUNCT_FOLD = [
+    ("\u2018", "'"),  # left single
+    ("\u2019", "'"),  # right single / apostrophe (the common autocorrect)
+    ("\u201a", "'"),  # low single
+    ("\u201b", "'"),  # reversed single
+    ("\u201c", '"'),  # left double
+    ("\u201d", '"'),  # right double
+    ("\u201e", '"'),  # low double
+    ("\u201f", '"'),  # reversed double
+    ("\u2013", "-"),  # en dash
+    ("\u2014", "-"),  # em dash
+]
+
+
+def normalize_punctuation(text):
+    """
+    将排印引号/破折号折叠为 ASCII 以用于激活匹配。
+
+仅应用于与技能评分时使用的消息，绝不会应用于发送给大语言模型或存储在记忆中的消息。其目标是使模式/关键词匹配能够抵御自动校正的影响，而不是修改用户内容。
+    """
+    if not text:
+        return text
+    out = text
+    for src, dst in _PUNCT_FOLD:
+        out = out.replace(src, dst)
+    return out
+
+
+def select_skills(skills, goal, max_candidates=3, max_tokens=6000):
+    """
+    使用确定性评分选择相关技能。
+
+    镜像 v1 Rust `ironclaw_skills::selector::prefilter_skills` 的行为：
+
+    1. **评分**：根据消息对每个技能进行评分。设置标记排除在上游 Rust `handle_list_skills` 中处理，因此当技能列表到达此函数时，被排除的技能已经移除。
+    2. **排序**：按得分降序排序。
+    3. **选择**：在预算和 `max_candidates` 限制内贪婪地选择得分技能。
+    4. **链式加载**：从每个被选父技能的 `requires.skills` 中加载配套技能，绕过评分过滤。配套技能随父技能被选中，因此角色/捆绑技能可以在配套技能自身得分不高的情况下仍将其操作配套技能拉入。
+
+    链式加载是**非传递的**（仅深度为 1），以保持行为可预测：被链式加载的配套技能不会再拉入其自身的配套技能。链式加载的技能与评分技能一样遵守相同的预算和 `max_candidates` 上限。
+    """
+    if not skills or not goal:
+        return []
+
+    # Fold typographic quotes/dashes before extraction and scoring so autocorrected
+    # user input matches manifests and slash commands.
+    normalized_goal = normalize_punctuation(goal)
+    explicit, rewritten_goal, _missing = extract_explicit_skills(skills, normalized_goal)
+    message_lower = rewritten_goal.lower()
+    message_original = rewritten_goal
+
+    # Build name -> skill lookup for chain-loading companion resolution.
+    by_name = {}
+    for sk in skills:
+        meta = sk.get("metadata", {})
+        name = meta.get("name")
+        if name:
+            by_name[str(name)] = sk
+
+    scored = []
+    for skill in skills:
+        s = score_skill(skill, message_lower, message_original)
+        if s > 0:
+            scored.append((s, skill))
+
+    scored.sort(key=lambda x: -x[0])
+
+    # Seed with explicitly-activated skills (slash-command mentions) first,
+    # so they are guaranteed a slot regardless of keyword score.
+    selected = []
+    selected_names = set()
+    budget = max_tokens
+
+    for skill in explicit:
+        if len(selected) >= max_candidates:
+            break
+        meta = skill.get("metadata", {})
+        name = meta.get("name")
+        if name is None or str(name) in selected_names:
+            continue
+        activation = meta.get("activation", {})
+        cost = _skill_token_cost(skill, activation)
+        if cost > budget:
+            continue
+        selected.append(skill)
+        selected_names.add(str(name))
+        budget -= cost
+
+    # Greedy selection with chain-loading. `selected_names` tracks
+    # what's already in the result to dedup across explicit, scored,
+    # and companion skills.
+    for _, parent in scored:
+        if len(selected) >= max_candidates:
+            break
+        parent_meta = parent.get("metadata", {})
+        parent_name = parent_meta.get("name")
+        if parent_name is None or str(parent_name) in selected_names:
+            continue
+        parent_activation = parent_meta.get("activation", {})
+        parent_cost = _skill_token_cost(parent, parent_activation)
+        if parent_cost > budget:
+            continue
+        selected.append(parent)
+        selected_names.add(str(parent_name))
+        budget -= parent_cost
+
+        # Chain-load companions (depth 1, non-transitive).
+        requires = parent_meta.get("requires", {})
+        companion_names = requires.get("skills", [])
+        for companion_name in companion_names:
+            cname = str(companion_name)
+            if len(selected) >= max_candidates:
+                break
+            if cname in selected_names:
+                continue
+            companion = by_name.get(cname)
+            if companion is None:
+                # Listed but not loaded — ignore silently, persona
+                # bundles often list optional companions.
+                continue
+            comp_meta = companion.get("metadata", {})
+            comp_activation = comp_meta.get("activation", {})
+            comp_cost = _skill_token_cost(companion, comp_activation)
+            if comp_cost > budget:
+                # Budget exhausted for companions. Parent is still
+                # selected; the remaining companions are skipped.
+                continue
+            selected.append(companion)
+            selected_names.add(cname)
+            budget -= comp_cost
+
+    return selected
+
+
+# ----------执行函数----------
+
+def handle_check_signals(
+        signal_rx: SignalReceiver,
+        thread: Thread,
+) -> ExtFunctionResult:
+    """检查信号"""
+    # 检查取消/暂停信号
+    try:
+        signal = signal_rx.try_recv()
+        if signal is not None:
+            return ExtFunctionResult.Return({"signal": str(signal)})
+    except Exception:
+        pass
+    return ExtFunctionResult.Return({"signal": None})
+
+
+def handle_check_budget(thread: Thread) -> ExtFunctionResult:
+    """检查预算"""
+    config = thread.config
+    # 检查 token 预算
+    if config.max_tokens_total is not None and thread.total_tokens_used >= config.max_tokens_total:
+        return ExtFunctionResult.Return({"exceeded": True, "reason": "超过 token 限制"})
+    # 检查成本预算
+    if config.max_budget_usd is not None and thread.total_cost_usd >= config.max_budget_usd:
+        return ExtFunctionResult.Return({"exceeded": True, "reason": "超过预算限制"})
+    return ExtFunctionResult.Return({"exceeded": False})
+
+
+async def handle_retrieve_docs(
+        goal: str,
+        max_docs: int,
+        thread: Thread,
+        retrieval: Optional[RetrievalEngine] = None,
+) -> ExtFunctionResult:
+    """查询记忆文档"""
+    if retrieval is None:
+        return ExtFunctionResult.Return([])
+
+    if not isinstance(max_docs, int):
+        max_docs = 5
+
+    try:
+        docs = await retrieval.retrieve_context(
+            thread.project_id, thread.user_id, goal, max_docs,
+        )
+        docs_json = [
+            {
+                "type": str(doc.doc_type),
+                "title": doc.title,
+                "content": doc.content,
+            }
+            for doc in docs
+        ]
+        return ExtFunctionResult.Return(docs_json)
+    except Exception as e:
+        logger.debug(f"retrieve_docs 失败: {e}")
+        return ExtFunctionResult.Return([])
+
+
+async def handle_list_skills(
+        thread: Thread,
+        store: Optional[Store] = None,
+) -> "ExtFunctionResult":
+    """处理 `__list_skills__()`
+
+    从项目中加载所有 `DocType::Skill` MemoryDoc 并将其作为 Python 字典列表返回。
+    Python 编排器处理评分、选择和注入 — Rust 仅提供数据访问
+
+    ## 设置标记排除（与 v1 选择器的 v2 对等）
+
+    在返回技能列表之前，此函数过滤掉其 `metadata.activation.setup_marker`
+    已在当前项目中作为 MemoryDoc 标题存在的任何技能。在 v2 中，工作区文件
+    存储为按标题索引的 MemoryDoc，因此"标记文件是否存在"映射到
+    "是否存在具有该标题的 MemoryDoc" — 并且我们已经在作用域中拥有
+    完整的文档列表用于技能过滤，因此这不会产生额外的存储调用成本
+
+    这是 v1 路径上通过 `ironclaw_skills::prefilter_skills` 传递的
+    `satisfied_setup_markers` 参数的 v2 等效项。两条路径实现相同的规则：
+    一次性设置技能在其标记文件已被写入后已完成其工作，
+    不应在随后的每个回合中持续消耗激活预算
+    """
+    if store is None:
+        return ExtFunctionResult.Return([])
+
+    # 用户在其项目中的文档（所有文档类型 — 技能过滤在下面的
+    # `filter(|d| d.doc_type == Skill)` 过程中进行）
+    try:
+        docs = await store.list_memory_docs(thread.project_id, thread.user_id)
+    except Exception as e:
+        logger.debug(f"__list_skills__: 加载用户文档失败: {e}")
+        docs = []
+
+    # 跨所有项目的管理员/共享技能（修复多租户可见性 —
+    # 共享技能存在于所有者的项目中，但必须对所有用户可见，
+    # 无论其线程在哪个按用户划分的项目中运行）
+    try:
+        shared = await store.list_skills_global()
+        docs.extend(shared)
+    except Exception as e:
+        logger.debug(f"__list_skills__: 加载全局技能失败: {e}")
+
+    # 按 ID 排序并去重
+    docs.sort(key=lambda d: d.id.value if hasattr(d.id, 'value') else str(d.id))
+    seen_ids = set()
+    unique_docs = []
+    for doc in docs:
+        doc_id = doc.id.value if hasattr(doc.id, 'value') else str(doc.id)
+        if doc_id not in seen_ids:
+            seen_ids.add(doc_id)
+            unique_docs.append(doc)
+    docs = unique_docs
+
+    # 构建现有非技能文档标题的集合（== v2 中的工作区路径），
+    # 这样下面的设置标记过滤对每个技能是 O(1) 的。
+    # 排除 Skill 文档，以便像 "github" 这样的标记不会与同名的技能文档冲突
+    existing_titles = set()
+    for doc in docs:
+        if doc.doc_type != DocType.Skill:
+            existing_titles.add(doc.title)
+
+    # 过滤技能文档
+    skills = []
+    for doc in docs:
+        if doc.doc_type != DocType.Skill:
+            continue
+
+        # 设置标记排除。如果技能的激活元数据声明了一个 setup_marker，
+        # 且已存在具有该标题的 MemoryDoc，则该技能的设置已完成，我们跳过它
+        metadata = doc.metadata if isinstance(doc.metadata, dict) else {}
+        activation = metadata.get("activation", {}) if isinstance(metadata, dict) else {}
+        marker = activation.get("setup_marker") if isinstance(activation, dict) else None
+
+        if marker is not None and marker in existing_titles:
+            logger.debug(
+                f"__list_skills__: 排除设置技能 — 标记已存在: "
+                f"skill={doc.title}, marker={marker}"
+            )
+            continue
+
+        skills.append({
+            "doc_id": str(doc.id.value) if hasattr(doc.id, 'value') else str(doc.id),
+            "title": doc.title,
+            "content": doc.content,
+            "metadata": doc.metadata,
+        })
+
+    return ExtFunctionResult.Return(skills)
+
+
+def handle_set_active_skills(
+        skills_json: List[Any],
+        thread: Thread,
+) -> "ExtFunctionResult":
+    """
+    将选定的技能溯源持久化到线程上，以便运行后学习流程
+    可以推理出活跃的确切技能版本和代码片段
+    """
+
+    # 将 JSON 数据转换为 ActiveSkillProvenance 对象列表
+    try:
+        if isinstance(skills_json, list):
+            skills = []
+            for skill_data in skills_json:
+                if isinstance(skill_data, dict):
+                    skills.append(ActiveSkillProvenance(
+                        doc_id=DocId(skill_data.get("doc_id", "")),
+                        name=skill_data.get("name", ""),
+                        version=skill_data.get("version", 0),
+                        snippet_names=skill_data.get("snippet_names", []),
+                        force_activated=skill_data.get("force_activated", False),
+                    ))
+        else:
+            skills = []
+    except Exception as e:
+        logger.debug(f"__set_active_skills__: 无效负载: {e}")
+        return ExtFunctionResult.Return(None)
+
+    # 将技能持久化到线程上
+    try:
+        thread.set_active_skills(skills)
+    except Exception as e:
+        logger.debug(f"__set_active_skills__: 持久化活跃技能失败: {e}")
+
+    return ExtFunctionResult.Return(None)
+
+def handle_emit_event(
+        args: List[Any],
+        kwargs: Dict[str, Any],
+        thread: Thread,
+        event_tx: Optional[asyncio.Queue],
+) -> ExtFunctionResult:
+    """处理 `__emit_event__(kind, **data)`"""
+    kind = args[0] if len(args) > 0 else "unknown"
+    data = args[1] if len(args) > 1 else {}
+    # ... 发出事件的具体逻辑
+    return ExtFunctionResult.Return(None)
+
+async def handle_llm_complete(
         args: List[Any],
         kwargs: Dict[str, Any],
         thread: Thread,
@@ -769,139 +1568,7 @@ async def _handle_llm_complete(
     except Exception as e:
         return ExtFunctionResult.Error(RuntimeError(f"LLM 调用失败: {e}"))
 
-
-async def _handle_execute_code_step(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        llm: LlmBackend,
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        policy: PolicyEngine,
-        event_tx: Optional[asyncio.Queue],
-        gate_controller: GateController,
-) -> ExtFunctionResult:
-    """处理 `__execute_code_step__(code, state)`"""
-    # 实际实现取决于 CodeAct 执行引擎
-    code = args[0] if len(args) > 0 else ""
-    state = args[1] if len(args) > 1 else {}
-    # ... 执行代码步骤的具体逻辑
-    return ExtFunctionResult.Return({"status": "ok"})
-
-
-async def _handle_execute_action(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        policy: PolicyEngine,
-        event_tx: Optional[asyncio.Queue],
-        gate_controller: GateController,
-) -> ExtFunctionResult:
-    """处理 `__execute_action__(name, params, call_id=...)`"""
-    action_name = args[0] if len(args) > 0 else ""
-    params = args[1] if len(args) > 1 else {}
-    call_id = kwargs.get("call_id", str(time.time()))
-    # ... 执行单个动作的具体逻辑
-    return ExtFunctionResult.Return({"status": "ok"})
-
-
-async def _handle_execute_actions_parallel(
-        args: List[Any],
-        thread: Thread,
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        policy: PolicyEngine,
-        event_tx: Optional[asyncio.Queue],
-        gate_controller: GateController,
-) -> ExtFunctionResult:
-    """处理 `__execute_actions_parallel__(calls)`"""
-    calls = args[0] if len(args) > 0 else []
-    # ... 并行执行多个动作的具体逻辑
-    return ExtFunctionResult.Return({"results": []})
-
-
-def _handle_check_signals(
-        signal_rx: SignalReceiver,
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__check_signals__()`"""
-    # 检查取消/暂停信号
-    try:
-        signal = signal_rx.try_recv()
-        if signal is not None:
-            return ExtFunctionResult.Return({"signal": str(signal)})
-    except Exception:
-        pass
-    return ExtFunctionResult.Return({"signal": None})
-
-
-def _handle_emit_event(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        event_tx: Optional[asyncio.Queue],
-) -> ExtFunctionResult:
-    """处理 `__emit_event__(kind, **data)`"""
-    kind = args[0] if len(args) > 0 else "unknown"
-    data = args[1] if len(args) > 1 else {}
-    # ... 发出事件的具体逻辑
-    return ExtFunctionResult.Return(None)
-
-
-def _handle_save_checkpoint(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__save_checkpoint__(state, counters)`"""
-    state = args[0] if len(args) > 0 else {}
-    # ... 保存检查点的具体逻辑
-    return ExtFunctionResult.Return(None)
-
-
-def _handle_transition_to(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__transition_to__(state, reason)`"""
-    new_state = args[0] if len(args) > 0 else None
-    reason = args[1] if len(args) > 1 else None
-    if new_state is not None:
-        thread.transition_to(new_state, reason)
-    return ExtFunctionResult.Return(None)
-
-
-async def _handle_retrieve_docs(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        retrieval: Optional[RetrievalEngine],
-) -> ExtFunctionResult:
-    """处理 `__retrieve_docs__(goal, max_docs)`"""
-    goal = args[0] if len(args) > 0 else thread.goal
-    max_docs = args[1] if len(args) > 1 else 5
-    if retrieval is not None:
-        docs = await retrieval.retrieve_context(thread.project_id, thread.user_id, goal, max_docs)
-        return ExtFunctionResult.Return({"docs": docs})
-    return ExtFunctionResult.Return({"docs": []})
-
-
-def _handle_check_budget(thread: Thread) -> ExtFunctionResult:
-    """处理 `__check_budget__()`"""
-    config = thread.config
-    # 检查 token 预算
-    if config.max_tokens_total is not None and thread.total_tokens_used >= config.max_tokens_total:
-        return ExtFunctionResult.Return({"exceeded": True, "reason": "超过 token 限制"})
-    # 检查成本预算
-    if config.max_budget_usd is not None and thread.total_cost_usd >= config.max_budget_usd:
-        return ExtFunctionResult.Return({"exceeded": True, "reason": "超过预算限制"})
-    return ExtFunctionResult.Return({"exceeded": False})
-
-
-async def _handle_get_actions(
+async def handle_get_actions(
         thread: Thread,
         effects: EffectExecutor,
         leases: LeaseManager,
@@ -914,148 +1581,437 @@ async def _handle_get_actions(
     return ExtFunctionResult.Return({"actions": actions if actions else []})
 
 
-async def _handle_list_skills(
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional, List, Any
+
+logger = logging.getLogger(__name__)
+
+
+async def handle_execute_actions_parallel(
         args: List[Any],
-        thread: Thread,
-        store: Optional[Store],
-) -> ExtFunctionResult:
-    """处理 `__list_skills__(max_candidates, max_tokens)`"""
-    # ... 列出技能的具体逻辑
-    return ExtFunctionResult.Return({"skills": []})
+        thread: "Thread",
+        effects: "EffectExecutor",
+        leases: "LeaseManager",
+        policy: "PolicyEngine",
+        event_tx: Optional[asyncio.Queue] = None,
+        gate_controller: "GateController" = None,
+) -> "ExtFunctionResult":
+    """处理 `__execute_actions_parallel__(calls)`
 
+    接收动作调用列表并并发执行它们的批量主机函数。
+    每个调用是一个包含 `name`、`params` 和可选的 `call_id` 的字典
 
-async def _handle_record_skill_usage(
-        args: List[Any],
-        store: Optional[Store],
-) -> ExtFunctionResult:
-    """处理 `__record_skill_usage__(doc_id, success)`"""
-    # ... 记录技能使用的具体逻辑
-    return ExtFunctionResult.Return(None)
+    返回结果字典列表（每个调用一个，按顺序）。
+    每个结果与 `__execute_action__` 输出具有相同的形状，加上可选的门控暂停负载
 
-
-def _handle_regex_match(args: List[Any]) -> ExtFunctionResult:
-    """处理 `__regex_match__(pattern, text) -> bool`
-
-    使用 Python 的 re 模块评估正则表达式。
-    无效模式静默返回 False
+    在所有并行执行完成后，事件按原始调用顺序发出
     """
-    import re
-    pattern = args[0] if len(args) > 0 else ""
-    text = args[1] if len(args) > 1 else ""
+    # 从第一个参数解析调用列表（字典列表）
+    calls_json = args[0] if len(args) > 0 else []
+    if not isinstance(calls_json, list):
+        return ExtFunctionResult.Error(
+            TypeError("__execute_actions_parallel__ 需要调用字典列表")
+        )
+
+    if not calls_json:
+        return ExtFunctionResult.Return([])
+
+    # 将每个调用字典解析为 (name, params, call_id)
+    parsed = []
+    for c in calls_json:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name", "")
+        params = c.get("params", {})
+        call_id = c.get("call_id", "")
+        parsed.append({"name": name, "params": params, "call_id": call_id})
+
+    step_id = StepId()
+    actions_context = thread_execution_context(thread, step_id, None, gate_controller)
+    active_leases = await leases.active_for_thread(thread.id)
+
+    # 加载动作清单
+    inventory = None
     try:
-        result = bool(re.search(pattern, text))
-        return ExtFunctionResult.Return(result)
-    except re.error:
-        return ExtFunctionResult.Return(False)
+        inventory = await effects.available_action_inventory(active_leases, actions_context)
+    except Exception as error:
+        logger.debug(
+            f"加载编排器并行执行的动作清单失败: "
+            f"thread_id={thread.id}, step_id={step_id}, error={error}"
+        )
 
+    available_actions = list(inventory.inline) if inventory is not None else []
 
-def _handle_set_active_skills(
-        args: List[Any],
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__set_active_skills__(skills)`"""
-    skills = args[0] if len(args) > 0 else []
-    thread.set_active_skills(skills)
-    return ExtFunctionResult.Return(None)
+    # ── 阶段 1：预检（顺序）─────────────────────────
+    # 检查租约和策略。拒绝 → 错误结果。批准 → 中断
 
+    preflight = []
 
-# ── 常量 ─────────────────────────────────────────────────────
+    for pc in parsed:
+        # 从可调用清单中查找动作定义
+        exec_ctx = thread_execution_context(
+            thread, step_id, pc["call_id"], gate_controller,
+        )
+        if inventory is not None:
+            exec_ctx.available_actions_snapshot = available_actions
+            exec_ctx.available_action_inventory_snapshot = inventory
 
-CODE_EXECUTED_MAX_BYTES = 8_000
+        action_def = None
+        for a in available_actions:
+            if a.matches_name(pc["name"]):
+                action_def = a
+                break
 
+        if inventory is not None and action_def is None:
+            error = f"动作 '{pc['name']}' 在此执行上下文中不可调用"
+            output = {"error": error}
+            result_json = {"output": output, "is_error": True}
+            event = EventKind.ActionFailed(
+                step_id=step_id,
+                action_name=pc["name"],
+                call_id=pc["call_id"],
+                error=error,
+                duration_ms=0,
+                params_summary=summarize_params(pc["name"], pc["params"]),
+            )
+            preflight.append({
+                "type": "error",
+                "result_json": result_json,
+                "event": event,
+                "output": output,
+            })
+            continue
 
-# ── 辅助函数 ─────────────────────────────────────────────────
+        # 查找租约
+        lease = await leases.find_lease_for_action(thread.id, pc["name"])
+        if lease is None:
+            error = f"动作 '{pc['name']}' 没有租约"
+            output = {"error": error}
+            result_json = {"output": output, "is_error": True}
+            event = EventKind.ActionFailed(
+                step_id=step_id,
+                action_name=pc["name"],
+                call_id=pc["call_id"],
+                error=error,
+                duration_ms=0,
+                params_summary=None,
+            )
+            preflight.append({
+                "type": "error",
+                "result_json": result_json,
+                "event": event,
+                "output": output,
+            })
+            continue
 
-def _tail_utf8_bytes(text: str, max_bytes: int) -> str:
-    """截断字符串到指定的字节数（UTF-8 编码）"""
-    encoded = text.encode('utf-8')
-    if len(encoded) <= max_bytes:
-        return text
-    # 从开头截取 max_bytes 字节，确保不截断多字节字符
-    truncated = encoded[:max_bytes]
-    # 解码时忽略不完整的尾部字符
-    return truncated.decode('utf-8', errors='ignore')
+        # 检查策略
+        action_name = action_def.name if action_def is not None else pc["name"]
 
+        if action_def is not None:
+            decision = policy.evaluate(action_def, lease, [])
+            if isinstance(decision, Deny):
+                output = {"error": f"被拒绝: {decision.reason}"}
+                result_json = {"output": output, "is_error": True}
+                event = EventKind.ActionFailed(
+                    step_id=step_id,
+                    action_name=action_name,
+                    call_id=pc["call_id"],
+                    error=decision.reason,
+                    duration_ms=0,
+                    params_summary=None,
+                )
+                preflight.append({
+                    "type": "error",
+                    "result_json": result_json,
+                    "event": event,
+                    "output": output,
+                })
+                continue
+            elif isinstance(decision, RequireApproval):
+                # 内联门控等待：就地暂停此预检调用，直到用户解决门控。
+                # 批准后，进入租约消耗 + 排队执行。
+                # 拒绝后，推送 ActionFailed 结果并继续预检，
+                # 以便批次其余部分仍然运行
+                approval_ev = ThreadEvent.new(
+                    thread.id,
+                    EventKind.ApprovalRequested(
+                        action_name=pc["name"],
+                        call_id=pc["call_id"],
+                        parameters=pc["params"],
+                        description=None,
+                        allow_always=True,
+                        gate_name="approval",
+                        params_summary=summarize_params(pc["name"], pc["params"]),
+                    ),
+                )
+                if event_tx is not None:
+                    try:
+                        event_tx.put_nowait(approval_ev)
+                    except asyncio.QueueFull:
+                        pass
+                thread.events.append(approval_ev)
+                thread.updated_at = datetime.now(timezone.utc)
 
-def _tail_chars(text: str, max_chars: int) -> str:
-    """截断字符串到指定的字符数"""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars]
+                resume_kind = ResumeKind.Approval(allow_always=True)
+                resolution = await gate_controller.pause(GatePauseRequest(
+                    thread_id=thread.id,
+                    user_id=thread.user_id,
+                    gate_name="approval",
+                    action_name=pc["name"],
+                    call_id=pc["call_id"],
+                    parameters=pc["params"],
+                    resume_kind=resume_kind,
+                    conversation_id=exec_ctx.conversation_id,
+                ))
 
+                denial = denial_outcome_for_resolution(resolution)
+                if denial is not None:
+                    error = denial.event_error()
+                    output = {"error": error}
+                    result_json = {"output": output, "is_error": True}
+                    event = EventKind.ActionFailed(
+                        step_id=step_id,
+                        action_name=action_name,
+                        call_id=pc["call_id"],
+                        error=error,
+                        duration_ms=0,
+                        params_summary=summarize_params(pc["name"], pc["params"]),
+                    )
+                    preflight.append({
+                        "type": "error",
+                        "result_json": result_json,
+                        "event": event,
+                        "output": output,
+                    })
+                    continue
+                # 已批准 — 进入租约消耗 + 可运行
 
-def _bounded_return_value(value: Any, max_bytes: int) -> Optional[str]:
-    """将返回值限制在指定字节数内"""
-    if value is None:
-        return None
-    json_str = json.dumps(value, ensure_ascii=False)
-    return _tail_utf8_bytes(json_str, max_bytes)
+        # 原子化地在单个写锁下重新查找 + 消耗一次租约使用，
+        # 关闭上面只读 `find_lease_for_action` 和消耗之间的 TOCTOU 窗口
+        try:
+            lease = await leases.find_and_consume(thread.id, pc["name"])
+        except Exception as e:
+            logger.debug(f"原子化租约 find_and_consume 失败: {e}")
+            error = f"动作 '{pc['name']}' 的租约消耗失败: {e}"
+            output = {"error": error}
+            result_json = {"output": output, "is_error": True}
+            event = EventKind.ActionFailed(
+                step_id=step_id,
+                action_name=pc["name"],
+                call_id=pc["call_id"],
+                error=error,
+                duration_ms=0,
+                params_summary=None,
+            )
+            preflight.append({
+                "type": "error",
+                "result_json": result_json,
+                "event": event,
+                "output": output,
+            })
+            continue
 
+        preflight.append({"type": "runnable", "lease": lease})
 
-def _code_hash(code: str) -> str:
-    """计算代码的哈希值"""
-    return hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
+    # ── 阶段 2：并行执行 ────────────────────────────
 
+    slot_results: List[Optional[dict]] = [None] * len(parsed)
+    slot_events: List[Optional[List[EventKind]]] = [None] * len(parsed)
+    slot_outputs: List[Optional[dict]] = [None] * len(parsed)
 
-def _extract_string_arg(args: List[Any], kwargs: Dict[str, Any], name: str, index: int) -> Optional[str]:
-    """从位置参数或关键字参数中提取字符串值"""
-    if index < len(args) and isinstance(args[index], str):
-        return args[index]
-    return kwargs.get(name)
+    # 将可运行项与错误分开
+    runnable = []
+    for idx, pf in enumerate(preflight):
+        if pf["type"] == "error":
+            slot_results[idx] = pf["result_json"]
+            slot_events[idx] = [pf["event"]]
+            slot_outputs[idx] = pf["output"]
+        elif pf["type"] == "runnable":
+            runnable.append((idx, pf["lease"]))
 
+    if len(runnable) == 1:
+        # 单个调用：直接使用内联门控等待重试执行
+        idx, lease = runnable[0]
+        pc = parsed[idx]
 
-def _extract_string_kwarg(kwargs: Dict[str, Any], name: str) -> Optional[str]:
-    """从关键字参数中提取字符串值"""
-    val = kwargs.get(name)
-    if isinstance(val, str):
-        return val
-    return None
+        action_name = pc["name"]
+        for a in available_actions:
+            if a.matches_name(pc["name"]):
+                action_name = a.name
+                break
 
+        exec_ctx = thread_execution_context(
+            thread, step_id, pc["call_id"], gate_controller,
+        )
+        if inventory is not None:
+            exec_ctx.available_actions_snapshot = available_actions
+            exec_ctx.available_action_inventory_snapshot = inventory
 
-# ── LLM 消息刷新 ─────────────────────────────────────────────
+        ps = summarize_params(action_name, pc["params"])
+        result_json, events, output, _final_lease_id = await execute_single_action_with_inline_retry(
+            effects,
+            leases,
+            action_name,
+            pc["params"],
+            pc["call_id"],
+            lease,
+            exec_ctx,
+            ps,
+            thread.id,
+            thread.user_id,
+        )
+        slot_results[idx] = result_json
+        slot_events[idx] = events
+        slot_outputs[idx] = output
 
-async def refresh_llm_messages_for_current_surface(
-        messages: List[ThreadMessage],
-        thread: Thread,
-        effects: EffectExecutor,
-        store: Optional[Store] = None,
-        platform_info: Optional[PlatformInfo] = None,
-        active_leases: List[CapabilityLease] = None,
-        actions_context: ThreadExecutionContext = None,
-        actions: List[ActionDef] = None,
-) -> None:
-    """为当前表面刷新 LLM 消息"""
-    # 检查消息中是否已存在引擎拥有的系统提示
-    has_system_prompt = False
-    for message in messages:
-        if message.role == MessageRole.System and is_codeact_system_prompt(message.content):
-            has_system_prompt = True
-            break
+    elif len(runnable) > 1:
+        # 多个调用：通过 asyncio 任务并行执行。每个任务携带自己的内联重试循环，
+        # 这样一个工具的门控不会阻塞批次其余部分
+        base_exec_ctx = thread_execution_context(
+            thread, step_id, None, gate_controller,
+        )
+        thread_id_val = thread.id
+        user_id_val = thread.user_id
 
-    if not has_system_prompt:
+        async def execute_single(idx: int, lease: "CapabilityLease"):
+            pc_name = parsed[idx]["name"]
+            for a in available_actions:
+                if a.matches_name(pc_name):
+                    pc_name = a.name
+                    break
+
+            pc_params = parsed[idx]["params"]
+            pc_call_id = parsed[idx]["call_id"]
+
+            exec_ctx = thread_execution_context(
+                thread, step_id, pc_call_id, gate_controller,
+            )
+            if inventory is not None:
+                exec_ctx.available_actions_snapshot = available_actions
+                exec_ctx.available_action_inventory_snapshot = inventory
+
+            ps = summarize_params(pc_name, pc_params)
+            result_json, events, output, final_lease_id = await execute_single_action_with_inline_retry(
+                effects,
+                leases,
+                pc_name,
+                pc_params,
+                pc_call_id,
+                lease,
+                exec_ctx,
+                ps,
+                thread_id_val,
+                user_id_val,
+            )
+            return (idx, final_lease_id, result_json, events, output)
+
+        tasks = [execute_single(idx, lease) for idx, lease in runnable]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result_item in results_list:
+            if isinstance(result_item, Exception):
+                logger.debug(f"并行动作执行任务异常: {result_item}")
+                continue
+            idx, _lease_id, result_json, events, output = result_item
+            slot_results[idx] = result_json
+            slot_events[idx] = events
+            slot_outputs[idx] = output
+
+    # ── 阶段 3：按顺序发出事件 ────────────────────────────
+
+    results_json = []
+    for idx in range(len(parsed)):
+        result_json = slot_results[idx] or {
+            "is_error": True,
+            "output": {"error": "执行槽为空"},
+        }
+        output = slot_outputs[idx] or {"error": "无输出"}
+
+        if slot_events[idx] is not None:
+            for event in slot_events[idx]:
+                ev = ThreadEvent.new(thread.id, event)
+                if event_tx is not None:
+                    try:
+                        event_tx.put_nowait(ev)
+                    except asyncio.QueueFull:
+                        pass
+                thread.events.append(ev)
+
+        results_json.append(result_json)
+
+    thread.updated_at = datetime.now(timezone.utc)
+    return ExtFunctionResult.Return(results_json)
+
+def sync_runtime_state(thread: Thread, state: Optional[dict]) -> None:
+    """将运行时状态同步到线程"""
+    if state is None:
         return
 
-    # 加载能力
+    working_messages = state.get("working_messages")
+    if working_messages is not None:
+        messages = json_to_thread_messages(working_messages)
+        if messages is not None:
+            thread.internal_messages = messages
+            thread.updated_at = datetime.now(timezone.utc)
+
+
+def handle_save_checkpoint(
+    args: List[Any],
+    kwargs: dict,
+    thread: "Thread",
+) -> "ExtFunctionResult":
+    """处理 `__save_checkpoint__(state, counters)`"""
+    # 从第一个参数获取状态数据
+    state = args[0] if len(args) > 0 else {}
+
+    # 从第二个参数获取计数器数据
+    counters = args[1] if len(args) > 1 else {}
+
+    # 将运行时状态同步到线程
+    sync_runtime_state(thread, state)
+
+    # 将检查点数据持久化到线程元数据中
+    if isinstance(thread.metadata, dict):
+        thread.metadata["runtime_checkpoint"] = {
+            "persisted_state": state,
+            "nudge_count": counters.get("nudge_count", 0),
+            "consecutive_errors": counters.get("consecutive_errors", 0),
+            "consecutive_action_errors": counters.get("consecutive_action_errors", 0),
+            "compaction_count": counters.get("compaction_count", 0),
+        }
+
+    thread.updated_at = datetime.now(timezone.utc)
+
+    return ExtFunctionResult.Return(None)
+
+def handle_transition_to(
+        args: List[Any],
+        kwargs: Dict[str, Any],
+        thread: Thread,
+) -> ExtFunctionResult:
+    """处理 `__transition_to__(state, reason)`"""
+    state_str = args[0] if len(args) > 0 else ""
+    reason = args[1] if len(args) > 1 else None
+
+    state_map = {
+        "running": ThreadState.Running,
+        "completed": ThreadState.Completed,
+        "failed": ThreadState.Failed,
+        "waiting": ThreadState.Waiting,
+        "suspended": ThreadState.Suspended,
+    }
+
+    target = state_map.get(state_str)
+    if target is None:
+        return ExtFunctionResult.Error(ValueError(f"未知的线程状态: {state_str}"))
+
     try:
-        capabilities = await effects.available_capabilities(active_leases, actions_context)
-    except Exception as error:
-        logger.debug(f"线程 {thread.id}: 加载 llm_complete 提示刷新所需能力失败: {error}")
-        capabilities = []
-
-    # 构建系统提示
-    system_prompt = await build_codeact_system_prompt(
-        capabilities,
-        actions if actions else [],
-        store,
-        thread.project_id,
-        platform_info,
-    )
-
-    # 更新系统提示
-    upsert_codeact_system_prompt(messages, system_prompt)
-
-
-# ── 执行代码步骤 ─────────────────────────────────────────────
+        thread.transition_to(target, reason)
+        return ExtFunctionResult.Return(None)
+    except Exception as e:
+        return ExtFunctionResult.Error(RuntimeError(f"状态转换失败: {e}"))
 
 async def handle_execute_code_step(
         args: List[Any],
@@ -1229,1750 +2185,3 @@ async def handle_execute_code_step(
 
     except Exception as e:
         return ExtFunctionResult.Error(RuntimeError(f"代码执行失败: {e}"))
-
-
-# ── 执行单个动作 ─────────────────────────────────────────────
-
-async def handle_execute_action(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        policy: PolicyEngine,
-        event_tx: Optional[asyncio.Queue] = None,
-        gate_controller: GateController = None,
-) -> ExtFunctionResult:
-    """处理 `__execute_action__(name, params, call_id=...)`
-
-    动作执行的唯一真实来源。执行：
-    1. 租约查找
-    2. 策略检查
-    3. 租约消耗
-    4. 通过 EffectExecutor 执行动作
-    5. 事件发出（ActionExecuted/ActionFailed）
-
-    Python 拥有工作转录，并决定工具输出如何在内部消息历史中表示
-    """
-    name = _extract_string_arg(args, kwargs, "name", 0)
-    if name is None:
-        return ExtFunctionResult.Error(TypeError("__execute_action__ 需要名称参数"))
-
-    params = args[1] if len(args) > 1 else {}
-    call_id = _extract_string_kwarg(kwargs, "call_id") or ""
-
-    exec_ctx = thread_execution_context(thread, StepId(), call_id, gate_controller)
-    active_leases = await leases.active_for_thread(thread.id)
-
-    # 加载动作清单
-    inventory = None
-    try:
-        inventory = await effects.available_action_inventory(active_leases, exec_ctx)
-    except Exception as error:
-        logger.debug(f"线程 {thread.id}: 加载编排器动作执行的动作清单失败: action={name}, error={error}")
-
-    available_actions = apply_snapshot_inventory(exec_ctx, inventory)
-
-    # 辅助函数：仅发出事件。编排器拥有转录记录
-    def emit_and_record(
-            thread: Thread,
-            event_tx: Optional[asyncio.Queue],
-            event_kind: EventKind,
-    ) -> None:
-        event = ThreadEvent.new(thread.id, event_kind)
-        if event_tx is not None:
-            try:
-                event_tx.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
-        thread.events.append(event)
-        thread.updated_at = datetime.now(timezone.utc)
-
-    # 1. 从可调用清单中查找动作定义
-    action_def = None
-    for a in available_actions:
-        if a.matches_name(name):
-            action_def = a
-            break
-
-    if exec_ctx.available_actions_snapshot is not None and action_def is None:
-        error = f"动作 '{name}' 在此执行上下文中不可调用"
-        output = {"error": error}
-        emit_and_record(
-            thread,
-            event_tx,
-            EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=error,
-                duration_ms=0,
-                params_summary=summarize_params(name, params),
-            ),
-        )
-        return ExtFunctionResult.Return({"output": output, "is_error": True})
-
-    # 2. 查找此动作的租约
-    lease = await leases.find_lease_for_action(thread.id, name)
-    if lease is None:
-        error = f"动作 '{name}' 没有租约"
-        output = {"error": error}
-        emit_and_record(
-            thread,
-            event_tx,
-            EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=error,
-                duration_ms=0,
-                params_summary=None,
-            ),
-        )
-        return ExtFunctionResult.Return({"output": output, "is_error": True})
-
-    canonical_name = action_def.name if action_def is not None else name
-
-    # 策略检查
-    if action_def is not None:
-        decision = policy.evaluate(action_def, lease, [])
-        if isinstance(decision, Deny):
-            output = {"error": f"被拒绝: {decision.reason}"}
-            emit_and_record(
-                thread,
-                event_tx,
-                EventKind.ActionFailed(
-                    step_id=exec_ctx.step_id,
-                    action_name=name,
-                    call_id=call_id,
-                    error=decision.reason,
-                    duration_ms=0,
-                    params_summary=None,
-                ),
-            )
-            return ExtFunctionResult.Return({"output": output, "is_error": True})
-        elif isinstance(decision, RequireApproval):
-            # 策略引发的批准的内联门控等待。
-            # 镜像 `structured.rs::execute_action_batch_with_results`：
-            # 发出请求，就地暂停执行器，批准后进入租约消耗 + 执行，
-            # 拒绝时发出 ActionFailed 并显示拒绝风格的结果。
-            # 此代码路径不再有 `gate_paused` 哨兵 + 线程重新进入
-            emit_and_record(
-                thread,
-                event_tx,
-                EventKind.ApprovalRequested(
-                    action_name=name,
-                    call_id=call_id,
-                    parameters=params,
-                    description=None,
-                    allow_always=True,
-                    gate_name="approval",
-                    params_summary=summarize_params(name, params),
-                ),
-            )
-
-            resume_kind = ResumeKind.Approval(allow_always=True)
-            resolution = await gate_controller.pause(GatePauseRequest(
-                thread_id=thread.id,
-                user_id=thread.user_id,
-                gate_name="approval",
-                action_name=name,
-                call_id=call_id,
-                parameters=params,
-                resume_kind=resume_kind,
-                conversation_id=exec_ctx.conversation_id,
-            ))
-
-            denial = denial_outcome_for_resolution(resolution)
-            if denial is not None:
-                error = denial.event_error()
-                output = {"error": error}
-                emit_and_record(
-                    thread,
-                    event_tx,
-                    EventKind.ActionFailed(
-                        step_id=exec_ctx.step_id,
-                        action_name=name,
-                        call_id=call_id,
-                        error=error,
-                        duration_ms=0,
-                        params_summary=summarize_params(name, params),
-                    ),
-                )
-                return ExtFunctionResult.Return({"output": output, "is_error": True})
-            # 已批准 — 进入租约消耗 + 执行。
-            # 适配器的每次调用 ApprovalRequirement 门控（如果有）独立于策略门控，
-            # 如果触发，将由下面的包装器内联处理
-
-    # 3. 原子化地在单个写锁下重新查找 + 消耗一次租约使用。
-    # 这关闭了只读 `find_lease_for_action`（上面用于策略检查）
-    # 和消耗之间的 TOCTOU 窗口 — 没有它，两个并发调用可能都观察到
-    # 剩余一次使用的租约并同时继续执行。
-    # 镜像 `structured.rs::execute_action_batch_with_results`
-    try:
-        lease = await leases.find_and_consume(thread.id, name)
-    except Exception as e:
-        logger.debug(f"原子化租约 find_and_consume 失败: {e}")
-        error = f"动作 '{name}' 的租约消耗失败: {e}"
-        output = {"error": error}
-        emit_and_record(
-            thread,
-            event_tx,
-            EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=error,
-                duration_ms=0,
-                params_summary=None,
-            ),
-        )
-        return ExtFunctionResult.Return({"output": output, "is_error": True})
-
-    # 4. 通过内联等待包装器执行。工具引发的 `Err(GatePaused)`
-    # 从 `effects.execute_action` 被适配器垫片转换为 `gate_paused` JSON 哨兵，
-    # 然后由 `execute_single_action_with_inline_retry` 内联处理：
-    # 暂停用户，批准时重试（有界），拒绝时显示拒绝风格的结果。
-    # 此路径不再向 Python 返回 `gate_paused` 哨兵
-    ps = summarize_params(canonical_name, params)
-    result_json, events, _output, _final_lease_id = await execute_single_action_with_inline_retry(
-        effects,
-        leases,
-        canonical_name,
-        params,
-        call_id,
-        lease,
-        exec_ctx,
-        ps,
-        thread.id,
-        thread.user_id,
-    )
-
-    for event in events:
-        emit_and_record(thread, event_tx, event)
-
-    return ExtFunctionResult.Return(result_json)
-
-
-async def handle_execute_actions_parallel(
-        args: List[Any],
-        thread: Thread,
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        policy: PolicyEngine,
-        event_tx: Optional[asyncio.Queue] = None,
-        gate_controller: GateController = None,
-) -> ExtFunctionResult:
-    """处理 `__execute_actions_parallel__(calls)`
-
-    接收动作调用列表并并发执行它们的批量主机函数。
-    每个调用是一个包含 `name`、`params` 和可选的 `call_id` 的字典
-
-    返回结果字典列表（每个调用一个，按顺序）。
-    每个结果与 `__execute_action__` 输出具有相同的形状，加上可选的门控暂停负载
-
-    在所有并行执行完成后，事件按原始调用顺序发出
-    """
-    # 从第一个参数解析调用列表（字典列表）
-    calls_json = args[0] if len(args) > 0 else []
-    if not isinstance(calls_json, list):
-        return ExtFunctionResult.Error(TypeError("__execute_actions_parallel__ 需要调用字典列表"))
-
-    if not calls_json:
-        return ExtFunctionResult.Return([])
-
-    # 将每个调用字典解析为 (name, params, call_id)
-    parsed = []
-    for c in calls_json:
-        name = c.get("name", "") if isinstance(c, dict) else ""
-        params = c.get("params", {}) if isinstance(c, dict) else {}
-        call_id = c.get("call_id", "") if isinstance(c, dict) else ""
-        parsed.append({"name": name, "params": params, "call_id": call_id})
-
-    step_id = StepId()
-    actions_context = thread_execution_context(thread, step_id, None, gate_controller)
-    active_leases = await leases.active_for_thread(thread.id)
-
-    # 加载动作清单
-    inventory = None
-    try:
-        inventory = await effects.available_action_inventory(active_leases, actions_context)
-    except Exception as error:
-        logger.debug(f"线程 {thread.id}, 步骤 {step_id}: 加载编排器并行执行的动作清单失败: {error}")
-
-    available_actions = list(inventory.inline) if inventory is not None else []
-
-    # ── 阶段 1：预检（顺序）─────────────────────────
-    # 检查租约和策略。拒绝 → 错误结果。批准 → 中断
-
-    preflight = []
-
-    for pc in parsed:
-        # 从可调用清单中查找动作定义
-        exec_ctx = thread_execution_context(thread, step_id, pc["call_id"], gate_controller)
-        if inventory is not None:
-            exec_ctx.available_actions_snapshot = available_actions
-            exec_ctx.available_action_inventory_snapshot = inventory
-
-        action_def = None
-        for a in available_actions:
-            if a.matches_name(pc["name"]):
-                action_def = a
-                break
-
-        if inventory is not None and action_def is None:
-            error = f"动作 '{pc['name']}' 在此执行上下文中不可调用"
-            output = {"error": error}
-            result_json = {"output": output, "is_error": True}
-            event = EventKind.ActionFailed(
-                step_id=step_id,
-                action_name=pc["name"],
-                call_id=pc["call_id"],
-                error=error,
-                duration_ms=0,
-                params_summary=summarize_params(pc["name"], pc["params"]),
-            )
-            preflight.append({"type": "error", "result_json": result_json, "event": event, "output": output})
-            continue
-
-        # 查找租约
-        lease = await leases.find_lease_for_action(thread.id, pc["name"])
-        if lease is None:
-            error = f"动作 '{pc['name']}' 没有租约"
-            output = {"error": error}
-            result_json = {"output": output, "is_error": True}
-            event = EventKind.ActionFailed(
-                step_id=step_id,
-                action_name=pc["name"],
-                call_id=pc["call_id"],
-                error=error,
-                duration_ms=0,
-                params_summary=None,
-            )
-            preflight.append({"type": "error", "result_json": result_json, "event": event, "output": output})
-            continue
-
-        # 检查策略
-        action_name = action_def.name if action_def is not None else pc["name"]
-
-        if action_def is not None:
-            decision = policy.evaluate(action_def, lease, [])
-            if isinstance(decision, Deny):
-                output = {"error": f"被拒绝: {decision.reason}"}
-                result_json = {"output": output, "is_error": True}
-                event = EventKind.ActionFailed(
-                    step_id=step_id,
-                    action_name=action_name,
-                    call_id=pc["call_id"],
-                    error=decision.reason,
-                    duration_ms=0,
-                    params_summary=None,
-                )
-                preflight.append({"type": "error", "result_json": result_json, "event": event, "output": output})
-                continue
-            elif isinstance(decision, RequireApproval):
-                # 内联门控等待：就地暂停此预检调用，直到用户解决门控。
-                # 批准后，进入租约消耗 + 排队执行。
-                # 拒绝后，推送 ActionFailed 结果并继续预检，
-                # 以便批次其余部分仍然运行 —
-                # 镜像 `structured.rs::execute_action_batch_with_results`
-                #
-                # 桥接控制器按 (user, thread) 序列化并发内联门控，
-                # 因此两个同时门控的预检调用会顺序提示，
-                # 而不是第二个静默取消
-                approval_ev = ThreadEvent.new(
-                    thread.id,
-                    EventKind.ApprovalRequested(
-                        action_name=pc["name"],
-                        call_id=pc["call_id"],
-                        parameters=pc["params"],
-                        description=None,
-                        allow_always=True,
-                        gate_name="approval",
-                        params_summary=summarize_params(pc["name"], pc["params"]),
-                    ),
-                )
-                if event_tx is not None:
-                    try:
-                        event_tx.put_nowait(approval_ev)
-                    except asyncio.QueueFull:
-                        pass
-                thread.events.append(approval_ev)
-                thread.updated_at = datetime.now(timezone.utc)
-
-                resume_kind = ResumeKind.Approval(allow_always=True)
-                resolution = await gate_controller.pause(GatePauseRequest(
-                    thread_id=thread.id,
-                    user_id=thread.user_id,
-                    gate_name="approval",
-                    action_name=pc["name"],
-                    call_id=pc["call_id"],
-                    parameters=pc["params"],
-                    resume_kind=resume_kind,
-                    conversation_id=exec_ctx.conversation_id,
-                ))
-
-                denial = denial_outcome_for_resolution(resolution)
-                if denial is not None:
-                    error = denial.event_error()
-                    output = {"error": error}
-                    result_json = {"output": output, "is_error": True}
-                    event = EventKind.ActionFailed(
-                        step_id=step_id,
-                        action_name=action_name,
-                        call_id=pc["call_id"],
-                        error=error,
-                        duration_ms=0,
-                        params_summary=summarize_params(pc["name"], pc["params"]),
-                    )
-                    preflight.append({"type": "error", "result_json": result_json, "event": event, "output": output})
-                    continue
-                # 已批准 — 进入租约消耗 + 可运行
-
-        # 原子化地在单个写锁下重新查找 + 消耗一次租约使用，
-        # 关闭上面只读 `find_lease_for_action` 和消耗之间的 TOCTOU 窗口。
-        # 镜像 `structured.rs::execute_action_batch_with_results`
-        try:
-            lease = await leases.find_and_consume(thread.id, pc["name"])
-        except Exception as e:
-            logger.debug(f"原子化租约 find_and_consume 失败: {e}")
-            error = f"动作 '{pc['name']}' 的租约消耗失败: {e}"
-            output = {"error": error}
-            result_json = {"output": output, "is_error": True}
-            event = EventKind.ActionFailed(
-                step_id=step_id,
-                action_name=pc["name"],
-                call_id=pc["call_id"],
-                error=error,
-                duration_ms=0,
-                params_summary=None,
-            )
-            preflight.append({"type": "error", "result_json": result_json, "event": event, "output": output})
-            continue
-
-        preflight.append({"type": "runnable", "lease": lease})
-
-    # ── 阶段 2：并行执行 ────────────────────────────
-
-    # 槽数组：索引 → 执行结果。`slot_events` 是每个槽的 `List[EventKind]`，
-    # 以便内联重试路径可以记录多个事件（ApprovalRequested + 重试后结果）
-    slot_results = [None] * len(parsed)
-    slot_events = [None] * len(parsed)
-    slot_outputs = [None] * len(parsed)
-
-    # 将可运行项与错误分开
-    runnable = []
-    for idx, pf in enumerate(preflight):
-        if pf["type"] == "error":
-            slot_results[idx] = pf["result_json"]
-            slot_events[idx] = [pf["event"]]
-            slot_outputs[idx] = pf["output"]
-        elif pf["type"] == "runnable":
-            runnable.append((idx, pf["lease"]))
-
-    if len(runnable) == 1:
-        # 单个调用：直接使用内联门控等待重试执行
-        idx, lease = runnable[0]
-        pc = parsed[idx]
-
-        action_name = pc["name"]
-        for a in available_actions:
-            if a.matches_name(pc["name"]):
-                action_name = a.name
-                break
-
-        exec_ctx = thread_execution_context(thread, step_id, pc["call_id"], gate_controller)
-        if inventory is not None:
-            exec_ctx.available_actions_snapshot = available_actions
-            exec_ctx.available_action_inventory_snapshot = inventory
-
-        ps = summarize_params(action_name, pc["params"])
-        result_json, events, output, _final_lease_id = await execute_single_action_with_inline_retry(
-            effects,
-            leases,
-            action_name,
-            pc["params"],
-            pc["call_id"],
-            lease,
-            exec_ctx,
-            ps,
-            thread.id,
-            thread.user_id,
-        )
-        slot_results[idx] = result_json
-        slot_events[idx] = events
-        slot_outputs[idx] = output
-
-    elif len(runnable) > 1:
-        # 多个调用：通过 asyncio 任务并行执行。每个任务携带自己的内联重试循环，
-        # 这样一个工具的门控不会阻塞批次其余部分 — 并且旧版的"恢复时双重执行"
-        # 错误也不会在并行批次中触发
-        effects_ref = effects
-        leases_ref = leases
-        base_exec_ctx = thread_execution_context(thread, step_id, None, gate_controller)
-        thread_id = thread.id
-        user_id = thread.user_id
-
-        async def task(idx: int, lease: CapabilityLease):
-            pc_name = parsed[idx]["name"]
-            for a in available_actions:
-                if a.matches_name(pc_name):
-                    pc_name = a.name
-                    break
-
-            pc_params = parsed[idx]["params"]
-            pc_call_id = parsed[idx]["call_id"]
-
-            exec_ctx = base_exec_ctx.clone()
-            exec_ctx.current_call_id = pc_call_id
-            if inventory is not None:
-                exec_ctx.available_actions_snapshot = available_actions
-                exec_ctx.available_action_inventory_snapshot = inventory
-
-            ps = summarize_params(pc_name, pc_params)
-            result_json, events, output, final_lease_id = await execute_single_action_with_inline_retry(
-                effects_ref,
-                leases_ref,
-                pc_name,
-                pc_params,
-                pc_call_id,
-                lease,
-                exec_ctx,
-                ps,
-                thread_id,
-                user_id,
-            )
-            return (idx, final_lease_id, result_json, events, output)
-
-        tasks = [task(idx, lease) for idx, lease in runnable]
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result_item in results_list:
-            if isinstance(result_item, Exception):
-                logger.debug(f"并行动作执行任务异常: {result_item}")
-                continue
-            idx, _lease_id, result_json, events, output = result_item
-            # 内联重试助手已经退还了门控等待期间消耗的任何租约。
-            # 此处不需要额外的记账
-            slot_results[idx] = result_json
-            slot_events[idx] = events
-            slot_outputs[idx] = output
-
-    # ── 阶段 3：按顺序发出事件 ────────────────────────────
-
-    results_json = []
-    for idx in range(len(parsed)):
-        result_json = slot_results[idx] or {"is_error": True, "output": {"error": "执行槽为空"}}
-        output = slot_outputs[idx] or {"error": "无输出"}
-
-        if slot_events[idx] is not None:
-            for event in slot_events[idx]:
-                ev = ThreadEvent.new(thread.id, event)
-                if event_tx is not None:
-                    try:
-                        event_tx.put_nowait(ev)
-                    except asyncio.QueueFull:
-                        pass
-                thread.events.append(ev)
-
-        results_json.append(result_json)
-
-    thread.updated_at = datetime.now(timezone.utc)
-    return ExtFunctionResult.Return(results_json)
-
-
-async def execute_single_action(
-        effects: EffectExecutor,
-        name: str,
-        params: dict,
-        call_id: str,
-        lease: CapabilityLease,
-        exec_ctx: ThreadExecutionContext,
-        params_summary: Optional[str] = None,
-) -> tuple:
-    """执行单个动作并返回 (result_json, event, output) 供批量处理器记录。
-    由单调用和并行路径共享
-    """
-    execution_start = time.monotonic()
-
-    try:
-        r = await effects.execute_action(name, params, lease, exec_ctx)
-
-        # 将包装的错误显示为 ActionFailed（参见 resolve_tool_future 和
-        # 并行执行路径中的相同模式）
-        if r.is_error:
-            error_msg = r.output.get("error", str(r.output)) if isinstance(r.output, dict) else str(r.output)
-            duration_ms = r.duration_ms if r.duration_ms > 0 else int((time.monotonic() - execution_start) * 1000)
-            event = EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=error_msg,
-                duration_ms=duration_ms,
-                params_summary=params_summary,
-            )
-        else:
-            event = EventKind.ActionExecuted(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                duration_ms=r.duration_ms,
-                params_summary=params_summary,
-            )
-
-        result_json = {
-            "action_name": r.action_name,
-            "output": r.output,
-            "is_error": r.is_error,
-            "duration_ms": r.duration_ms,
-        }
-        return (result_json, event, r.output)
-
-    except EngineError as e:
-        if e.error_type == "GatePaused":
-            gate_name = e.gate_name
-            parameters = e.parameters
-            resume_kind = e.resume_kind
-            resume_output = e.resume_output
-            paused_lease = e.paused_lease
-
-            output = {"status": "gate_paused", "gate_name": gate_name}
-
-            allow_always = None
-            if hasattr(resume_kind, 'allow_always'):
-                allow_always = resume_kind.allow_always
-
-            event = EventKind.ApprovalRequested(
-                action_name=name,
-                call_id=call_id,
-                parameters=parameters,
-                description=None,
-                allow_always=allow_always,
-                gate_name=gate_name,
-                params_summary=summarize_params(name, parameters),
-            )
-
-            resume_kind_dict = resume_kind.to_dict() if hasattr(resume_kind, 'to_dict') else str(resume_kind)
-
-            result_json = {
-                "gate_paused": True,
-                "gate_name": gate_name,
-                "action_name": name,
-                "call_id": call_id,
-                "parameters": parameters,
-                "resume_kind": resume_kind_dict,
-                "resume_output": resume_output,
-                "paused_lease": paused_lease,
-            }
-            return (result_json, event, output)
-        else:
-            output = {"error": str(e)}
-            event = EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=str(e),
-                duration_ms=int((time.monotonic() - execution_start) * 1000),
-                params_summary=params_summary,
-            )
-            result_json = {"output": output, "is_error": True}
-            return (result_json, event, output)
-
-
-def interrupted_result_needs_refund(result: dict) -> bool:
-    """检查中断的结果是否需要退还租约使用次数"""
-    return result.get("gate_paused") is True
-
-
-# 内联门控重试的最大次数，防止行为异常的工具占用 CPU
-MAX_INLINE_GATE_RETRIES = 3
-
-
-async def execute_single_action_with_inline_retry(
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        name: str,
-        params: dict,
-        call_id: str,
-        initial_lease: CapabilityLease,
-        exec_ctx: ThreadExecutionContext,
-        params_summary: Optional[str] = None,
-        thread_id: ThreadId = None,
-        user_id: str = "",
-) -> tuple:
-    """类似于 [`execute_single_action`]，但在 `Approval` 类型的门控暂停结果上
-    内联暂停并重试。受 `MAX_INLINE_GATE_RETRIES` 限制，
-    因此行为异常的工具不会占用 CPU
-
-    由 `__execute_actions_parallel__` 用于单可运行和多可运行分支。
-    没有此包装器，多可运行分支会回退到旧版 `gate_paused` 哨兵 + 线程重新进入，
-    这会双重执行同一批次中较早的非幂等调用 — 正是此 PR 旨在防止的错误
-    """
-    current_lease = initial_lease
-    call_ctx = exec_ctx.clone()
-    # `accumulated_events` 携带内联重试循环观察到的每个事件 —
-    # 来自每次门控暂停迭代的 `ApprovalRequested`，加上最终的
-    # `ActionExecuted` / `ActionFailed`。调用者将它们全部追加到
-    # 线程事件日志中，以便观察者看到完整序列
-    accumulated_events = []
-
-    for _ in range(MAX_INLINE_GATE_RETRIES):
-        result_json, event, output = await execute_single_action(
-            effects,
-            name,
-            params,
-            call_id,
-            current_lease,
-            call_ctx,
-            params_summary,
-        )
-        # 重置一次性批准标志 — 只有紧随批准的调用才应携带它
-        call_ctx.call_approval_granted = False
-
-        if not interrupted_result_needs_refund(result_json):
-            # 不是门控暂停 — 终端事件；记录并返回
-            accumulated_events.append(event)
-            return (result_json, accumulated_events, output, current_lease.id)
-
-        # 门控暂停。Approval 和 Authentication 获得内联等待处理
-        # （#3133 / #3166）：主机控制器就地解决它们，暂停的调用重试，
-        # 编排器在不展开的情况下继续。External 保留旧版 `gate_paused`
-        # 哨兵 + 重新进入路径，因为其解决方案负载（回调正文）无法
-        # 传回给暂停的调用
-        resume_kind = result_json.get("resume_kind", {"Approval": {"allow_always": False}})
-        if isinstance(resume_kind, dict):
-            if "Approval" in resume_kind:
-                resume_kind = ResumeKind.Approval(allow_always=resume_kind["Approval"].get("allow_always", False))
-            elif "Authentication" in resume_kind:
-                resume_kind = ResumeKind.Authentication()
-            else:
-                # External 或其他 — 不内联处理
-                accumulated_events.append(event)
-                return (result_json, accumulated_events, output, current_lease.id)
-        else:
-            accumulated_events.append(event)
-            return (result_json, accumulated_events, output, current_lease.id)
-
-        # 批准门控触发 — 在暂停控制器之前记录请求，
-        # 以便观察者无论解决方案如何落地都能看到提示
-        accumulated_events.append(event)
-
-        # 退还此尝试消耗的租约使用次数；如果用户批准，我们将在重试时重新消耗。
-        # 例外：当门控携带缓存的 `resume_output` 时，动作已经执行
-        # （执行后认证门控），下面的缓存输出分支将返回而不重新消耗。
-        # 现在退还将让成功的副作用动作消耗零次租约使用。
-        # 参见 `scripting::resolve_tool_future` 和
-        # `structured::execute_with_inline_gate_retry` 中的匹配保护。
-        # 由 #3559 安全审查跟踪
-        gate_carries_resume_output = (
-                "resume_output" in result_json
-                and result_json["resume_output"] is not None
-        )
-        if not gate_carries_resume_output:
-            await leases.refund_use(current_lease.id)
-
-        # 使用来自 GatePaused 负载的门控提供的参数，而不是原始调用者 `params`：
-        # 安全层可能已转换/编辑它们，用户看到的提示必须与工具实际想要运行的内容匹配。
-        # 镜像 `structured::execute_with_inline_gate_retry` 中的契约
-        gate_parameters = result_json.get("parameters", params)
-
-        resolution = await exec_ctx.gate_controller.pause(GatePauseRequest(
-            thread_id=thread_id,
-            user_id=user_id,
-            gate_name=result_json.get("gate_name", "approval"),
-            action_name=name,
-            call_id=call_id,
-            parameters=gate_parameters,
-            resume_kind=resume_kind,
-            conversation_id=exec_ctx.conversation_id,
-        ))
-
-        denial = denial_outcome_for_resolution(resolution)
-        if denial is not None:
-            # 取消+认证 → 回退到旧版 `gate_paused` 哨兵，
-            # 以便任务/非内联感知控制器仍然可以显示暂停状态。
-            # 参见 `structured::execute_with_inline_gate_retry` 中的匹配分支。
-            # 已累积的 `ApprovalRequested` 事件在暂停前已推送；
-            # 我们在携带原始门控元数据的新 result_json 上重新发出它
-            if (isinstance(resolution, GateResolution)
-                    and resolution.type == "Cancelled"
-                    and isinstance(resume_kind, ResumeKind)
-                    and resume_kind.type == "Authentication"):
-                return (result_json, accumulated_events, output, current_lease.id)
-
-            error_msg = denial.event_error()
-            denial_output = {"error": error_msg}
-            denial_event = EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=error_msg,
-                duration_ms=0,
-                params_summary=params_summary,
-            )
-            accumulated_events.append(denial_event)
-            result_json = {
-                "action_name": name,
-                "output": denial_output,
-                "is_error": True,
-                "duration_ms": 0,
-            }
-            return (result_json, accumulated_events, denial_output, current_lease.id)
-
-        # 已批准。如果桥接在引发此门控之前缓存了动作的输出
-        # （执行后认证门控路径 — 参见 `effect_adapter::auth_gate_from_extension_result`
-        # 和 `check_tool_readiness` 路径），动作已经运行，我们只需要用户侧解决方案。
-        # 返回缓存的输出而不是重新执行。没有此快捷方式，重试 `tool_install`
-        # 会重新下载 WASM 并第二次运行 `effect_adapter::enforce_tool_permission` 批准检查，
-        # 引发用户无法解决的新门控。由 #3533 跟踪
-        cached_output = result_json.get("resume_output")
-        if cached_output is not None:
-            event = EventKind.ActionExecuted(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                duration_ms=0,
-                params_summary=params_summary,
-            )
-            accumulated_events.append(event)
-            result_json = {
-                "action_name": name,
-                "output": cached_output,
-                "is_error": False,
-                "duration_ms": 0,
-            }
-            return (result_json, accumulated_events, cached_output, current_lease.id)
-
-        # 重新消耗一次租约使用并标记下一次调用为预批准
-        try:
-            new_lease = await leases.find_and_consume(thread_id, name)
-            current_lease = new_lease
-            call_ctx.call_approval_granted = True
-            continue
-        except Exception as e:
-            err = {"error": f"批准后租约耗尽: {e}"}
-            lease_event = EventKind.ActionFailed(
-                step_id=exec_ctx.step_id,
-                action_name=name,
-                call_id=call_id,
-                error=f"批准后租约耗尽: {e}",
-                duration_ms=0,
-                params_summary=params_summary,
-            )
-            accumulated_events.append(lease_event)
-            result_json = {
-                "action_name": name,
-                "output": err,
-                "is_error": True,
-                "duration_ms": 0,
-            }
-            return (result_json, accumulated_events, err, current_lease.id)
-
-    # 重试预算耗尽 — 工具在每次批准后持续门控。
-    # 最后一次循环迭代以成功的 `find_and_consume` 结束，其租约从未被使用；
-    # 在返回之前退还它，这样行为异常的工具无法在多次批准中缓慢耗尽 `max_uses`。
-    # 尽力而为；如果租约已被撤销/过期，退款是无操作的
-    await leases.refund_use(current_lease.id)
-    err = {
-        "error": f"工具 '{name}' 在 {MAX_INLINE_GATE_RETRIES} 次重试后仍然需要批准"
-    }
-    accumulated_events.append(EventKind.ActionFailed(
-        step_id=exec_ctx.step_id,
-        action_name=name,
-        call_id=call_id,
-        error=f"工具在 {MAX_INLINE_GATE_RETRIES} 次批准后持续门控",
-        duration_ms=0,
-        params_summary=params_summary,
-    ))
-    result_json = {
-        "action_name": name,
-        "output": err,
-        "is_error": True,
-        "duration_ms": 0,
-    }
-    return (result_json, accumulated_events, err, current_lease.id)
-
-
-def handle_check_signals(
-        signal_rx: SignalReceiver,
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__check_signals__()`"""
-    try:
-        signal = signal_rx.try_recv()
-    except Exception:
-        return ExtFunctionResult.Return(None)
-
-    if signal is None:
-        return ExtFunctionResult.Return(None)
-
-    if signal.type in ("Stop", "Suspend"):
-        return ExtFunctionResult.Return("stop")
-    elif signal.type == "InjectMessage":
-        thread.add_message(signal.message)
-        return ExtFunctionResult.Return({"inject": signal.message.content})
-    elif signal.type in ("Resume", "ChildCompleted"):
-        return ExtFunctionResult.Return(None)
-    else:
-        return ExtFunctionResult.Return(None)
-
-
-def handle_emit_event(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        event_tx: Optional[asyncio.Queue] = None,
-) -> ExtFunctionResult:
-    """处理 `__emit_event__(kind, **data)`"""
-    kind_str = args[0] if len(args) > 0 else ""
-
-    if kind_str == "step_started":
-        step = kwargs.get("step", 0)
-        kind = EventKind.StepStarted(step_id=StepId())
-    elif kind_str == "step_completed":
-        input_tokens = kwargs.get("input_tokens", 0)
-        output_tokens = kwargs.get("output_tokens", 0)
-        # 增加步骤计数（镜像旧的 Rust 循环的 step_count += 1）
-        thread.step_count += 1
-        # 跟踪 token 使用量
-        thread.total_tokens_used += input_tokens + output_tokens
-        kind = EventKind.StepCompleted(
-            step_id=StepId(),
-            tokens=TokenUsage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            ),
-        )
-    elif kind_str == "action_executed":
-        action_name = kwargs.get("action_name", "")
-        call_id = kwargs.get("call_id", "")
-        kind = EventKind.ActionExecuted(
-            step_id=StepId(),
-            action_name=action_name,
-            call_id=call_id,
-            duration_ms=0,
-            params_summary=None,
-        )
-    elif kind_str == "action_failed":
-        action_name = kwargs.get("action_name", "")
-        call_id = kwargs.get("call_id", "")
-        error = kwargs.get("error", "")
-        duration_ms = kwargs.get("duration_ms", 0)
-        kind = EventKind.ActionFailed(
-            step_id=StepId(),
-            action_name=action_name,
-            call_id=call_id,
-            error=error,
-            duration_ms=duration_ms,
-            params_summary=None,
-        )
-    elif kind_str == "skill_activated":
-        names_str = kwargs.get("skill_names", "")
-        skill_names = [s.strip() for s in names_str.split(",") if s.strip()]
-        kind = EventKind.SkillActivated(skill_names=skill_names)
-    else:
-        logger.debug(f"编排器: 未知事件类型 '{kind_str}'，跳过")
-        return ExtFunctionResult.Return(None)
-
-    event = ThreadEvent.new(thread.id, kind)
-    if event_tx is not None:
-        try:
-            event_tx.put_nowait(event)
-        except asyncio.QueueFull:
-            pass
-    thread.events.append(event)
-    thread.updated_at = datetime.now(timezone.utc)
-
-    return ExtFunctionResult.Return(None)
-
-
-def handle_save_checkpoint(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__save_checkpoint__(state, counters)`"""
-    state = args[0] if len(args) > 0 else {}
-    counters = args[1] if len(args) > 1 else {}
-
-    sync_runtime_state(thread, state)
-
-    if isinstance(thread.metadata, dict):
-        thread.metadata["runtime_checkpoint"] = {
-            "persisted_state": state,
-            "nudge_count": counters.get("nudge_count", 0),
-            "consecutive_errors": counters.get("consecutive_errors", 0),
-            "consecutive_action_errors": counters.get("consecutive_action_errors", 0),
-            "compaction_count": counters.get("compaction_count", 0),
-        }
-    thread.updated_at = datetime.now(timezone.utc)
-
-    return ExtFunctionResult.Return(None)
-
-
-def handle_transition_to(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__transition_to__(state, reason)`"""
-    state_str = args[0] if len(args) > 0 else ""
-    reason = args[1] if len(args) > 1 else None
-
-    state_map = {
-        "running": ThreadState.Running,
-        "completed": ThreadState.Completed,
-        "failed": ThreadState.Failed,
-        "waiting": ThreadState.Waiting,
-        "suspended": ThreadState.Suspended,
-    }
-
-    target = state_map.get(state_str)
-    if target is None:
-        return ExtFunctionResult.Error(ValueError(f"未知的线程状态: {state_str}"))
-
-    try:
-        thread.transition_to(target, reason)
-        return ExtFunctionResult.Return(None)
-    except Exception as e:
-        return ExtFunctionResult.Error(RuntimeError(f"状态转换失败: {e}"))
-
-
-async def handle_retrieve_docs(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        thread: Thread,
-        retrieval: Optional[RetrievalEngine] = None,
-) -> ExtFunctionResult:
-    """处理 `__retrieve_docs__(goal, max_docs)`"""
-    if retrieval is None:
-        return ExtFunctionResult.Return([])
-
-    goal = args[0] if len(args) > 0 else ""
-    max_docs = args[1] if len(args) > 1 else 5
-    if not isinstance(max_docs, int):
-        max_docs = 5
-
-    try:
-        docs = await retrieval.retrieve_context(
-            thread.project_id, thread.user_id, goal, max_docs,
-        )
-        docs_json = [
-            {
-                "type": str(doc.doc_type),
-                "title": doc.title,
-                "content": doc.content,
-            }
-            for doc in docs
-        ]
-        return ExtFunctionResult.Return(docs_json)
-    except Exception as e:
-        logger.debug(f"retrieve_docs 失败: {e}")
-        return ExtFunctionResult.Return([])
-
-
-def handle_check_budget(thread: Thread) -> ExtFunctionResult:
-    """处理 `__check_budget__()`"""
-    # 计算剩余 token
-    if thread.config.max_tokens_total is not None:
-        tokens_remaining = max(0, thread.config.max_tokens_total - thread.total_tokens_used)
-    else:
-        tokens_remaining = None  # 表示无限制
-
-    # 计算剩余时间
-    if thread.config.max_duration is not None:
-        elapsed = datetime.now(timezone.utc) - thread.created_at
-        elapsed_ms = max(0, int(elapsed.total_seconds() * 1000))
-        max_duration_ms = int(thread.config.max_duration.total_seconds() * 1000)
-        time_remaining_ms = max(0, max_duration_ms - elapsed_ms)
-    else:
-        time_remaining_ms = None
-
-    # 计算剩余美元预算
-    if thread.config.max_budget_usd is not None:
-        usd_remaining = max(0.0, thread.config.max_budget_usd - thread.total_cost_usd)
-    else:
-        usd_remaining = None
-
-    result = {
-        "tokens_remaining": tokens_remaining,
-        "time_remaining_ms": time_remaining_ms,
-        "usd_remaining": usd_remaining,
-    }
-
-    return ExtFunctionResult.Return(result)
-
-
-async def handle_get_actions(
-        thread: Thread,
-        effects: EffectExecutor,
-        leases: LeaseManager,
-        store: Optional[Store] = None,
-) -> ExtFunctionResult:
-    """处理 `__get_actions__()`"""
-    # 在获取动作前协调动态工具租约
-    try:
-        await reconcile_dynamic_tool_lease(thread, effects, leases, store, LeasePlanner())
-    except Exception as e:
-        warn_on_lease_refresh_failure("get_actions", e)
-
-    active_leases = await leases.active_for_thread(thread.id)
-    # 只读路径：`available_actions` 不暂停，因此惰性控制器是正确的。
-    # 在此处传入实时控制器不会带来任何好处
-    actions_context = thread_execution_context(
-        thread, StepId(), None, CancellingGateController(),
-    )
-
-    try:
-        actions = await effects.available_actions(active_leases, actions_context)
-        actions_json = [
-            {
-                "name": a.name,
-                "description": a.description,
-                "params": a.parameters_schema,
-            }
-            for a in actions
-        ]
-        return ExtFunctionResult.Return(actions_json)
-    except Exception as e:
-        logger.debug(f"get_actions 失败: {e}")
-        return ExtFunctionResult.Return([])
-
-
-# 编译正则表达式的最大大小限制（64 KiB），用于防止 ReDoS 攻击
-MAX_REGEX_SIZE = 1 << 16  # 65536 字节
-
-
-async def handle_list_skills(
-        args: List[Any],
-        thread: Thread,
-        store: Optional[Store] = None,
-) -> ExtFunctionResult:
-    """处理 `__list_skills__()`
-
-    从项目中加载所有 `DocType::Skill` MemoryDoc 并将其作为 Python 字典列表返回。
-    Python 编排器处理评分、选择和注入 — Rust 仅提供数据访问
-
-    ## 设置标记排除（与 v1 选择器的 v2 对等）
-
-    在返回技能列表之前，此函数过滤掉其 `metadata.activation.setup_marker`
-    已在当前项目中作为 MemoryDoc 标题存在的任何技能。在 v2 中，工作区文件
-    存储为按标题索引的 MemoryDoc，因此"标记文件是否存在"映射到
-    "是否存在具有该标题的 MemoryDoc" — 并且我们已经在作用域中拥有
-    完整的文档列表用于技能过滤，因此这不会产生额外的存储调用成本
-
-    这是 v1 路径上通过 `ironclaw_skills::prefilter_skills` 传递的
-    `satisfied_setup_markers` 参数的 v2 等效项。两条路径实现相同的规则：
-    一次性设置技能在其标记文件已被写入后已完成其工作，
-    不应在随后的每个回合中持续消耗激活预算
-    """
-    if store is None:
-        return ExtFunctionResult.Return([])
-
-    # 用户在其项目中的文档（所有文档类型 — 技能过滤在下面的
-    # `filter(|d| d.doc_type == Skill)` 过程中进行）
-    try:
-        docs = await store.list_memory_docs(thread.project_id, thread.user_id)
-    except Exception as e:
-        logger.debug(f"__list_skills__: 加载用户文档失败: {e}")
-        docs = []
-
-    # 跨所有项目的管理员/共享技能（修复多租户可见性 —
-    # 共享技能存在于所有者的项目中，但必须对所有用户可见，
-    # 无论其线程在哪个按用户划分的项目中运行）
-    try:
-        shared = await store.list_skills_global()
-        docs.extend(shared)
-    except Exception as e:
-        logger.debug(f"__list_skills__: 加载全局技能失败: {e}")
-
-    # 按 ID 排序并去重
-    seen_ids = set()
-    unique_docs = []
-    for doc in sorted(docs, key=lambda d: d.id.value if hasattr(d.id, 'value') else str(d.id)):
-        doc_id = d.id.value if hasattr(d.id, 'value') else str(d.id)
-        if doc_id not in seen_ids:
-            seen_ids.add(doc_id)
-            unique_docs.append(doc)
-    docs = unique_docs
-
-    # 构建现有非技能文档标题的集合（== v2 中的工作区路径），
-    # 这样下面的设置标记过滤对每个技能是 O(1) 的。
-    # 排除 Skill 文档，以便像 "github" 这样的标记不会与同名的技能文档冲突
-    existing_titles = set()
-    for doc in docs:
-        if doc.doc_type != DocType.Skill:
-            existing_titles.add(doc.title)
-
-    # 过滤技能文档
-    skills = []
-    for doc in docs:
-        if doc.doc_type != DocType.Skill:
-            continue
-
-        # 设置标记排除。如果技能的激活元数据声明了一个 setup_marker，
-        # 且已存在具有该标题的 MemoryDoc，则该技能的设置已完成，我们跳过它
-        metadata = doc.metadata if isinstance(doc.metadata, dict) else {}
-        activation = metadata.get("activation", {}) if isinstance(metadata, dict) else {}
-        marker = activation.get("setup_marker") if isinstance(activation, dict) else None
-
-        if marker is not None and marker in existing_titles:
-            logger.debug(f"__list_skills__: 排除设置技能 — 标记已存在: skill={doc.title}, marker={marker}")
-            continue
-
-        skills.append({
-            "doc_id": str(doc.id.value) if hasattr(doc.id, 'value') else str(doc.id),
-            "title": doc.title,
-            "content": doc.content,
-            "metadata": doc.metadata,
-        })
-
-    return ExtFunctionResult.Return(skills)
-
-
-async def handle_record_skill_usage(
-        args: List[Any],
-        store: Optional[Store] = None,
-) -> ExtFunctionResult:
-    """处理 `__record_skill_usage__(doc_id, success)`
-
-    记录在此线程中使用了某个技能。由 Python 编排器在技能辅助执行完成后调用
-    """
-    if store is None:
-        return ExtFunctionResult.Return(None)
-
-    doc_id_str = args[0] if len(args) > 0 else ""
-    success = args[1] if len(args) > 1 else False
-    if not isinstance(success, bool):
-        success = False
-
-    try:
-        doc_uuid = uuid.UUID(doc_id_str)
-    except (ValueError, AttributeError):
-        logger.debug(f"__record_skill_usage__: 无效的 doc_id: {doc_id_str}")
-        return ExtFunctionResult.Return(None)
-
-    tracker = SkillTracker(store)
-    try:
-        await tracker.record_usage(DocId(doc_uuid), success)
-    except Exception as e:
-        logger.debug(f"__record_skill_usage__: 失败: {e}")
-
-    return ExtFunctionResult.Return(None)
-
-
-def handle_regex_match(args: List[Any]) -> ExtFunctionResult:
-    """处理 `__regex_match__(pattern, text) -> bool`
-
-    以有界大小限制编译 `pattern`，并返回它是否匹配 `text` 中的任何位置。
-    无效的正则表达式或大小限制违规静默返回 `False`。
-    由 Python 技能选择器用于正则表达式模式评分（Monty 没有 `re` 模块）
-
-    **安全：ReDoS 安全。** 此处理程序接受来自 Python 编排器（其自身从技能清单接收）
-    的任意模式，并在用户提供的文本上运行它们。安全性依赖于 Python `re` 模块的
-    线性时间匹配保证（无反向引用，无环视）加上下面的编译大小上限。
-    如果 `re` 模块被替换为支持反向引用且不是线性时间的 `regex` 模块，
-    这将成为真正的 ReDoS 向量。这仅通过约定和文档强制执行
-    """
-    pattern = args[0] if len(args) > 0 else ""
-    text = args[1] if len(args) > 1 else ""
-
-    if not pattern:
-        return ExtFunctionResult.Return(False)
-
-    # 限制编译正则表达式的大小以防止 ReDoS
-    # （匹配 `ironclaw_skills` 中 `LoadedSkill::compile_patterns` 使用的 64 KiB 限制）。
-    # 同时限制模式长度作为额外的防御层
-    if len(pattern) > MAX_REGEX_SIZE:
-        logger.debug(f"__regex_match__: 模式超过大小限制 ({len(pattern)} > {MAX_REGEX_SIZE})")
-        return ExtFunctionResult.Return(False)
-
-    try:
-        compiled = re.compile(pattern)
-        matched = bool(compiled.search(text))
-        return ExtFunctionResult.Return(matched)
-    except re.error as e:
-        logger.debug(f"__regex_match__: 无效模式 '{pattern}': {e}")
-        return ExtFunctionResult.Return(False)
-
-
-def handle_set_active_skills(
-        args: List[Any],
-        thread: Thread,
-) -> ExtFunctionResult:
-    """处理 `__set_active_skills__(skills)`
-
-    将选定的技能溯源持久化到线程上，以便运行后学习流程
-    可以推理出活跃的确切技能版本和代码片段
-    """
-    skills_json = args[0] if len(args) > 0 else []
-
-    # 将 JSON 数据转换为 ActiveSkillProvenance 对象列表
-    try:
-        if isinstance(skills_json, list):
-            skills = []
-            for skill_data in skills_json:
-                if isinstance(skill_data, dict):
-                    skills.append(ActiveSkillProvenance(
-                        doc_id=DocId(skill_data.get("doc_id", "")),
-                        name=skill_data.get("name", ""),
-                        version=skill_data.get("version", 0),
-                        snippet_names=skill_data.get("snippet_names", []),
-                        force_activated=skill_data.get("force_activated", False),
-                    ))
-        else:
-            skills = []
-    except Exception as e:
-        logger.debug(f"__set_active_skills__: 无效负载: {e}")
-        return ExtFunctionResult.Return(None)
-
-    try:
-        thread.set_active_skills(skills)
-    except Exception as e:
-        logger.debug(f"__set_active_skills__: 持久化活跃技能失败: {e}")
-
-    return ExtFunctionResult.Return(None)
-
-
-# ── 辅助函数 ─────────────────────────────────────────────────
-
-def build_orchestrator_inputs(
-        thread: Thread,
-        persisted_state: dict,
-) -> tuple:
-    """构建注入到编排器 Python 中的上下文变量"""
-    names = ["context", "goal", "actions", "state", "config"]
-
-    # 构建编排器引导上下文。当存在内部执行转录时优先使用它，
-    # 否则回退到用户可见的转录
-    bootstrap_messages = (
-        thread.internal_messages if thread.internal_messages
-        else thread.messages
-    )
-
-    context = []
-    for m in bootstrap_messages:
-        # 通过 Python 交换形状（`{name, call_id, params}`）序列化 action_calls，
-        # 以便引导上下文与 `python_json_to_action_calls` 往返兼容。
-        # 在此处使用裸 `m.action_calls` 会产生规范的 Rust serde 格式
-        # （`{action_name, id, parameters}`），Python 编排器会在下一次
-        # `__llm_complete__` 调用中原样传回 — 然后 `python_json_to_action_calls`
-        # 会因"缺少字段 `name`"而失败，使每个后续工具结果成为孤儿。
-        # 这是将 action_calls 输入 Python 工作转录的第二个代码路径
-        # （在 `handle_llm_complete` 之后）；两者必须使用相同的形状
-        calls_json = None
-        if hasattr(m, 'action_calls') and m.action_calls:
-            calls_json = action_calls_to_python_json(m.action_calls)
-
-        context.append({
-            "role": str(m.role),
-            "content": m.content,
-            "action_name": m.action_name if hasattr(m, 'action_name') else None,
-            "action_call_id": m.action_call_id if hasattr(m, 'action_call_id') else None,
-            "action_calls": calls_json,
-        })
-
-    # 构建配置
-    config = {
-        # 最大迭代次数: 限制 LLM 调用的总次数，防止无限循环
-        "max_iterations": thread.config.max_iterations,
-        # 当前步数
-        "step_count": thread.step_count,
-        # 最大工具意图提示次数: 限制提示消息的注入次数，避免无限循环
-        "max_tool_intent_nudges": thread.config.max_tool_intent_nudges,
-        # 是否启用工具意图提示: 当 LLM 说"我会搜索"但没有实际调用工具时，自动注入提示消息
-        "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
-        # 是否要求尝试执行动作: 强制 LLM 必须调用工具，不能只返回文本
-        "require_action_attempt": thread.config.require_action_attempt,
-        # 最大动作要求提示次数: 限制"请调用工具"提示的注入次数
-        "max_action_requirement_nudges": thread.config.max_action_requirement_nudges,
-        # 最大连续错误次数: 连续出现指定次数错误后终止线程
-        "max_consecutive_errors": thread.config.max_consecutive_errors,
-        # 最大总 token 数: 限制整个线程使用的 token 总量（输入+输出）
-        "max_tokens_total": thread.config.max_tokens_total,
-        # 最大预算: 限制整个线程的 USD 成本
-        "max_budget_usd": thread.config.max_budget_usd,
-        # 模型上下文限制: LLM 模型的最大上下文窗口大小，用于触发压缩
-        "model_context_limit": thread.config.model_context_limit,
-        # 是否启用压缩: 当上下文超过阈值时自动压缩历史消息
-        "enable_compaction": thread.config.enable_compaction,
-        # 压缩阈值: 当上下文达到模型限制的 85% 时触发压缩
-        "compaction_threshold": thread.config.compaction_threshold,
-        # 当前递归深度: 当前线程在递归调用树中的深度（0 为根线程）
-        "depth": thread.config.depth,
-        # 最大递归深度: 限制 rlm_query() 的最大递归深度，防止无限递归
-        "max_depth": thread.config.max_depth,
-    }
-
-    values = [
-        context,
-        thread.goal,
-        [],  # 动作通过 __get_actions__ 动态加载
-        persisted_state if persisted_state else {},
-        config,
-    ]
-
-    return (names, values)
-
-
-# ── Python ActionCall 交换格式 ────────────────────────────────
-
-def action_calls_to_python_json(calls: List[ActionCall]) -> List[dict]:
-    """将 `ActionCall` 列表序列化为 Python 交换形状
-
-    序列化失败时（对于 String + String + Value 基本上不可能发生，
-    但如果 `parameters` 树中包含序列化失败的键，仍然是可能的），
-    该条目会被从输出中**丢弃**而不是替换为 `null`。
-    之前的 `unwrap_or_else(|_| null)` 会损坏数组 — Python 的
-    `default.py` 对每个条目访问 `c.get("name")` / `c.get("call_id")` /
-    `c.get("params")`，因此 `null` 会因 Python `AttributeError` 崩溃
-    并丢失整个 LLM 步骤。`filter_map` 产生更短的数组，Python 的
-    工具结果循环可以正确处理，因为它针对缩短的调用列表迭代
-    `range(len(results))`。保留警告日志，以便操作员在触发时有线索
-    """
-    result = []
-    for c in calls:
-        try:
-            value = {
-                "name": c.action_name,
-                "call_id": c.id,
-                "params": c.parameters,
-            }
-            result.append(value)
-        except Exception as e:
-            logger.warning(
-                f"为 Python 编排器序列化 ActionCall 失败 — 丢弃条目: "
-                f"action_name={c.action_name}, error={e}"
-            )
-    return result
-
-
-def python_json_to_action_calls(value: Any) -> Optional[List[ActionCall]]:
-    """将 action_calls JSON 数组（Python 交换形状）反序列化回规范的 ActionCall
-
-    失败时记录警告而不是静默吞掉。引入此助手的整个提交是为了撤销一个
-    `.ok()` 吞掉，该吞掉在没有任何信号的情况下丢弃了 action_calls —
-    用另一个 `.ok()?` 替换它只会重新引入同样的陷阱，只是更深一层。
-    如果形状再次漂移（Python 编排器字段重命名、额外的必需字段、部分迁移），
-    警告是操作员可见的线索，解释了为什么后续工具结果在
-    `sanitize_tool_messages` 中突然看起来是孤立的
-
-    警告日志发出结构摘要（`summarize_action_calls_for_log`）而不是原始值，
-    因为工具参数可能包含用户 PII
-    """
-    if not isinstance(value, list):
-        logger.warning(
-            f"从 Python 编排器解析 action_calls 失败: "
-            f"期望列表但得到 {type(value).__name__}"
-        )
-        return None
-
-    result = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        try:
-            result.append(ActionCall(
-                id=item.get("call_id", ""),
-                action_name=item.get("name", ""),
-                parameters=item.get("params", {}),
-            ))
-        except Exception as e:
-            logger.warning(
-                f"从 Python 编排器解析 action_calls 失败 — "
-                f"助手消息将丢失 tool_call 链接，下游工具结果将被重写为用户消息: "
-                f"error={e}"
-            )
-            return None
-
-    return result
-
-
-# ── 字符串截断 ───────────────────────────────────────────────
-
-def tail_chars(s: str, n: int) -> str:
-    """提取字符串的最后 `n` 个字符
-
-    错误回溯出现在 stdout 的末尾，在任何 `print()` 输出之后。
-    使用开头会捕获打印语句而不是错误
-    """
-    if len(s) > n:
-        return s[-n:]
-    return s
-
-
-def tail_utf8_bytes(s: str, max_bytes: int) -> str:
-    """返回 `s` 的最后 `max_bytes` 字节，向前调整到下一个 UTF-8 字符边界，
-    以便切片始终是有效的 UTF-8
-
-    基于字节（不像 [`tail_chars`]）以在大负载上保持 O(1)+边界遍历。
-    由 `CodeExecuted` 发射路径使用，其中 `code`/`stdout` 可能任意大，
-    因此在每个步骤上进行 `chars().count()` 将是可测量的开销
-    """
-    encoded = s.encode('utf-8')
-    if len(encoded) <= max_bytes:
-        return s
-
-    start = len(encoded) - max_bytes
-    # 向前移动以越过不完整的码点字节。
-    # 最多 3 次迭代，因为 UTF-8 码点 ≤ 4 字节
-    truncated = encoded[start:]
-    try:
-        return truncated.decode('utf-8')
-    except UnicodeDecodeError:
-        # 尝试从下一个可能的边界开始
-        for offset in range(1, 4):
-            try:
-                return encoded[start + offset:].decode('utf-8')
-            except UnicodeDecodeError:
-                continue
-        # 最后手段：从 max_bytes 位置开始
-        return encoded[-max_bytes:].decode('utf-8', errors='ignore')
-
-
-def bounded_return_value(value: Any, max_bytes: int) -> Optional[Any]:
-    """在发出之前限制 CodeAct 返回值的序列化大小
-
-    - `None` → `None`（无变化 — null 返回无需显示）
-    - `str` → 通过 [`tail_utf8_bytes`] 尾部截断
-    - 其他（list、dict、int/float、bool）→ 检查序列化长度；
-      如果 ≤ `max_bytes` 则完整返回，否则丢弃
-
-    丢弃（而不是截断任意 JSON）是故意的：截断的列表/字典
-    在前端无法解析且不提供诊断价值。观察者看到 `None` 返回值，
-    知道负载因大小而被省略，而不是它是 `null`
-    """
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return tail_utf8_bytes(value, max_bytes)
-
-    # 对于其他类型，序列化后检查大小
-    try:
-        serialized = json.dumps(value, ensure_ascii=False).encode('utf-8')
-        if len(serialized) <= max_bytes:
-            return value
-        return None
-    except Exception:
-        return None
-
-
-# ── 日志摘要 ─────────────────────────────────────────────────
-
-def summarize_action_calls_for_log(value: Any) -> str:
-    """为日志输出构建 action_calls JSON 值的 PII 安全摘要
-
-    action_calls 负载包含工具参数，这些参数可能携带用户 PII
-    （搜索查询、文件名、邮件内容、对话文本）。
-    将完整值转储到 `warning` 日志中会在解析器失败时立即将该 PII 泄露到
-    日志聚合系统（Datadog、CloudWatch、Sentry）— 而解析器仅在
-    Python ↔ Rust 形状漂移时失败，这正是操作员最可能正在搜索日志的时候
-
-    我们只发出操作员调试形状漂移实际需要的结构信息：
-    数组长度和第一个条目的键。键本身不是用户数据 — 它们是像
-    `name`/`call_id`/`params` 这样的字段名，在所有调用中都是静态的
-    """
-    if not isinstance(value, list):
-        return f"非数组值，类型为 {_json_value_type_name(value)}"
-
-    if not value:
-        return "空数组"
-
-    first = value[0]
-    if isinstance(first, dict):
-        keys = sorted(first.keys())
-        keys_str = ",".join(keys)
-        return f"包含 {len(value)} 个条目的数组；第一个条目的键: [{keys_str}]"
-    else:
-        return f"包含 {len(value)} 个条目的数组；第一个条目: <非对象类型>"
-
-
-def _json_value_type_name(value: Any) -> str:
-    """返回 `value` 的廉价类型名称字符串。由 `summarize_action_calls_for_log`
-    用于显示错误形状的情况（例如 Python 传递了字符串而不是数组），
-    而不泄露实际内容
-    """
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "bool"
-    if isinstance(value, (int, float)):
-        return "number"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, dict):
-        return "object"
-    return type(value).__name__
-
-
-# ── 消息转换 ─────────────────────────────────────────────────
-
-def json_to_thread_messages(value: Any) -> Optional[List[ThreadMessage]]:
-    """将 JSON 值转换为 ThreadMessage 列表"""
-    if not isinstance(value, list):
-        return None
-
-    messages = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-
-        role = item.get("role", "User")
-        content = item.get("content", "")
-
-        # 在调用解析器之前过滤掉 null — `action_calls: null`
-        # 是 Python 合法的"此消息没有工具调用"信号（文本响应），
-        # 不是解析错误。没有此过滤，`python_json_to_action_calls` 中的警告日志
-        # 会在每个纯文本助手消息上触发，显示"无效类型: null，期望序列"
-        action_calls_raw = item.get("action_calls")
-        action_calls = None
-        if action_calls_raw is not None:
-            action_calls = python_json_to_action_calls(action_calls_raw)
-
-        if role in ("System", "system"):
-            message = ThreadMessage.system(content)
-        elif role in ("Assistant", "assistant"):
-            if action_calls:
-                message = ThreadMessage.assistant_with_actions(content, action_calls)
-            else:
-                message = ThreadMessage.assistant(content)
-        elif role in ("ActionResult", "action_result"):
-            message = ThreadMessage.action_result(
-                item.get("action_call_id", ""),
-                item.get("action_name", ""),
-                content,
-            )
-        else:
-            message = ThreadMessage.user(content)
-
-        messages.append(message)
-
-    return messages
-
-
-# ── 状态同步 ─────────────────────────────────────────────────
-
-def sync_runtime_state(thread: Thread, state: Optional[dict]) -> None:
-    """将运行时状态同步到线程"""
-    if state is None:
-        return
-
-    working_messages = state.get("working_messages")
-    if working_messages is not None:
-        messages = json_to_thread_messages(working_messages)
-        if messages is not None:
-            thread.internal_messages = messages
-            thread.updated_at = datetime.now(timezone.utc)
-
-
-def sync_visible_outcome(thread: Thread, outcome: ThreadOutcome) -> None:
-    """将可见结果同步到线程消息"""
-    if hasattr(outcome, 'response') and outcome.response is not None:
-        response = outcome.response
-        # 检查是否已经存在相同的助手消息
-        already_present = False
-        if thread.messages:
-            last_msg = thread.messages[-1]
-            if (last_msg.role == MessageRole.Assistant
-                    and last_msg.content == response):
-                already_present = True
-
-        if not already_present:
-            thread.add_message(ThreadMessage.assistant(response))
-
-
-def parse_outcome(result: dict) -> ThreadOutcome:
-    """将编排器的返回值解析为 ThreadOutcome"""
-    outcome = result.get("outcome", "completed")
-    if not isinstance(outcome, str):
-        outcome = "completed"
-
-    if outcome == "completed":
-        response = result.get("response")
-        return ThreadOutcome.Completed(
-            response=response if isinstance(response, str) else None,
-        )
-    elif outcome == "stopped":
-        return ThreadOutcome.Stopped()
-    elif outcome == "max_iterations":
-        return ThreadOutcome.MaxIterations()
-    elif outcome == "failed":
-        error = result.get("error", "未知错误")
-        return ThreadOutcome.Failed(
-            error=error if isinstance(error, str) else "未知错误",
-            debug_detail=None,
-        )
-    elif outcome == "gate_paused":
-        resume_kind_value = result.get("resume_kind", {})
-        resume_kind = ResumeKind.from_dict(resume_kind_value) if isinstance(resume_kind_value,
-                                                                            dict) else ResumeKind.Approval(
-            allow_always=False)
-
-        gate_name = result.get("gate_name", "unknown")
-        action_name = result.get("action_name", "")
-        call_id = result.get("call_id", "")
-        parameters = result.get("parameters", {})
-        resume_output = result.get("resume_output")
-        paused_lease = result.get("paused_lease")
-
-        return ThreadOutcome.GatePaused(
-            gate_name=gate_name if isinstance(gate_name, str) else "unknown",
-            action_name=action_name if isinstance(action_name, str) else "",
-            call_id=call_id if isinstance(call_id, str) else "",
-            parameters=parameters if isinstance(parameters, dict) else {},
-            resume_kind=resume_kind,
-            resume_output=resume_output,
-            paused_lease=paused_lease,
-        )
-    else:
-        return ThreadOutcome.Completed(response=None)
-
-
-def extract_string_arg(
-        args: List[Any],
-        kwargs: Dict[str, Any],
-        name: str,
-        position: int,
-) -> Optional[str]:
-    """从位置参数或关键字参数中提取字符串值
-
-    优先检查关键字参数，然后回退到位置参数
-    """
-    # 首先检查关键字参数
-    if isinstance(kwargs, dict) and name in kwargs:
-        val = kwargs[name]
-        if isinstance(val, str):
-            return val
-        return str(val) if val is not None else None
-
-    # 回退到位置参数
-    if position < len(args):
-        val = args[position]
-        if isinstance(val, str):
-            return val
-        return str(val) if val is not None else None
-
-    return None
-
-
-def extract_string_kwarg(kwargs: Dict[str, Any], name: str) -> Optional[str]:
-    """从关键字参数中提取字符串值"""
-    if isinstance(kwargs, dict) and name in kwargs:
-        val = kwargs[name]
-        if isinstance(val, str):
-            return val
-        return str(val) if val is not None else None
-    return None
-
-
-def extract_u64_kwarg(kwargs: Dict[str, Any], name: str) -> Optional[int]:
-    """从关键字参数中提取无符号整数值"""
-    if isinstance(kwargs, dict) and name in kwargs:
-        val = kwargs[name]
-        if isinstance(val, int) and val >= 0:
-            return val
-        if isinstance(val, float) and val >= 0 and val.is_integer():
-            return int(val)
-    return None

@@ -608,7 +608,7 @@ class ToolRegistry:
         需要 `Arc<Self>` 以便该工具能够在运行时向注册表查询其他工具的架构。
         请在 `register_builtin_tools()` 之后调用。
         """
-        from tools.builtin.tool_info import ToolInfoTool
+        from tools.builtin import ToolInfoTool
         tool = ToolInfoTool(self)
         self.register_sync(tool)
         logger.debug("已注册 tool_info 发现工具")

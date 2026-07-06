@@ -2,18 +2,18 @@
 #
 # 为所有引擎类型定义 CRUD 操作。主 crate 通过包装其双后端 `Database` 特质（PostgreSQL + libSQL）来实现它。
 
+from abc import ABC, abstractmethod
+from typing import Optional, List
+
+from ..types import is_shared_owner, shared_owner_candidates
 from ..types.capability import CapabilityLease, LeaseId
 from ..types.conversation import ConversationId, ConversationSurface
-from ..types.error import EngineError
 from ..types.event import ThreadEvent
-from ..types.memory import DocId, MemoryDoc
+from ..types.memory import DocId, DocType, MemoryDoc
 from ..types.mission import Mission, MissionId, MissionStatus
 from ..types.project import Project, ProjectId
 from ..types.step import Step
 from ..types.thread import Thread, ThreadId, ThreadState
-from ..types import is_shared_owner, shared_owner_candidates
-from abc import ABC, abstractmethod
-from typing import Optional, List
 
 
 class Store(ABC):
@@ -87,25 +87,25 @@ class Store(ABC):
 
     async def list_projects(self, user_id: str) -> List[Project]:
         """列出用户的项目"""
-        raise EngineError(f"Store: 未为用户 '{user_id}' 实现 list_projects")
+        raise RuntimeError(f"Store: 未为用户 '{user_id}' 实现 list_projects")
 
     async def list_all_projects(self) -> List[Project]:
         """列出所有项目"""
-        raise EngineError("Store: 未实现 list_all_projects")
+        raise RuntimeError("Store: 未实现 list_all_projects")
 
     # ── 对话操作 ─────────────────────────────
 
     async def save_conversation(self, conversation: ConversationSurface) -> None:
         """保存对话"""
-        raise EngineError(f"Store: 未为对话 '{conversation.id}' 实现 save_conversation")
+        raise RuntimeError(f"Store: 未为对话 '{conversation.id}' 实现 save_conversation")
 
     async def load_conversation(self, id: ConversationId) -> Optional[ConversationSurface]:
         """加载对话"""
-        raise EngineError(f"Store: 未为 '{id}' 实现 load_conversation")
+        raise RuntimeError(f"Store: 未为 '{id}' 实现 load_conversation")
 
     async def list_conversations(self, user_id: str) -> List[ConversationSurface]:
         """列出用户的对话"""
-        raise EngineError(f"Store: 未为用户 '{user_id}' 实现 list_conversations")
+        raise RuntimeError(f"Store: 未为用户 '{user_id}' 实现 list_conversations")
 
     # ── 记忆文档操作 ───────────────────────────────
 
@@ -295,10 +295,10 @@ class Store(ABC):
         """列出项目中所有线程，无论用户。
         用于：恢复、启动时的后台线程恢复
         """
-        raise EngineError(f"Store: 未为项目 '{project_id}' 实现 list_all_threads")
+        raise RuntimeError(f"Store: 未为项目 '{project_id}' 实现 list_all_threads")
 
     async def list_all_missions(self, project_id: ProjectId) -> List[Mission]:
         """列出项目中所有任务，无论用户。
         用于：cron 计时器、事件监听器、引导
         """
-        raise EngineError(f"Store: 未为项目 '{project_id}' 实现 list_all_missions")
+        raise RuntimeError(f"Store: 未为项目 '{project_id}' 实现 list_all_missions")

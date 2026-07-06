@@ -20,5 +20,4 @@ class HookEntry:
 
 @dataclass
 class HookRegistry:
-    pass
     hooks: RWLockList[HookEntry] = field(default_factory=RWLockList)

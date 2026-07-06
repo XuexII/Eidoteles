@@ -1349,7 +1349,7 @@ async def handle_with_engine_inner(
         # --------Step4.1: 验证content是否合法--------
         if not skip_empty_check:
 
-            validation = agent.safety().validate_input(content)
+            validation = agent.safety.validate_input(content)
             if not validation.is_valid:
                 details = "; ".join(
                     f"{e.field}: {e.message}" for e in validation.errors
@@ -1359,7 +1359,8 @@ async def handle_with_engine_inner(
                 )
 
         # --------Step4.2: 验证content否违反任何策略规则--------
-        violations = agent.safety().check_policy(content)
+        violations = agent.safety.check_policy(content)
+        from safety.policy import PolicyAction
         if any(rule.action == PolicyAction.Block for rule in violations):
             return BridgeOutcome.Respond(
                 "输入被安全策略拒绝。"
@@ -1370,7 +1371,7 @@ async def handle_with_engine_inner(
         # 扫描入站消息中的密钥（API 密钥、令牌）。
         # 在此处捕获它们可以防止大语言模型将其回显，
         # 否则会触发外发泄漏检测器并造成错误循环。
-        warning = agent.safety().scan_inbound_for_secrets(content)
+        warning = agent.safety.scan_inbound_for_secrets(content)
         if warning is not None:
             logger.warning(
                 "engine v2: 入站消息被阻止——包含泄漏的密钥, user_id=%s, channel=%s",
