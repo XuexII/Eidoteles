@@ -1,7 +1,7 @@
-# Memory
+# 记忆
 
-Long-term notes, decisions, and facts worth remembering across sessions.
+长期笔记、决策和值得跨会话记住的事实。
 
-The agent appends here during conversations. Curate periodically:
-remove stale entries, consolidate duplicates, keep it concise.
-This file is loaded into the system prompt, so brevity matters.
+智能体在对话过程中会追加内容到此文件。请定期整理：
+移除过时的条目、合并重复项、保持简洁。
+此文件会被加载到系统提示词中，因此简洁很重要。

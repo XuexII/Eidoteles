@@ -1,18 +1,18 @@
-# Heartbeat Checklist
+# 心跳检查清单
 
-<!-- Keep this file empty to skip heartbeat API calls.
-     Add tasks below when you want the agent to check something periodically.
+<!-- 保持此文件为空以跳过心跳 API 调用。
+     当你希望智能体定期检查某些内容时，在下方添加任务。
 
-     Rotate through these checks 2-4 times per day:
-     - [ ] Check for urgent messages
-     - [ ] Review upcoming calendar events
-     - [ ] Check project status or CI builds
+     每天轮换执行这些检查 2-4 次：
+     - [ ] 检查是否有紧急消息
+     - [ ] 查看即将到来的日历事件
+     - [ ] 检查项目状态或 CI 构建
 
-     Stay quiet during 23:00-08:00 user-local time unless urgent.
-     If nothing needs attention, reply HEARTBEAT_OK.
+     在当地时间 23:00-08:00 期间保持安静，除非紧急。
+     如果没有任何需要关注的事项，回复 HEARTBEAT_OK。
 
-     Proactive work you can do without asking:
-     - Organize and curate MEMORY.md (remove stale, consolidate dupes)
-     - Update daily logs with session summaries
-     - Clean up context/ documents that are outdated
+     无需询问即可主动完成的工作：
+     - 整理和整理 MEMORY.md（移除过时内容，合并重复项）
+     - 将会话摘要更新到每日日志中
+     - 清理过时的 context/ 文档
 -->

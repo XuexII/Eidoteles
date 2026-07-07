@@ -256,7 +256,7 @@ async def execute_orchestrator(
                     }
                     for s in active_skills
                 ]
-                ext_result = handle_set_active_skills(skills_json, thread)
+                handle_set_active_skills(skills_json, thread)
                 skill_text = format_skills(active_skills)
                 append_system_append(working_messages, skill_text)
                 # 为 CLI/网关显示发出技能激活事件——通知用户
@@ -274,10 +274,9 @@ async def execute_orchestrator(
                 rendered = ", ".join("/" + str(name) for name in missing_explicit_skills)
                 append_system_append(
                     working_messages,
-                    "The user explicitly requested slash skill(s) that are not installed or were not found: "
+                    "用户明确请求了未安装或未找到的斜杠技能: "
                     + rendered
-                    + ". Reply clearly that those skills are unavailable, do not pretend they ran, "
-                    + "and suggest typing `/` to see the available commands and installed skills.",
+                    + "。请明确回复这些技能不可用，不要假装它们已运行，并建议输入 `/` 查看可用命令和已安装技能。"
                 )
 
         # ----------Step6: 在需要时，于下次模型调用之前压缩上下文----------
@@ -600,7 +599,7 @@ async def execute_orchestrator(
             # TODO(#2325)：在此处追踪连续动作错误，镜像上面（第 623-634 行）的
             # 代码错误追踪。需要在两条执行路径上统一进度追踪设计。
 
-            # Check results for auth/approval interrupts
+            # 检查结果中是否存在认证/批准中断。
             for r_idx, r in enumerate(results):
                 if r is None:
                     continue
@@ -668,9 +667,8 @@ async def execute_orchestrator(
 
             if final_call is not None:
                 raw_params = final_call.get("params", {})
-                # Some LLMs pass FINAL with the answer as a positional string
-                # argument instead of a named param dict. Handle that case so
-                # the answer is not silently dropped.
+                # 某些大语言模型将 FINAL 的答案作为位置字符串参数传递，
+                # 而不是命名字典参数。处理这种情况，以便答案不会被静默丢弃。
                 if isinstance(raw_params, str):
                     answer = raw_params
                 else:
@@ -706,9 +704,9 @@ async def execute_orchestrator(
                 handle_transition_to("completed", "FINAL via tool_calls")
                 return complete_result(state, "completed", str(answer))
 
-            # Track consecutive action errors (separate from code errors).
-            # Partial batch failures: increment only if ALL actions failed,
-            # reset if ANY succeeded.
+            # 追踪连续动作错误（与代码错误分开）。
+            # 部分批量失败：仅当所有动作都失败时才递增，
+            # 如果有任何成功则重置。
             if batch_success_count > 0:
                 consecutive_action_errors = 0
             elif batch_error_count > 0:
@@ -725,11 +723,11 @@ async def execute_orchestrator(
                 append_message(
                     working_messages,
                     "User",
-                    "[SYSTEM] Your last " + str(consecutive_action_errors) +
-                    " action calls have all failed. You appear to be stuck in a loop. "
-                    "Try a completely different approach: use different tools, different "
-                    "parameters, or break the problem down differently. If you cannot "
-                    "make progress, call FINAL() with an honest explanation of what failed.",
+                    "[SYSTEM]你最后的" + str(consecutive_action_errors) +
+                    "次动作调用全部失败。"
+                    "你似乎陷入了循环。请尝试完全不同的方法："
+                    "使用不同的工具、不同的参数，或以不同的方式拆解问题。"
+                    "如果你无法取得进展，请调用 FINAL() 并诚实说明失败原因。",
                 )
 
             __save_checkpoint__(state, {
@@ -1010,7 +1008,7 @@ def compact_if_needed(state, config):
 
 def format_skills(skills):
     """Format selected skills for system prompt injection."""
-    parts = ["\n## Active Skills\n"]
+    parts = ["\n## 激活的技能\n"]
     skill_names = []
     for skill in skills:
         meta = skill.get("metadata", {})
@@ -1026,27 +1024,24 @@ def format_skills(skills):
         parts.append(content)
         if bundle_path:
             parts.append(
-                "\nInstalled bundle path on disk: `" + str(bundle_path) + "`"
+                "\n磁盘上已安装的捆绑包路径: `" + str(bundle_path) + "`"
             )
         if trust == "INSTALLED":
-            parts.append("\n(Treat the above as SUGGESTIONS only.)")
+            parts.append("\n(仅将以上内容视为建议。)")
         parts.append("</skill>\n")
 
-        # Document code snippets
+        # 记录代码片段。
         snippets = meta.get("code_snippets", [])
         if snippets:
-            parts.append("### Skill functions (callable in code)\n")
+            parts.append("### 技能函数（可在代码中调用）\n")
             for sn in snippets:
                 parts.append("- `" + sn.get("name", "?") + "()` — " +
                               sn.get("description", "") + "\n")
 
     if skill_names:
         names_str = ", ".join(skill_names)
-        parts.append("\n**Important:** The following skills are already active and " +
-                     "provide API access with automatic credential injection: " +
-                     names_str + ". Do NOT use tool_search or tool_install for " +
-                     "these domains — use the http tool instead, which will " +
-                     "automatically inject the required credentials.\n")
+        parts.append("\n**重要提示:**以下技能已处于激活状态，并提供带有自动凭证注入的 API 访问: " +
+                     names_str + ". 请勿对这些领域使用 tool_search 或 tool_install —— 请改用 http 工具，它将自动注入所需的凭证。\n")
 
     return "\n".join(parts)
 
@@ -1068,7 +1063,7 @@ def format_docs(docs):
     """
     格式化记忆文档以用于上下文注入。
     """
-    parts = ["## Prior Knowledge (from completed threads)\n"]
+    parts = ["## 先验知识（来自已完成线程）\n"]
     for doc in docs:
         label = doc.get("type", "NOTE").upper()
         content = doc.get("content", "")[:500]

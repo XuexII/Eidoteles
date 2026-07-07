@@ -41,20 +41,19 @@ workspace/
 4. **混合搜索**：通过 RRF 结合向量相似度与 BM25 全文搜索
 """
 
-
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 import logging
 from workspace.document import paths, MemoryDocument
+from db.base import Database
+from workspace.layer import MemoryLayer
+from workspace.search import SearchConfig
+import json
 
 logger = logging.getLogger(__name__)
 
 
-# 工作区为智能体提供基于数据库的记忆存储。
-
-# 每个工作区限定于一个用户（以及可选的智能体）。
-# 文档持久化到数据库并建立索引以供搜索。
-# 同时支持 PostgreSQL（通过 Repository）和 libSQL（通过 Database 特质）。
 @dataclass
 class Workspace:
     """
@@ -72,81 +71,233 @@ class Workspace:
     这实现了跨租户的读取访问（例如，用户同时从自己的工作区和“共享”工作区读取）。
     """
 
-    # 用户标识符（来自频道）。所有写入都进入此作用域
+    # 作用: 所有写操作的目标 scope，即"这个 workspace 属于谁"
+    # 设计原因: workspace 是按用户隔离的，写操作必须有一个明确的归属 scope，防止跨用户数据污染。
+    #          所有 write()、append()、delete() 都使用 user_id 作为数据库查询的 user_id 字段
     user_id: str
     # 读操作的用户标识符。包含 `user_id` 作为第一个元素，
     # 加上通过 `with_additional_read_scopes` 添加的任何额外作用域
-    read_user_ids: List[str] = field(default_factory=list)
-    # 可选的多代理隔离代理 ID
-    agent_id: Optional[str] = None
     # 数据库存储后端
-    storage: "WorkspaceStorage" = None
+    db: Database
+    # 作用：读操作（read()、search()、list_all()）可以跨越多个 scope。
+    # 第一个元素始终是 user_id，后续元素是通过 with_additional_read_scopes() 添加的额外 scope
+    # 设计原因：支持"共享工作区"场景——Alice 可以读取自己的文档，同时也能读取 shared scope 的团队文档，
+    # 但写操作仍然只写入 Alice 自己的 scope
+    read_user_ids: List[str] = field(default_factory=list)
+    # 作用：可选的 agent 隔离维度。当设置后，所有数据库查询都额外带上 agent_id 过滤条件，
+    # 实现同一用户下不同 agent 的数据隔离。
+    # 设计原因：多 agent 场景下（如 CEO assistant + 子 agent），
+    # 每个 agent 需要独立的 workspace 命名空间，
+    # 防止 agent A 的文档被 agent B 读到。默认为 None（单 agent 模式）
+    agent_id: Optional[str] = None
+
     # 语义搜索的嵌入提供者
     embeddings: Optional["EmbeddingProvider"] = None
-    # 由 `seed_if_empty()` 在新生成 BOOTSTRAP.md 时设置。
-    # 代理循环检查并清除此标志以发送主动问候
+    # 作用：一次性标志位。当 seed_if_empty() 为全新 workspace 创建了 BOOTSTRAP.md 时，
+    # 将此标志设为 true。agent loop 调用 take_bootstrap_pending()（原子 swap，读后清零）
+    # 检测到 true 时，发送主动问候消息。
+    #
+    # 设计原因：seed_if_empty() 和 agent loop 是异步解耦的，需要一个进程内信号来传递"这是全新用户，
+    # 需要发送欢迎语"这一事件，而不必再次查询数据库。
+    # 使用 AtomicBool 而非普通 bool 是因为 Workspace 在多个异步任务间共享（Arc<Workspace>）
     bootstrap_pending: bool = False
-    # 安全网：为 true 时，即使文件仍然存在，BOOTSTRAP.md 注入也被抑制。
-    # 从 `profile_onboarding_completed` 设置中设置
-    bootstrap_completed: bool = False
-    # 应用于所有查询的默认搜索配置
-    search_defaults: "SearchConfig" = field(default_factory=lambda: SearchConfig())
-    # 此工作区可访问的内存层
-    memory_layers: List["MemoryLayer"] = field(default_factory=list)
-    # 可选的共享层写入隐私分类器。
-    # 为 None 时，写入精确到达请求的位置 — 无静默重定向
-    privacy_classifier: Optional["PrivacyClassifier"] = None
-    # 为 true 时，系统提示包含来自 `__admin__` 作用域的管理员定义指令。
-    # 在多租户模式下由 `WorkspacePool` 设置
-    admin_prompt_enabled: bool = False
-    # 管理员系统提示的共享缓存。当为 `Some` 时，工作区从此缓存读取，
-    # 而不是在每个轮次都访问数据库。在多租户模式下由 `WorkspacePool` 填充
-    admin_prompt_cache: Optional[Any] = None  # Arc<RwLock<Option<String>>>
 
+    # 作用：安全网标志。当用户完成 onboarding（profile_onboarding_completed 设置被写入）后，此标志设为 true。
+    # 即使 BOOTSTRAP.md 文件仍然存在于数据库中，system_prompt_for_context_inner() 也会跳过注入，
+    # 防止重复触发首次运行仪式。
+    #
+    # 设计原因：LLM 可能完成了 onboarding 但忘记删除 BOOTSTRAP.md（或删除失败）。
+    # 这个标志提供了一个独立于文件存在性的"已完成"信号，避免用户每次对话都重复经历 onboarding 流程。
+    bootstrap_completed: bool = False
+    # 作用: 所有搜索查询的默认配置，包含
+
+    # 设计原因：搜索参数在全局配置（环境变量/数据库设置）中统一配置，而不是每次调用时传入。
+    # search() 直接使用 search_defaults，search_with_config() 允许覆盖。
+    # 这样运维人员可以通过配置调整搜索行为，无需修改代码。
+    search_defaults: SearchConfig = field(default_factory=lambda: SearchConfig())
+    # 作用：workspace 可访问的内存层列表。每个 MemoryLayer 有：
+    #   name：层名称（如 "private"、"household"、"finance"）
+    #   scope：对应的数据库 user_id（层的实际存储位置）
+    #   writable：是否可写
+    #   sensitivity：Private（私密）或 Shared（共享）
+
+    # 设计原因：支持家庭/团队场景，不同类型的数据存储在不同的逻辑层中。
+    # 例如，家庭 workspace 可以有 private（个人私密）和 household（家庭共享）两层，
+    # LLM 根据内容类型选择写入哪一层。默认只有一个 private 层。
+    memory_layers: List[MemoryLayer] = field(default_factory=list)
+    # 作用：可选的隐私分类器。当向 Shared 层写入时，分类器检测内容是否敏感（如医疗信息、电话号码）。
+    # 若敏感，自动将写操作重定向到 Private 层，防止私密信息泄漏到共享层。
+    #
+    # 设计原因：LLM 通过系统提示指导选择正确的层，但可能判断失误。
+    # 分类器作为安全网，在 LLM 误判时自动保护隐私。默认为 None（不启用），
+    # 因为正则分类器在家庭场景中误报率较高（"doctor"、"therapy" 等词不一定是私密内容）。
+    privacy_classifier: Optional["PrivacyClassifier"] = None
+    # 作用：多租户模式下，是否从 __admin__ scope 读取 SYSTEM.md 并注入系统提示。
+    # 由 WorkspacePool 在多租户模式下设置为 true。
+    #
+    # 设计原因：SaaS 部署场景中，管理员需要向所有用户的 LLM 注入统一的系统指令（如合规要求、品牌语调）。
+    # 通过 __admin__ 这个保留 scope（双下划线前缀防止与真实用户 ID 冲突）存储，
+    # 所有用户的 workspace 都能读取，但只有管理员能写入。
+    admin_prompt_enabled: bool = False
+    # 作用：多租户模式下，所有用户的 workspace 共享同一个 admin 系统提示缓存。
+    # WorkspacePool 创建一个 Arc<RwLock<Option<String>>> 并注入到每个用户的 workspace 中。
+    # 第一次读取时从数据库加载并写入缓存，后续直接从内存读取。
+    #
+    # 设计原因：多租户部署中，每次对话都从数据库读取 SYSTEM.md 会产生大量重复 I/O。
+    # 通过共享缓存，N 个并发用户只需一次数据库读取。使用 RwLock 允许多个读者并发，写者（缓存填充）独占
+    admin_prompt_cache: Optional[Any] = None
 
     def __post_init__(self):
         if not self.read_user_ids:
             self.read_user_ids = [self.user_id]
 
-    @classmethod
-    def new(cls, user_id: str, pool: Any) -> "Workspace":
-        """创建由 PostgreSQL 连接池支持的新工作区"""
-        user_id_str = user_id
-        memory_layers = MemoryLayer.default_for_user(user_id_str)
-        return cls(
-            user_id=user_id_str,
-            read_user_ids=[user_id_str],
-            agent_id=None,
-            storage=WorkspaceStorage.Repo(Repository(pool)),
-            embeddings=None,
-            bootstrap_pending=False,
-            bootstrap_completed=False,
-            search_defaults=SearchConfig(),
-            memory_layers=memory_layers,
-            privacy_classifier=None,
-            admin_prompt_enabled=False,
-            admin_prompt_cache=None,
-        )
+        self.memory_layers.append(MemoryLayer(self.user_id))
 
-    @classmethod
-    def new_with_db(cls, user_id: str, db: "Database") -> "Workspace":
-        """创建由任何 Database 实现支持的新工作区。用于 libSQL 或实现 Database trait 的任何其他后端"""
-        user_id_str = user_id
-        memory_layers = MemoryLayer.default_for_user(user_id_str)
-        return cls(
-            user_id=user_id_str,
-            read_user_ids=[user_id_str],
-            agent_id=None,
-            storage=WorkspaceStorage.Db(db),
-            embeddings=None,
-            bootstrap_pending=False,
-            bootstrap_completed=False,
-            search_defaults=SearchConfig(),
-            memory_layers=memory_layers,
-            privacy_classifier=None,
-            admin_prompt_enabled=False,
-            admin_prompt_cache=None,
-        )
+    async def read_primary(self, path: str) -> "MemoryDocument":
+        """从**仅主要作用域**读取文件，忽略额外的读作用域。
+        用于标识和配置文件（AGENTS.md、SOUL.md、USER.md、IDENTITY.md、TOOLS.md、BOOTSTRAP.md），
+        其中从另一个作用域继承内容将是正确性/安全问题"""
+        path = normalize_path(path)
+        return await self.db.get_document_by_path(self.user_id, self.agent_id, path)
+
+    async def seed_if_empty(self) -> int:
+        """播种工作区中任何缺失的核心标识文件
+
+        每次启动时调用。仅创建尚不存在的文件，因此用户编辑永远不会被覆盖。
+        返回创建的文件数（如果所有核心文件已存在则返回 0）
+        """
+
+        seed_files: List[Tuple[str, str]] = [
+            ("README.md", README_SEED),
+            ("MEMORY.md", MEMORY_SEED),
+            ("IDENTITY.md", IDENTITY_SEED),
+            ("SOUL.md", SOUL_SEED),
+            ("AGENTS.md", AGENTS_SEED),
+            ("USER.md", USER_SEED),
+            ("HEARTBEAT.md", HEARTBEAT_SEED),
+            ("TOOLS.md", TOOLS_SEED),
+            (".system/gateway/README.md", FRONTEND_SEED),
+        ]
+
+        # 在播种标识文件之前检查新鲜度，否则播种的文件会使工作区看起来不新鲜，
+        # BOOTSTRAP.md 永远不会被创建
+        is_fresh_workspace = False
+        try:
+            await self.read_primary("BOOTSTRAP.md")
+            # BOOTSTRAP 已存在
+        except Exception:
+            agents_res = None
+            soul_res = None
+            user_res = None
+            try:
+                agents_res = await self.read_primary("AGENTS.md")
+            except Exception:
+                pass
+            try:
+                soul_res = await self.read_primary("SOUL.md")
+            except Exception:
+                pass
+            try:
+                user_res = await self.read_primary("USER.md")
+            except Exception:
+                pass
+
+            is_fresh_workspace = (
+                    isinstance(agents_res, DocumentNotFoundError)
+                    and isinstance(soul_res, DocumentNotFoundError)
+                    and isinstance(user_res, DocumentNotFoundError)
+            )
+
+        count = 0
+        for path, content in seed_files:
+            # 跳过主要作用域中已存在的文件（永不覆盖用户编辑）。
+            # 使用 read_primary 以避免来自次要作用域的误报 —
+            # 另一个作用域中的文件不应抑制此作用域中的播种
+            try:
+                await self.read_primary(path)
+                continue
+            except Exception:
+                pass
+            except Exception as e:
+                logger.debug(f"检查 {path} 失败: {e}")
+                continue
+
+            try:
+                await self.write(path, content)
+                count += 1
+            except Exception as e:
+                logger.debug(f"播种 {path} 失败: {e}")
+
+        # 为卫生默认值播种文件夹级别的 .config 文档
+        config_seeds: list[tuple[str, dict]] = [
+            (
+                "daily/.config",
+                {
+                    "hygiene": {"enabled": True, "retention_days": 30},
+                    "skip_versioning": True,
+                },
+            ),
+            (
+                "conversations/.config",
+                {
+                    "hygiene": {"enabled": True, "retention_days": 7},
+                    "skip_versioning": True,
+                },
+            ),
+            (
+                ".system/gateway/.config",
+                {"skip_indexing": True},
+            ),
+        ]
+
+        for config_path, metadata_value in config_seeds:
+            try:
+                await self.read_primary(config_path)
+                continue  # 已存在，不覆盖
+            except DocumentNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug(f"检查 {config_path} 失败: {e}")
+                continue
+
+            # 创建带有元数据的空文档
+            try:
+                doc = await self.db.get_or_create_document_by_path(
+                    self.user_id, self.agent_id, config_path,
+                )
+                await self.db.update_document_metadata(doc.id, metadata_value)
+                count += 1
+            except Exception as e:
+                logger.debug(f"在 {config_path} 上设置元数据失败: {e}")
+
+        # BOOTSTRAP.md 仅在真正新鲜的工作区上播种（播种前不存在标识文件）
+        # 且尚不存在个人资料时（用户可能已有来自先前安装的个人资料，不需要引导）。
+        # 这防止现有用户在升级后获得虚假的首次运行仪式。
+        # 使用 read_primary() 以避免来自次要作用域的误报
+        has_profile = False
+        try:
+            doc = await self.read_primary("context/profile.json")
+            if doc.content.strip():
+                try:
+                    profile = json.loads(doc.content)
+                    if isinstance(profile, dict):
+                        has_profile = True
+                except json.JSONDecodeError:
+                    pass
+        except Exception:
+            pass
+
+        if is_fresh_workspace and not has_profile:
+            try:
+                await self.write("BOOTSTRAP.md", BOOTSTRAP_SEED)
+                self.bootstrap_pending = True
+                count += 1
+            except Exception as e:
+                logger.warning(f"播种 BOOTSTRAP.md 失败: {e}")
+
+        if count > 0:
+            logger.debug(f"播种了 {count} 个工作区文件")
+        return count
 
     def take_bootstrap_pending(self) -> bool:
         """如果 `seed_if_empty()` 为新工作区创建了 BOOTSTRAP.md 则返回 `True`（一次）。
@@ -175,7 +326,7 @@ class Workspace:
         return self
 
     def with_embeddings_cached(
-        self, provider: "EmbeddingProvider", cache_config: "EmbeddingCacheConfig"
+            self, provider: "EmbeddingProvider", cache_config: "EmbeddingCacheConfig"
     ) -> "Workspace":
         """使用自定义缓存配置设置嵌入提供者"""
         self.embeddings = CachedEmbeddingProvider(provider, cache_config)
@@ -271,7 +422,7 @@ class Workspace:
             user_id=user_id,
             read_user_ids=read_user_ids,
             agent_id=self.agent_id,
-            storage=self.storage.clone() if hasattr(self.storage, 'clone') else self.storage,
+            db=self.db.clone() if hasattr(self.db, 'clone') else self.db,
             embeddings=self.embeddings,
             bootstrap_pending=self.bootstrap_pending if preserve_flags else False,
             bootstrap_completed=self.bootstrap_completed if preserve_flags else False,
@@ -292,35 +443,28 @@ class Workspace:
         """按路径读取文件。返回文档（如果存在），如果未找到则返回错误"""
         path = normalize_path(path)
         if self.is_multi_scope() and is_identity_path(path):
-            return await self.storage.get_document_by_path(self.user_id, self.agent_id, path)
+            return await self.db.get_document_by_path(self.user_id, self.agent_id, path)
         elif self.is_multi_scope():
-            return await self.storage.get_document_by_path_multi(self.read_user_ids, self.agent_id, path)
+            return await self.db.get_document_by_path_multi(self.read_user_ids, self.agent_id, path)
         else:
-            return await self.storage.get_document_by_path(self.user_id, self.agent_id, path)
-
-    async def read_primary(self, path: str) -> "MemoryDocument":
-        """从**仅主要作用域**读取文件，忽略额外的读作用域。
-        用于标识和配置文件（AGENTS.md、SOUL.md、USER.md、IDENTITY.md、TOOLS.md、BOOTSTRAP.md），
-        其中从另一个作用域继承内容将是正确性/安全问题"""
-        path = normalize_path(path)
-        return await self.storage.get_document_by_path(self.user_id, self.agent_id, path)
+            return await self.db.get_document_by_path(self.user_id, self.agent_id, path)
 
     async def get_or_create(self, path: str) -> "MemoryDocument":
         """获取或创建给定路径的文档。如果不存在则创建空内容的文档。不触发重新索引或版本控制"""
         path = normalize_path(path)
-        return await self.storage.get_or_create_document_by_path(self.user_id, self.agent_id, path)
+        return await self.db.get_or_create_document_by_path(self.user_id, self.agent_id, path)
 
     async def update_metadata(self, id: uuid.UUID, metadata: dict) -> None:
         """按 ID 更新文档的元数据 JSON（完全替换）"""
-        await self.storage.update_document_metadata(id, metadata)
+        await self.db.update_document_metadata(id, metadata)
 
     async def prune_versions(self, document_id: uuid.UUID, keep_count: int) -> int:
         """修剪文档的旧版本，仅保留最近的 `keep_count` 个。返回删除的版本数"""
-        return await self.storage.prune_versions(document_id, keep_count)
+        return await self.db.prune_versions(document_id, keep_count)
 
     async def find_config_documents(self) -> List["MemoryDocument"]:
         """查找此工作区作用域中的所有 `.config` 文档"""
-        return await self.storage.find_config_documents(self.user_id, self.agent_id)
+        return await self.db.find_config_documents(self.user_id, self.agent_id)
 
     async def resolve_metadata(self, path: str) -> "DocumentMetadata":
         """解析主要作用域中文档路径的有效元数据。
@@ -332,14 +476,14 @@ class Workspace:
         path = normalize_path(path)
         doc_meta = None
         try:
-            doc = await self.storage.get_document_by_path(scope, self.agent_id, path)
+            doc = await self.db.get_document_by_path(scope, self.agent_id, path)
             doc_meta = doc.metadata
         except Exception:
             pass
 
         config_meta = None
         try:
-            configs = await self.storage.find_config_documents(scope, self.agent_id)
+            configs = await self.db.find_config_documents(scope, self.agent_id)
             config_meta = find_nearest_config(path, configs)
         except Exception:
             pass
@@ -351,18 +495,18 @@ class Workspace:
 
     async def list_versions(self, document_id: uuid.UUID, limit: int) -> List["VersionSummary"]:
         """列出文档的版本（最新的在前）"""
-        return await self.storage.list_versions(document_id, limit)
+        return await self.db.list_versions(document_id, limit)
 
     async def get_version(self, document_id: uuid.UUID, version: int) -> "DocumentVersion":
         """获取文档的特定版本"""
-        return await self.storage.get_version(document_id, version)
+        return await self.db.get_version(document_id, version)
 
     async def maybe_save_version(
-        self,
-        document_id: uuid.UUID,
-        current_content: str,
-        metadata: "DocumentMetadata",
-        changed_by: Optional[str] = None,
+            self,
+            document_id: uuid.UUID,
+            current_content: str,
+            metadata: "DocumentMetadata",
+            changed_by: Optional[str] = None,
     ) -> Optional[int]:
         """如果当前内容与最新版本不同，则保存为版本。返回新版本号，如果跳过则返回 None"""
         if not current_content:
@@ -372,22 +516,22 @@ class Workspace:
 
         hash_val = content_sha256(current_content)
         try:
-            versions = await self.storage.list_versions(document_id, 1)
+            versions = await self.db.list_versions(document_id, 1)
             if versions and versions[0].content_hash == hash_val:
                 return None
         except Exception:
             pass
 
-        return await self.storage.save_version(document_id, current_content, hash_val, changed_by)
+        return await self.db.save_version(document_id, current_content, hash_val, changed_by)
 
     async def patch(
-        self, path: str, old_string: str, new_string: str, replace_all: bool
+            self, path: str, old_string: str, new_string: str, replace_all: bool
     ) -> "PatchResult":
         """对工作区文档应用搜索替换补丁"""
         if not old_string:
             raise WorkspaceError(f"补丁失败: old_string 不能为空 (path={path})")
         path = normalize_path(path)
-        doc = await self.storage.get_document_by_path(self.user_id, self.agent_id, path)
+        doc = await self.db.get_document_by_path(self.user_id, self.agent_id, path)
 
         if old_string not in doc.content:
             raise WorkspaceError(f"补丁失败: 在文档中未找到 old_string (path={path})")
@@ -407,9 +551,9 @@ class Workspace:
             validate_content_against_schema(path, new_content, metadata.schema)
 
         await self.maybe_save_version(doc.id, doc.content, metadata, self.user_id)
-        await self.storage.update_document(doc.id, new_content)
+        await self.db.update_document(doc.id, new_content)
         await self.reindex_document_with_metadata(doc.id, metadata)
-        updated = await self.storage.get_document_by_id(doc.id)
+        updated = await self.db.get_document_by_id(doc.id)
         return PatchResult(document=updated, replacements=count)
 
     async def write(self, path: str, content: str) -> "MemoryDocument":
@@ -418,12 +562,12 @@ class Workspace:
         if is_system_prompt_file(path) and content:
             reject_if_injected(path, content)
 
-        doc = await self.storage.get_or_create_document_by_path(self.user_id, self.agent_id, path)
+        doc = await self.db.get_or_create_document_by_path(self.user_id, self.agent_id, path)
 
         if is_engine_runtime_path(path):
             # 一次性清理：删除在此守卫存在之前创建的任何块
             try:
-                await self.storage.delete_chunks(doc.id)
+                await self.db.delete_chunks(doc.id)
             except Exception:
                 pass
 
@@ -431,8 +575,8 @@ class Workspace:
                 return doc
             skip_meta = DocumentMetadata(skip_indexing=True, skip_versioning=True)
             await self.maybe_save_version(doc.id, doc.content, skip_meta, self.user_id)
-            await self.storage.update_document(doc.id, content)
-            return await self.storage.get_document_by_id(doc.id)
+            await self.db.update_document(doc.id, content)
+            return await self.db.get_document_by_id(doc.id)
 
         if doc.content == content:
             metadata = await self.resolve_metadata(path)
@@ -444,9 +588,9 @@ class Workspace:
             validate_content_against_schema(path, content, metadata.schema)
 
         await self.maybe_save_version(doc.id, doc.content, metadata, self.user_id)
-        await self.storage.update_document(doc.id, content)
+        await self.db.update_document(doc.id, content)
         await self.reindex_document_with_metadata(doc.id, metadata)
-        return await self.storage.get_document_by_id(doc.id)
+        return await self.db.get_document_by_id(doc.id)
 
     async def append(self, path: str, content: str) -> None:
         """追加内容到文件。如果不存在则创建。使用单个 `\\n` 分隔符"""
@@ -454,7 +598,7 @@ class Workspace:
         if is_system_prompt_file(path) and content:
             reject_if_injected(path, content)
 
-        doc = await self.storage.get_or_create_document_by_path(self.user_id, self.agent_id, path)
+        doc = await self.db.get_or_create_document_by_path(self.user_id, self.agent_id, path)
         new_content = content if not doc.content else f"{doc.content}\n{content}"
 
         if is_system_prompt_file(path) and new_content:
@@ -465,7 +609,7 @@ class Workspace:
             validate_content_against_schema(path, new_content, metadata.schema)
 
         await self.maybe_save_version(doc.id, doc.content, metadata, self.user_id)
-        await self.storage.update_document(doc.id, new_content)
+        await self.db.update_document(doc.id, new_content)
         await self.reindex_document_with_metadata(doc.id, metadata)
 
     async def exists(self, path: str) -> bool:
@@ -473,11 +617,11 @@ class Workspace:
         path = normalize_path(path)
         try:
             if self.is_multi_scope() and is_identity_path(path):
-                await self.storage.get_document_by_path(self.user_id, self.agent_id, path)
+                await self.db.get_document_by_path(self.user_id, self.agent_id, path)
             elif self.is_multi_scope():
-                await self.storage.get_document_by_path_multi(self.read_user_ids, self.agent_id, path)
+                await self.db.get_document_by_path_multi(self.read_user_ids, self.agent_id, path)
             else:
-                await self.storage.get_document_by_path(self.user_id, self.agent_id, path)
+                await self.db.get_document_by_path(self.user_id, self.agent_id, path)
             return True
         except DocumentNotFoundError:
             return False
@@ -485,32 +629,32 @@ class Workspace:
     async def delete(self, path: str) -> None:
         """删除文件。同时删除关联的块"""
         path = normalize_path(path)
-        await self.storage.delete_document_by_path(self.user_id, self.agent_id, path)
+        await self.db.delete_document_by_path(self.user_id, self.agent_id, path)
 
     async def list(self, directory: str) -> List["WorkspaceEntry"]:
         """列出路径中的文件和目录。返回直接子项（非递归）"""
         directory = normalize_directory(directory)
         if self.is_multi_scope():
-            primary = await self.storage.list_directory(self.user_id, self.agent_id, directory)
+            primary = await self.db.list_directory(self.user_id, self.agent_id, directory)
             all_entries = list(primary)
             for scope in self.read_user_ids[1:]:
-                entries = await self.storage.list_directory(scope, self.agent_id, directory)
+                entries = await self.db.list_directory(scope, self.agent_id, directory)
                 all_entries.extend(e for e in entries if not is_identity_path(e.path))
             return merge_workspace_entries(all_entries)
         else:
-            return await self.storage.list_directory(self.user_id, self.agent_id, directory)
+            return await self.db.list_directory(self.user_id, self.agent_id, directory)
 
     async def list_all(self) -> List[str]:
         """递归列出所有文件（所有路径的扁平列表）"""
         if self.is_multi_scope():
-            all_paths = await self.storage.list_all_paths(self.user_id, self.agent_id)
+            all_paths = await self.db.list_all_paths(self.user_id, self.agent_id)
             for scope in self.read_user_ids[1:]:
-                paths = await self.storage.list_all_paths(scope, self.agent_id)
+                paths = await self.db.list_all_paths(scope, self.agent_id)
                 all_paths.extend(p for p in paths if not is_identity_path(p))
             all_paths = sorted(set(all_paths))
             return all_paths
         else:
-            return await self.storage.list_all_paths(self.user_id, self.agent_id)
+            return await self.db.list_all_paths(self.user_id, self.agent_id)
 
     # ==================== 便捷方法 ====================
 
@@ -540,24 +684,24 @@ class Workspace:
         """读取或创建文件的辅助方法。多作用域读取时，在创建之前检查所有读作用域"""
         if self.is_multi_scope():
             try:
-                return await self.storage.get_document_by_path_multi(
+                return await self.db.get_document_by_path_multi(
                     self.read_user_ids, self.agent_id, path,
                 )
             except DocumentNotFoundError:
                 pass
-        return await self.storage.get_or_create_document_by_path(self.user_id, self.agent_id, path)
+        return await self.db.get_or_create_document_by_path(self.user_id, self.agent_id, path)
 
     # ==================== 内存操作 ====================
 
     async def append_memory(self, entry: str) -> None:
         """向主要的 MEMORY.md 文档追加条目。用于值得长期记住的重要事实、决策和偏好"""
-        doc = await self.storage.get_or_create_document_by_path(
+        doc = await self.db.get_or_create_document_by_path(
             self.user_id, self.agent_id, "MEMORY.md",
         )
         new_content = entry if not doc.content else f"{doc.content}\n\n{entry}"
         metadata = await self.resolve_metadata("MEMORY.md")
         await self.maybe_save_version(doc.id, doc.content, metadata, self.user_id)
-        await self.storage.update_document(doc.id, new_content)
+        await self.db.update_document(doc.id, new_content)
         await self.reindex_document_with_metadata(doc.id, metadata)
 
     async def append_daily_log(self, entry: str) -> None:
@@ -597,7 +741,7 @@ class Workspace:
                 return cached if cached else None
 
         try:
-            doc = await self.storage.get_document_by_path("__admin__", None, "SYSTEM.md")
+            doc = await self.db.get_document_by_path("__admin__", None, "SYSTEM.md")
             content = doc.content if doc.content else None
         except DocumentNotFoundError:
             content = None
@@ -610,7 +754,7 @@ class Workspace:
         return content
 
     async def system_prompt_for_context_inner(
-        self, is_group_chat: bool, tz: Optional[str] = None
+            self, is_group_chat: bool, tz: Optional[str] = None
     ) -> str:
         """系统提示构建的内部实现"""
         parts = []
@@ -756,4 +900,27 @@ class Workspace:
         return True
 
 
+def normalize_path(path: str) -> str:
+    """规范化文件路径（移除首尾斜杠，合并连续的 //）
 
+    Args:
+        path: 要规范化的文件路径
+
+    Returns:
+        规范化后的路径字符串
+    """
+    path = path.strip().strip('/')
+
+    # 合并连续的斜杠
+    result = []
+    last_was_slash = False
+    for c in path:
+        if c == '/':
+            if not last_was_slash:
+                result.append(c)
+            last_was_slash = True
+        else:
+            result.append(c)
+            last_was_slash = False
+
+    return ''.join(result)

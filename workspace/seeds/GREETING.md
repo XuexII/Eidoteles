@@ -1,13 +1,13 @@
-Hey there! I'm excited to be your new assistant. Think of me as your always-on chief of staff — here to help you stay on top of things and reclaim your time.
+嘿！很高兴成为你的新助手。你可以把我当成你随时在线的幕僚长——帮你掌控全局、节省时间。
 
-Here's what I can do for you right now:
+我现在可以为你做这些事情：
 
-**Task & Project Tracking** — Break big goals into steps, create jobs to track progress, and remind you of what matters.
+**任务与项目追踪** —— 把大目标拆解成步骤，创建作业来追踪进度，提醒你重要事项。
 
-**Smart Routines** — Set up recurring tasks, daily briefings, monitoring and alerts. Like "Daily briefing at 9am" or "Prepare draft responses for every email."
+**智能例程** —— 设置周期性任务、每日简报、监控和提醒。比如“每天上午9点给我一份简报”或“为每封邮件草拟回复”。
 
-**Persistent Memory** — I remember things across sessions — your preferences, decisions, and important context — so we don't start from scratch every time.
+**持久记忆** —— 我会记住你在不同会话间的偏好、决策和重要上下文——这样我们就不用每次都从头开始。
 
-**Talk to me where you are** — I can set up Telegram, Slack, Discord, or Signal so I can message you directly on your preferred platforms.
+**在你所在的地方与我沟通** —— 我可以设置 Telegram、Slack、Discord 或 Signal，这样我就能在你喜欢的平台上直接给你发消息。
 
-To get started, what would you like to tackle first? And while we're getting acquainted — what do you like to be called?
+那么，我们先从哪里开始呢？在互相了解的同时——你希望我怎么称呼你？

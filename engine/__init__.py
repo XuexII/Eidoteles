@@ -1,4 +1,4 @@
-# ── Re-exports: types ───────────────────────────────────────
+# ── Re-exports: ironclaw_types ───────────────────────────────────────
 
 from .types.capability import (
     ActionDef, ActionDiscoveryMetadata, ActionDiscoverySummary, ActionInventory, Capability,

@@ -67,12 +67,12 @@ from llm import user_signals_execution_intent
 from secrets.store import SecretsStore
 # 导入数据类型
 # bridge
-from types.bridge.bridge_outcome import (
+from ironclaw_types.bridge.bridge_outcome import (
     BridgeOutcome,
     BridgeRespondOutcome,
     BridgePendingOutcome
 )
-from types.gate.pending_gate_resolution import (
+from ironclaw_types.gate.pending_gate_resolution import (
     PendingGateResolution,
     PendingGateResolutionNone,
     PendingGateResolutionResolved,

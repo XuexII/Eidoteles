@@ -16,10 +16,142 @@ message处理步骤:
 """
 
 # ----------初始化----------
-# 初始化: llm
+# ----------初始化: init_tools----------
+safety = SafetyLayer(**self.config.safety)
+tools = ToolRegistry().with_engine_version(engine_version)
+# 注册内置工具
+tools.register_builtin_tools()
+# 注册 获取工具详情的工具
+tools.register_tool_info()
+# 查看所有工具列表和版本的 工具
+tools.register_system_tools()
 
-# 初始化工具
-AppBuilder.init_tools()
+embeddings = None
+workspace =  None
+builder = None
+credential_registry = SharedCredentialRegistry()
+http_interceptor = None
+workspace_resolver = None
+
+hooks = HookRegistry()
+agent_session_manager = AgentSessionManager().with_hooks(hooks)
+
+settings_store: Optional[SettingsStore] = None
+settings_cache: Optional[CachedSettingsStore] = None
+ownership_cache = OwnershipCache()
+
+# ----------初始化: init_extensions----------
+mcp_session_manager = McpSessionManager()
+mcp_process_manager = McpProcessManager()
+wasm_tool_runtime = None
+extension_manager = ExtensionManager()
+catalog = RegistryCatalog.load_or_embedded()
+catalog_entries = catalog.discovery_entries()
+# WASM 工具
+dev_loaded_tool_names = []
+
+
+skill_registry = None
+skill_catalog = None
+tools.register_skill_tools(skill_registry, skill_catalog)
+context_manager = ContextManager(self.config.agent.max_parallel_jobs)
+cost_guard = CostGuard(
+            CostGuardConfig(
+                max_cost_per_day_cents=self.config.agent.max_cost_per_day_cents,
+                max_actions_per_hour=self.config.agent.max_actions_per_hour,
+                max_cost_per_user_per_day_cents=self.config.agent.max_cost_per_user_per_day_cents,
+            )
+        )
+
+components = AppComponents(
+            config=self.config,
+            db=self.db,
+            secrets_store=self.secrets_store,
+            llm=llm,
+            cheap_llm=cheap_llm,
+            llm_reload=llm_reload,
+            safety=safety,
+            tools=tools,
+            embeddings=embeddings,
+            workspace=workspace,
+            settings_store=settings_store,
+            settings_cache=settings_cache,
+            extension_manager=extension_manager,
+            mcp_session_manager=mcp_session_manager,
+            mcp_process_manager=mcp_process_manager,
+            wasm_tool_runtime=wasm_tool_runtime,
+            log_broadcaster=self.log_broadcaster,
+            context_manager=context_manager,
+            hooks=hooks,
+            agent_session_manager=agent_session_manager,
+            skill_registry=skill_registry,
+            skill_catalog=skill_catalog,
+            cost_guard=cost_guard,
+            recording_handle=recording_handle,
+            http_interceptor=http_interceptor,
+            session=self.session,
+            catalog_entries=catalog_entries,
+            dev_loaded_tool_names=dev_loaded_tool_names,
+            builder=builder,
+            ownership_cache=ownership_cache,
+        )
+
+deps = AgentDeps(
+        owner_id=config.owner_id,
+        settings_store=components.settings_store,
+        store=components.db,
+        llm=components.llm,
+        cheap_llm=components.cheap_llm,
+        safety=components.safety,
+        tools=components.tools,
+        workspace=components.workspace,
+        extension_manager=components.extension_manager,
+        skill_registry=components.skill_registry,
+        skill_catalog=components.skill_catalog,
+        skills_config=config.skills,
+        hooks=components.hooks,
+        auth_manager=auth_manager,
+        cost_guard=components.cost_guard,
+        sse_tx=sse_manager,
+        http_interceptor=http_interceptor,
+        transcription=(
+            ironclaw_llm.transcription.TranscriptionMiddleware(config.transcription.create_provider())
+            if config.transcription.create_provider() is not None
+            else None
+        ),
+        document_extraction=ironclaw.document_extraction.DocumentExtractionMiddleware(),
+        sandbox_readiness=(
+            ironclaw.agent.routine_engine.SandboxReadiness.DisabledByConfig
+            if not config.sandbox.enabled or docker_status == ironclaw.sandbox.DockerStatus.Disabled
+            else ironclaw.agent.routine_engine.SandboxReadiness.Available
+            if docker_status.is_ok()
+            else ironclaw.agent.routine_engine.SandboxReadiness.DockerUnavailable
+        ),
+        builder=components.builder,
+        llm_backend=config.llm.backend,
+        tenant_rates=ironclaw.tenant.TenantRateRegistry(
+            config.agent.max_llm_concurrent_per_user or 4,
+            config.agent.max_jobs_concurrent_per_user or 3
+        ),
+        # 在配置加载时由Config::with_runtime_overrides解析。
+        # 调度器通过tool_definitions_visible_under(policy)路由面向模型的工具列表，
+        # 以便在模型调用之前隐藏配置文件不可能的功能
+        # （例如在多租户托管下的提供者主机shell）。（#3045 PR 4 + PR 5）。
+        runtime_policy=config.runtime.effective_policy if config.runtime.effective_policy else None
+    )
+
+# 创建代理
+agent = Agent(
+    config.agent,
+    deps,
+    channels,
+    config.heartbeat,
+    config.hygiene,
+    config.routines,
+    components.context_manager,
+    session_manager
+)
+
 
 # ----------初始化V2----------
 # 初始化: LlmBridgeAdapter
@@ -35,13 +167,11 @@ from bridge.effect_adapter import EffectBridgeAdapter
 from tools.registry import ToolRegistry
 from safety import SafetyLayer
 
-tools = ToolRegistry()
-safety = SafetyLayer()
 effect_adapter = EffectBridgeAdapter(
-            tools,
-            safety,
+            agent.tools,
+            agent.safety,
             agent.hooks,
-        )
+        ).with_global_auto_approve(agent.config().auto_approve_tools)
 # 初始化: HybridStore
 # 作用: 基于工作区的持久化；知识文档使用 frontmatter+markdown 以提升人类可读性。
 from bridge.store_adapter import HybridStore

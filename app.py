@@ -1,23 +1,41 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Dict, Union, Optional, Tuple
+
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any, Tuple
+
+from agent.session_manager import SessionManager as AgentSessionManager
 from channels.web.log_layer import LogBroadcaster
 from config import Config
-from llm import LlmProvider, RecordingLlm, SessionManager, build_provider_chain
-from dataclasses import dataclass
-from pathlib import Path
-import logging
-import asyncio
-from db import Database
+from context import ContextManager
+from db import (Database, UserStore, SettingsStore)
+from db.cached_settings import CachedSettingsStore
+from extensions import ExtensionManager
+from hooks import HookRegistry
+from secrets import SecretsStore
 from tools import ToolRegistry
-import asyncio
-import logging
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from tools.mcp import (McpProcessManager, McpSessionManager)
+from tools.wasm import SharedCredentialRegistry
+from tools.wasm import WasmToolRuntime
+from workspace import Workspace
+from embeddings import (EmbeddingCacheConfig, EmbeddingProvider)
+from llm.recording import HttpInterceptor
+from llm import (LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager)
+from safety import SafetyLayer
+from skills.registry import SkillRegistry
+from skills.catalog import SkillCatalog
+
+from channels.web.log_layer import LogBroadcaster
+from config import Config
+from agent.cost_guard import CostGuard
+from extensions import RegistryEntry
+from tools import SoftwareBuilder
+from ownership import OwnershipCache
+from tools.tool import EngineVersion
+from tools.builtin.memory import WorkspaceResolver
 
 logger = logging.getLogger(__name__)
-
 
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -39,7 +57,9 @@ class AppComponents:
     llm_reload: Optional[LlmReloadHandle] = None
     safety: SafetyLayer = None
     tools: ToolRegistry = None
+    # 嵌入向量提供者
     embeddings: Optional[EmbeddingProvider] = None
+    # 工作区文件系统
     workspace: Optional[Workspace] = None
     # 工作区支持的 `SettingsStore` 适配器，将设置双重写入
     # 遗留的 `settings` 表和 `.system/settings/**` 工作区文档。
@@ -47,13 +67,18 @@ class AppComponents:
     # 只需要 `SettingsStore` 的使用者（权限工具、SIGHUP 重载处理器）
     # 应优先使用此接口而非原始的 `db`，以便运行时设置写入
     # 通过工作区流动并获得模式验证。
+    # 设置存储
     settings_store: Optional[SettingsStore] = None
     # 用于 `flush()` / `invalidate_user()` 的具体缓存句柄。
     # 当缓存处于活动状态时，与 `settings_store` 是同一实例。
     settings_cache: Optional[CachedSettingsStore] = None
+    # 扩展管理器
     extension_manager: Optional[ExtensionManager] = None
+    # MCP会话管理器
     mcp_session_manager: McpSessionManager = None
+    # MCP进程管理器
     mcp_process_manager: McpProcessManager = None
+    # WASM工具运行时
     wasm_tool_runtime: Optional[WasmToolRuntime] = None
     log_broadcaster: LogBroadcaster = None
     context_manager: ContextManager = None
@@ -81,14 +106,6 @@ class AppBuilderFlags:
     控制可选初始化阶段的选项。
     """
     no_db: bool = False  # 默认为 False，表示启用数据库
-
-
-
-@dataclass
-class AppBuilderFlags:
-    """AppBuilder 的标志。"""
-    no_db: bool = False
-    # 其他标志根据需要添加
 
 
 @dataclass
@@ -125,9 +142,9 @@ class AppBuilder:
         self.db = db
 
     def with_database_and_handles(
-        self,
-        db: Database,
-        handles: DatabaseHandles,
+            self,
+            db: Database,
+            handles: DatabaseHandles,
     ) -> None:
         """
         注入预创建的数据库**和**匹配的后端特定句柄，
@@ -355,7 +372,7 @@ class AppBuilder:
             self.install_ephemeral_secrets_store(reason)
 
     async def init_llm(
-        self,
+            self,
     ) -> Tuple[LlmProvider, Optional[LlmProvider], Optional[RecordingLlm], LlmReloadHandle]:
         """
         阶段 3：初始化 LLM 提供者链。
@@ -370,9 +387,9 @@ class AppBuilder:
         return llm, cheap_llm, recording_handle, reload_handle
 
     async def init_tools(
-        self,
-        llm: LlmProvider,
-        cheap_llm: Optional[LlmProvider],
+            self,
+            llm: LlmProvider,
+            cheap_llm: Optional[LlmProvider],
     ) -> Tuple[
         SafetyLayer,
         ToolRegistry,
@@ -386,12 +403,12 @@ class AppBuilder:
         """
         阶段 4：初始化安全层、工具、嵌入和工作区。
         """
-        from safety import SafetyLayer
-        safety = SafetyLayer(self.config.safety)
+        safety = SafetyLayer(**self.config.safety)
         logger.debug("安全层已初始化")
 
         # 使用凭证注入支持初始化工具注册表
         credential_registry = SharedCredentialRegistry()
+
         engine_version = EngineVersion.V2 if is_engine_v2_enabled() else EngineVersion.V1
         registry = ToolRegistry().with_engine_version(engine_version)
         if self.db is not None:
@@ -437,6 +454,7 @@ class AppBuilder:
         # 如果数据库可用，注册内存工具
         workspace_user_id = self.config.owner_id
         workspace: Optional[Workspace] = None
+
         workspace_resolver: Optional[WorkspaceResolver] = None
         if self.db is not None:
             emb_cache_config = EmbeddingCacheConfig(
@@ -518,7 +536,7 @@ class AppBuilder:
         # 如果启用，注册构建器工具
         builder = None
         if self.config.builder.enabled and (
-            self.config.agent.allow_local_tools or not self.config.sandbox.enabled
+                self.config.agent.allow_local_tools or not self.config.sandbox.enabled
         ):
             builder = await tools.register_builder_tool(
                 llm, self.config.builder.to_builder_config()
@@ -537,11 +555,11 @@ class AppBuilder:
         )
 
     async def init_extensions(
-        self,
-        tools: ToolRegistry,
-        hooks: HookRegistry,
-        settings_store_override: Optional[SettingsStore],
-        ownership_cache: OwnershipCache,
+            self,
+            tools: ToolRegistry,
+            hooks: HookRegistry,
+            settings_store_override: Optional[SettingsStore],
+            ownership_cache: OwnershipCache,
     ) -> Tuple[
         McpSessionManager,
         McpProcessManager,
@@ -703,7 +721,7 @@ class AppBuilder:
         # register_builder_tool() 已在内部调用 register_dev_tools()，
         # 因此仅当构建器尚未执行时才在此处注册。
         builder_registered_dev_tools = self.config.builder.enabled and (
-            self.config.agent.allow_local_tools or not self.config.sandbox.enabled
+                self.config.agent.allow_local_tools or not self.config.sandbox.enabled
         )
         if self.config.agent.allow_local_tools and not builder_registered_dev_tools:
             tools.register_dev_tools()
@@ -718,9 +736,9 @@ class AppBuilder:
         )
 
     async def _load_wasm_tools(
-        self,
-        tools: ToolRegistry,
-        wasm_tool_runtime: Optional[WasmToolRuntime],
+            self,
+            tools: ToolRegistry,
+            wasm_tool_runtime: Optional[WasmToolRuntime],
     ) -> List[str]:
         """加载 WASM 工具。"""
         dev_loaded_tool_names: List[str] = []
@@ -761,9 +779,9 @@ class AppBuilder:
         return dev_loaded_tool_names
 
     async def _load_mcp_servers(
-        self,
-        mcp_session_manager: McpSessionManager,
-        mcp_process_manager: McpProcessManager,
+            self,
+            mcp_session_manager: McpSessionManager,
+            mcp_process_manager: McpProcessManager,
     ) -> List[Tuple[str, Any]]:
         """加载 MCP 服务器。"""
         try:

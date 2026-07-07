@@ -234,7 +234,7 @@ class QueryParam:
 
 # 凭据在 HTTP 请求中的注入位置。
 #
-# 与 src/secrets/types.rs 中的 CredentialLocation 一一对应，
+# 与 src/secrets/ironclaw_types.rs 中的 CredentialLocation 一一对应，
 # 但定义在此处以便 ironclaw_skills 保持独立于主 crate。
 # 转换在注册时在 src/skills/mod.rs 中进行。
 SkillCredentialLocation = Bearer | BasicAuth | Header | QueryParam

@@ -920,8 +920,8 @@ class EffectBridgeAdapter(EffectExecutor):
         )
 
     async def available_actions(
-            self, leases: List[Any], context: Any
-    ) -> List[Any]:
+            self, leases: List[Any], context: ThreadExecutionContext
+    ) -> List[ActionDef]:
         """列出可用动作"""
         inventory = await self.available_action_inventory(leases, context)
         return inventory.inline
@@ -960,7 +960,7 @@ class EffectBridgeAdapter(EffectExecutor):
             self,
             leases: List[CapabilityLease],
             context: ThreadExecutionContext
-    ) -> List[Any]:
+    ) -> List[CapabilitySummary]:
         """列出能力后台摘要"""
         auth_manager = self.auth_manager
         extensions = await self.fetch_extension_list(auth_manager, context)

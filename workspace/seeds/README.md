@@ -1,19 +1,18 @@
-# Workspace
+# 工作区
 
-This is your agent's persistent memory. Files here are indexed for search
-and used to build the agent's context.
+这是你的智能体的持久化记忆。此处的文件会被建立索引以供搜索，并用于构建智能体的上下文。
 
-## Structure
+## 结构
 
-- `MEMORY.md` - Long-term curated notes (loaded into system prompt)
-- `IDENTITY.md` - Agent name, vibe, personality
-- `SOUL.md` - Core values and behavioral boundaries
-- `AGENTS.md` - Session routine and operational instructions
-- `USER.md` - Information about you (the user)
-- `TOOLS.md` - Environment-specific tool notes
-- `HEARTBEAT.md` - Periodic background task checklist
-- `daily/` - Automatic daily session logs
-- `context/` - Additional context documents
+- `MEMORY.md` —— 长期整理笔记（加载到系统提示词中）
+- `IDENTITY.md` —— 智能体名称、风格、个性
+- `SOUL.md` —— 核心价值观和行为边界
+- `AGENTS.md` —— 会话例程和操作指令
+- `USER.md` —— 关于你（用户）的信息
+- `TOOLS.md` —— 特定环境工具说明
+- `HEARTBEAT.md` —— 周期性后台任务检查清单
+- `daily/` —— 自动生成的每日会话日志
+- `context/` —— 额外上下文文档
 
-Edit these files to shape how your agent thinks and acts.
-The agent reads them at the start of every session.
+编辑这些文件以塑造你的智能体的思维和行为方式。
+智能体在每次会话开始时都会读取它们。

@@ -48,7 +48,7 @@ class ToolTier(Enum):
     层级完全有序：`ReadOnly < Stateful < Privileged < Administrative`。
     [`LeasePlanner`] 使用此排序来决定为每个 [`ThreadType`] 授予哪些动作
 
-    [`ThreadType`]: crate::types::thread::ThreadType
+    [`ThreadType`]: crate::ironclaw_types::thread::ThreadType
     """
     # 只读，无副作用（echo、time、json、memory_search、memory_read）
     ReadOnly = 1

@@ -1,8 +1,8 @@
-# User Context
+# 用户上下文
 
-- **Name:**
-- **Timezone:**
-- **Preferences:**
+- **姓名：**
+- **时区：**
+- **偏好：**
 
-The agent will fill this in as it learns about you.
-You can also edit this directly to provide context upfront.
+智能体会在了解你的过程中逐步填充此内容。
+你也可以直接编辑此文件以预先提供上下文信息。

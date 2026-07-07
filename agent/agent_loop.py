@@ -1706,12 +1706,12 @@ class Agent:
         运行Agent主循环
         """
         # 提前初始化 v2 引擎，以便网关 API 端点能够在首条聊天消息到达之前提供数据（项目、任务、对话线程）。
-        # if self.config.engine_v2:
-        #     import bridge
-        #     try:
-        #         await bridge.init_engine(self)
-        #     except Exception as e:
-        #         logger.debug(f"engine v2: 初始化失败: {e}")
+        if self.config.engine_v2:
+            from bridge.router import init_engine
+            try:
+                await init_engine(self)
+            except Exception as e:
+                logger.debug(f"engine v2: 初始化失败: {e}")
 
         # 启动消息接受通道。返回的是asyncio.Queue()
         message_stream = await self.channels.start_all()

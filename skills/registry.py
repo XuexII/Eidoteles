@@ -22,6 +22,7 @@ from pathlib import Path, PurePath
 from typing import Optional, List, Dict, Set, Tuple, Any
 from enum import Enum
 import logging
+from skills.parser import ParsedSkill
 
 logger = logging.getLogger(__name__)
 
@@ -627,7 +628,7 @@ def _normalize_install_content(
 ) -> Tuple[str, str]:
     """规范化安装内容"""
     try:
-        parsed = _parse_skill_md(normalized_content)
+        parsed = parse_skill_md(normalized_content)
         return (parsed.manifest.name, normalized_content)
     except SkillRegistryError as e:
         if "InvalidName" in str(e):
@@ -653,7 +654,210 @@ def _normalize_install_content(
         raise
 
 
-def _parse_skill_md(content: str) -> Any:
+def find_closing_delimiter(content: str) -> Optional[int]:
+    """在单独的行上找到闭合 `---` 分隔符的位置。
+    返回 `content` 中 `---` 行开头的字符偏移量。
+
+    遍历每一行，当找到只包含 `---`（去除空白后）的行时，
+    返回该行在内容中的起始字符偏移量。
+
+    Args:
+        content: 要搜索的字符串内容
+
+    Returns:
+        闭合 `---` 分隔符的字符偏移量，如果未找到则返回 None
+    """
+    pos = 0
+    for line in content.split('\n'):
+        if line.strip() == "---":
+            return pos
+        pos += len(line) + 1  # +1 用于换行符
+    return None
+
+
+def warn_on_legacy_requires(yaml_str: str, skill_name: str) -> None:
+    """如果存在旧的 `metadata.openclaw.requires` 形状则发出警告。
+
+    新的扁平 `requires:` 字段替代了它；YAML 解析器会静默丢弃旧的嵌套键，
+    因此没有此警告，技能作者可能认为门控有效而它完全无效。
+
+    Args:
+        yaml_str: YAML frontmatter 字符串
+        skill_name: 技能名称
+    """
+    if has_legacy_metadata_openclaw_requires(yaml_str):
+        logger.warning(
+            f"技能 '{skill_name}' 使用了旧的 `metadata.openclaw.requires` frontmatter 形状，"
+            f"该形状被忽略。将要求移到顶层 `requires:` 块（包含 `bins`、`env`、`config`、`skills`），"
+            f"以便门控和依赖声明生效。"
+        )
+
+
+def has_legacy_metadata_openclaw_requires(yaml_str: str) -> bool:
+    """检测旧的 `metadata.openclaw.requires` SKILL.md frontmatter 形状。
+    当存在旧形状时返回 True。
+
+    当反序列化为 `SkillManifest` 时，解析器会静默丢弃这些嵌套字段，
+    因此没有此检查，技能作者可能认为他们的门控/依赖要求得到遵守，
+    而它们完全无效。
+
+    Args:
+        yaml_str: YAML frontmatter 字符串
+
+    Returns:
+        如果存在旧的 `metadata.openclaw.requires` 形状则返回 True
+    """
+    try:
+        import yaml
+        raw = yaml.safe_load(yaml_str)
+        if not isinstance(raw, dict):
+            return False
+        metadata = raw.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        openclaw = metadata.get("openclaw")
+        if not isinstance(openclaw, dict):
+            return False
+        return "requires" in openclaw
+    except Exception:
+        return False
+
+
+# 用于验证技能名称的正则表达式：字母数字、连字符、下划线、点。
+# 必须以字母数字开头，总长度 1-64 个字符
+_SKILL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def validate_skill_name(name: str) -> bool:
+    """根据允许的模式验证技能名称。
+
+    技能名称必须以字母数字字符开头，只能包含字母数字、点、连字符和下划线，
+    总长度在 1 到 64 个字符之间。
+
+    Args:
+        name: 要验证的技能名称
+
+    Returns:
+        如果名称有效则返回 True，否则返回 False
+    """
+    return bool(_SKILL_NAME_PATTERN.match(name))
+
+
+
+# 用于验证技能版本的正则表达式：字母数字、点、连字符、加号、下划线、波浪号。
+# 长度 1-32 个字符
+_SKILL_VERSION_PATTERN = re.compile(r"^[a-zA-Z0-9._\-+~]{1,32}$")
+
+
+def validate_skill_version(version: str) -> bool:
+    """验证技能版本字符串。参见 [`SKILL_VERSION_PATTERN`]。
+
+    版本字符串只能包含字母数字、点、连字符、加号、下划线和波浪号，
+    长度在 1 到 32 个字符之间。
+
+    Args:
+        version: 要验证的版本字符串
+
+    Returns:
+        如果版本有效则返回 True，否则返回 False
+    """
+    return bool(_SKILL_VERSION_PATTERN.match(version))
+
+
+
+def parse_skill_md_impl(content: str, validate_name: bool = True) -> "ParsedSkill":
+    """解析 SKILL.md 文件的内部实现
+
+    Args:
+        content: SKILL.md 文件的原始内容
+        validate_name: 是否验证技能名称
+
+    Returns:
+        解析后的技能对象
+
+    Raises:
+        SkillParseError: 当解析失败时
+    """
+    # 在解析之前规范化行尾以处理 CRLF（调用者可能尚未预规范化）。
+    # 这也使得 `find_closing_delimiter` 的字符偏移算术正确，
+    # 因为它假定单字符 `\n` 分隔符
+    content = content.replace('\r\n', '\n').replace('\r', '\n')
+
+    # 剥离可选的 UTF-8 BOM
+    content = content.lstrip('\ufeff')
+
+    # 找到第一个 `---` 分隔符（必须在第 1 行）
+    trimmed = content.lstrip('\n\r')
+    if not trimmed.startswith("---"):
+        raise RuntimeError()
+
+    # 找到第二个 `---` 分隔符
+    after_first = trimmed[3:]
+    # 跳过第一个 `---` 行的其余部分（包括任何尾随字符/换行）
+    newline_pos = after_first.find('\n')
+    if newline_pos == -1:
+        raise RuntimeError()
+
+    after_first_line = after_first[newline_pos + 1:]
+
+    # 在单独的行上找到闭合的 `---`
+    yaml_end = find_closing_delimiter(after_first_line)
+    if yaml_end is None:
+        raise RuntimeError()
+
+    yaml_str = after_first_line[:yaml_end]
+
+    # 解析 YAML frontmatter
+    try:
+        import yaml as yaml_lib
+        manifest_data = yaml_lib.safe_load(yaml_str)
+        if not isinstance(manifest_data, dict):
+            raise RuntimeError()
+    except Exception as e:
+        raise RuntimeError()
+
+    # 构建 SkillManifest 对象
+    manifest = build_manifest_from_yaml(manifest_data)
+
+    # 检测旧的 `metadata.openclaw.requires` 形状并发出警告。
+    # 新的扁平 `requires:` 字段替代了它；YAML 解析器会静默丢弃旧的嵌套键，
+    # 因此没有此警告，技能作者可能认为门控有效而它完全无效
+    warn_on_legacy_requires(yaml_str, manifest.name)
+
+    # 验证技能名称
+    if validate_name and not validate_skill_name(manifest.name):
+        raise RuntimeError()
+
+    # 验证技能版本。编排器将此值直接插值到 XML 属性
+    # （`<skill version="...">`）中，因此我们拒绝任何可能跳出属性的字符串
+    if not validate_skill_version(manifest.version):
+        raise RuntimeError()
+
+    # 强制执行激活标准限制
+    if hasattr(manifest.activation, 'enforce_limits'):
+        manifest.activation.enforce_limits()
+
+    # 强制执行门控要求限制（目前只有 `requires.skills` 被限制以保持
+    # 链安装器的队列有界）
+    if hasattr(manifest.requires, 'enforce_limits'):
+        manifest.requires.enforce_limits()
+
+    # 提取提示内容（闭合 `---` 行之后的所有内容）
+    after_yaml = after_first_line[yaml_end:]
+    # 跳过 `---` 行本身
+    prompt_start = after_yaml.find('\n')
+    if prompt_start == -1:
+        prompt_start = len(after_yaml)
+    else:
+        prompt_start += 1
+    prompt_content = after_yaml[prompt_start:].lstrip('\n')
+
+    if not prompt_content.strip():
+        raise RuntimeError()
+
+    return ParsedSkill(manifest=manifest, prompt_content=prompt_content)
+
+def parse_skill_md(content: str) -> ParsedSkill:
     """解析 SKILL.md 内容"""
     # 简单实现：分割 frontmatter 和内容
     lines = content.split('\n')
@@ -683,7 +887,7 @@ def _parse_skill_md(content: str) -> Any:
 
 def _parse_skill_md_for_install_recovery(content: str) -> Any:
     """解析 SKILL.md 用于安装恢复"""
-    return _parse_skill_md(content)
+    return parse_skill_md(content)
 
 
 def _normalize_skill_identifier(name: str) -> Optional[str]:
@@ -756,7 +960,7 @@ def _build_loaded_skill(
         normalized_content: str, error_label: str, trust: SkillTrust, source: SkillSource
 ) -> Tuple[str, LoadedSkill]:
     """从规范化内容解析、验证、门控检查和构建 LoadedSkill"""
-    parsed = _parse_skill_md(normalized_content)
+    parsed = parse_skill_md(normalized_content)
     manifest = parsed.manifest
     prompt_content = getattr(parsed, 'prompt_content', '')
 
@@ -791,10 +995,10 @@ def _build_loaded_skill(
         lowercased_tags=[t.lower() for t in tags],
     )
 
-    return (name, skill)
+    return name, skill
 
 
-async def load_and_validate_skill(
+def load_and_validate_skill(
         path: Path, trust: SkillTrust, source: SkillSource
 ) -> Tuple[str, LoadedSkill]:
     """从磁盘加载和验证单个 SKILL.md 文件"""
@@ -827,3 +1031,12 @@ def compute_hash(content: str) -> str:
     hasher = hashlib.sha256()
     hasher.update(content.encode('utf-8'))
     return f"sha256:{hasher.hexdigest()}"
+
+if __name__ == '__main__':
+    path = Path(r"D:\jazz\projects\privateProjects\Eidoteles\delegation.md")
+    trust = SkillTrust.Trusted
+    source = SkillSource.Workspace(path)
+    name, skill = load_and_validate_skill(
+        path, trust, source
+)
+    print()
