@@ -744,6 +744,112 @@ async def execute_orchestrator(
 
 
 # ----------辅助函数----------
+def action_calls_to_python_json(calls: List[ActionCall]) -> List[dict]:
+    """将 `ActionCall` 列表序列化为 Python 交换形状
+
+    序列化失败时（对于 String + String + Value 基本上不可能发生，
+    但如果 `parameters` 树中包含序列化失败的键，仍然是可能的），
+    该条目会被从输出中**丢弃**而不是替换为 `null`。
+    之前的 `unwrap_or_else(|_| null)` 会损坏数组 — Python 的
+    `default.py` 对每个条目访问 `c.get("name")` / `c.get("call_id")` /
+    `c.get("params")`，因此 `null` 会因 Python `AttributeError` 崩溃
+    并丢失整个 LLM 步骤。`filter_map` 产生更短的数组，Python 的
+    工具结果循环可以正确处理，因为它针对缩短的调用列表迭代
+    `range(len(results))`。保留警告日志，以便操作员在触发时有线索
+    """
+    result = []
+    for c in calls:
+        try:
+            value = {
+                "name": c.action_name,
+                "call_id": c.id,
+                "params": c.parameters,
+            }
+            result.append(value)
+        except Exception as e:
+            logger.warning(
+                f"为 Python 编排器序列化 ActionCall 失败 — 丢弃条目: "
+                f"action_name={c.action_name}, error={e}"
+            )
+    return result
+
+def build_orchestrator_inputs(
+        thread: Thread,
+        persisted_state: dict,
+) -> tuple:
+    """构建注入到编排器 Python 中的上下文变量"""
+    names = ["context", "goal", "actions", "state", "config"]
+
+    # 构建编排器引导上下文。当存在内部执行转录时优先使用它，
+    # 否则回退到用户可见的转录
+    bootstrap_messages = (
+        thread.internal_messages if thread.internal_messages
+        else thread.messages
+    )
+
+    context = []
+    for m in bootstrap_messages:
+        # 通过 Python 交换形状（`{name, call_id, params}`）序列化 action_calls，
+        # 以便引导上下文与 `python_json_to_action_calls` 往返兼容。
+        # 在此处使用裸 `m.action_calls` 会产生规范的 Rust serde 格式
+        # （`{action_name, id, parameters}`），Python 编排器会在下一次
+        # `__llm_complete__` 调用中原样传回 — 然后 `python_json_to_action_calls`
+        # 会因"缺少字段 `name`"而失败，使每个后续工具结果成为孤儿。
+        # 这是将 action_calls 输入 Python 工作转录的第二个代码路径
+        # （在 `handle_llm_complete` 之后）；两者必须使用相同的形状
+        calls_json = None
+        if hasattr(m, 'action_calls') and m.action_calls:
+            calls_json = action_calls_to_python_json(m.action_calls)
+
+        context.append({
+            "role": str(m.role),
+            "content": m.content,
+            "action_name": m.action_name if hasattr(m, 'action_name') else None,
+            "action_call_id": m.action_call_id if hasattr(m, 'action_call_id') else None,
+            "action_calls": calls_json,
+        })
+
+    # 构建配置
+    config = {
+        # 最大迭代次数: 限制 LLM 调用的总次数，防止无限循环
+        "max_iterations": thread.config.max_iterations,
+        # 当前步数
+        "step_count": thread.step_count,
+        # 最大工具意图提示次数: 限制提示消息的注入次数，避免无限循环
+        "max_tool_intent_nudges": thread.config.max_tool_intent_nudges,
+        # 是否启用工具意图提示: 当 LLM 说"我会搜索"但没有实际调用工具时，自动注入提示消息
+        "enable_tool_intent_nudge": thread.config.enable_tool_intent_nudge,
+        # 是否要求尝试执行动作: 强制 LLM 必须调用工具，不能只返回文本
+        "require_action_attempt": thread.config.require_action_attempt,
+        # 最大动作要求提示次数: 限制"请调用工具"提示的注入次数
+        "max_action_requirement_nudges": thread.config.max_action_requirement_nudges,
+        # 最大连续错误次数: 连续出现指定次数错误后终止线程
+        "max_consecutive_errors": thread.config.max_consecutive_errors,
+        # 最大总 token 数: 限制整个线程使用的 token 总量（输入+输出）
+        "max_tokens_total": thread.config.max_tokens_total,
+        # 最大预算: 限制整个线程的 USD 成本
+        "max_budget_usd": thread.config.max_budget_usd,
+        # 模型上下文限制: LLM 模型的最大上下文窗口大小，用于触发压缩
+        "model_context_limit": thread.config.model_context_limit,
+        # 是否启用压缩: 当上下文超过阈值时自动压缩历史消息
+        "enable_compaction": thread.config.enable_compaction,
+        # 压缩阈值: 当上下文达到模型限制的 85% 时触发压缩
+        "compaction_threshold": thread.config.compaction_threshold,
+        # 当前递归深度: 当前线程在递归调用树中的深度（0 为根线程）
+        "depth": thread.config.depth,
+        # 最大递归深度: 限制 rlm_query() 的最大递归深度，防止无限递归
+        "max_depth": thread.config.max_depth,
+    }
+
+    values = [
+        context,
+        thread.goal,
+        [],  # 动作通过 __get_actions__ 动态加载
+        persisted_state if persisted_state else {},
+        config,
+    ]
+
+    return (names, values)
 
 def format_output(result, max_chars=8000):
     """Format code execution result for the next LLM context message."""
