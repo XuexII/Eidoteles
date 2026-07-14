@@ -88,50 +88,72 @@ class AgentDeps:
     # 实例的已解析持久所有者范围
     owner_id: str = ""
     # 可选的数据库句柄
+    # <rust>db::Database</rust>
     store: Optional[Database] = None
-    # 缓存的设置存储
+    # 持久化用户偏好和配置，提供用户配置，决定使用哪个 LLM 和是否启用沙箱
+    # <rust>db::SettingsStore</rust>
     settings_store: Optional[SettingsStore] = None
     # LLM 提供商
+    # <rust>ironclaw_llm::LlmProvider</rust>
     llm: Optional[LlmProvider] = None
     # 廉价/快速 LLM 提供商
+    # <rust>ironclaw_llm::LlmProvider</rust>
     cheap_llm: Optional[LlmProvider] = None
     # 安全层
+    # <rust>ironclaw_safety::SafetyLayer</rust>
     safety: Optional[SafetyLayer] = None
     # 工具注册表
+    # <rust>tools::ToolRegistry</rust>
     tools: Optional[ToolRegistry] = None
     # 可选的工作空间
+    # <rust>workspace::Workspace</rust>
     workspace: Optional[Workspace] = None
-    # 可选的扩展管理器
+    # 管理 WASM 和 MCP 扩展的生命周期，包括加载、卸载和状态管理。
+    # <rust>extensions::ExtensionManager</rust>
     extension_manager: Optional[ExtensionManager] = None
     # 可选的技能注册表
+    # <rust>ironclaw_skills::SkillRegistry</rust>
     skill_registry: Optional[SkillRegistry] = None
-    # 可选的技能目录: ironclaw_skills::catalog::SkillCatalog
+    # 使用内存缓存提高搜索性能
+    # <rust>ironclaw_skills::catalog::SkillCatalog</rust>
     skill_catalog: Optional[SkillCatalog] = None
-    # 技能配置
+    # 配置技能系统的行为，包括扫描目录、深度限制等。
+    # <rust>config::SkillsConfig</rust>
     skills_config: Optional[SkillsConfig] = None
-    # 钩子注册表
+    # 在消息入站、工具调用、响应出站时执行自定义逻辑
+    # <rust>hooks::HookRegistry</rust>
     hooks: Optional[HookRegistry] = None
-    # 可选的认证管理器
+    # 检查天气 API 是否需要认证，处理 OAuth 流程
+    # <rust>auth::extension::AuthManager</rust>
     auth_manager: Optional[AuthManager] = None
-    # 成本强制护栏
+    # 跟踪每日预算和每小时调用速率
+    # <rust>agent::cost_guard::CostGuard</rust>
     cost_guard: Optional[CostGuard] = None
-    # SSE 管理器
+    # 将 Agent 执行过程中的状态变化实时推送到前端，实现流式响应体验
+    # <rust>channels::web::sse::SseManager</rust>
     sse_tx: Optional[SseManager] = None
-    # HTTP 拦截器
+    # 拦截 HTTP 请求，用于测试录制/回放、请求重写等场景
+    # <rust>ironclaw_llm::recording::HttpInterceptor</rust>
     http_interceptor: Optional[HttpInterceptor] = None
     # 音频转录中间件
+    # <rust>ironclaw_llm::transcription::TranscriptionMiddleware</rust>
     transcription: Optional[TranscriptionMiddleware] = None
     # 文档文本提取中间件
+    # <rust>document_extraction::DocumentExtractionMiddleware</rust>
     document_extraction: Optional[DocumentExtractionMiddleware] = None
-    # 沙箱就绪状态
+    # 指示 Docker 沙箱是否可用，决定任务执行方式
+    # <rust>agent::routine_engine::SandboxReadiness</rust>
     sandbox_readiness: Optional[SandboxReadiness] = None
-    # 软件构建器
+    # 如果没有现成的天气工具，自动构建一个新工具
+    # <rust>crate::tools::SoftwareBuilder</rust>
     builder: Optional[SoftwareBuilder] = None
     # LLM 后端标识符
     llm_backend: str = ""
-    # 按租户的速率限制注册表
+    # 为每个租户提供独立的速率限制
+    # <rust>tenant::TenantRateRegistrye</rust>
     tenant_rates: Optional[TenantRateRegistry] = None
-    # 已解析的运行时策略
+    # 确保工具只能访问授权的外部服务，防止安全漏洞
+    # <rust>ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy</rust>
     runtime_policy: Optional[EffectiveRuntimePolicy] = None
 
 
@@ -142,17 +164,16 @@ class Agent:
     Attributes:
         config: 代理配置。
         deps: 代理依赖项。
-        channels: 频道管理器。
-        context_manager: 上下文管理器。
-        scheduler: 调度器。
-        router: 路由器。
-        session_manager: 会话管理器。
-        context_monitor: 上下文监视器。
-        heartbeat_config: 可选的心跳配置。
-        hygiene_config: 可选的卫生配置。
-        routine_config: 可选的例程配置。
+        channels: 接收来自 Web Gateway 的消息并聚合到统一流
+        context_manager: 创建作业上下文并跟踪状态
+        scheduler: 检查容量并分发任务
+        router: 分类意图，判断这是用户输入而非命令
+        session_manager: 获取或创建会话和线程
+        context_monitor: 监控上下文token数量，必要时触发压缩
+        heartbeat_config: 配置心跳检查，定期监控系统健康
+        hygiene_config: 配置工作空间清理策略
+        routine_config: 配置定时任务引擎的行为
         routine_engine_slot: 共享的例程引擎插槽，用于内部事件匹配和将引擎暴露给网关/手动触发入口点。
-        mission_manager_slot: 引擎 v2 任务管理器，用于触发学习任务（在引擎初始化后设置）。
     """
 
     def __init__(
@@ -167,6 +188,7 @@ class Agent:
             session_manager: Optional[SessionManager] = None
     ):
         # 初始化配置和基本组件
+        # <rust>config::AgentConfig</rust>
         self.config = config
         self.deps = deps
         self.channels = channels
@@ -215,18 +237,17 @@ class Agent:
         self.router = Router()
 
         self.context_monitor = ContextMonitor()
-
+        # <rust>config::HeartbeatConfig</rust>
         self.heartbeat_config = heartbeat_config
-
+        # <rust>config::HygieneConfig</rust>
         self.hygiene_config = hygiene_config
-
+        # <rust>config::RoutineConfig</rust>
         self.routine_config = routine_config
 
         # 共享的例程引擎插槽
+        # <rust>agent::routine_engine::RoutineEngine</rust>
         self.routine_engine_slot = None  # 对应 RwLock<Option<Arc<RoutineEngine>>>
 
-        # 引擎 v2 任务管理器插槽
-        self.mission_manager_slot = None  # 对应 RwLock<Option<Arc<MissionManager>>>
 
     @property
     def owner_id(self) -> str:
