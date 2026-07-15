@@ -995,447 +995,430 @@ class Agent:
                     path, e,
                 )
 
-    async def handle_message(self, message: IncomingMessage) -> HandleOutcomeType:
-        """
-        处理传入消息的主入口点。
+    async def handle_message(self, message):
+        """处理传入消息的主入口，保持与 Rust 实现相同的逻辑结构。"""
 
-        对应 Rust:
-        """
-        # 为故障排除在调试级别记录敏感详细信息
         logger.debug(
-            "消息详情: message_id=%s, user_id=%s, channel=%s, thread_id=%s",
-            message.id, message.user_id, message.channel, message.thread_id,
+            f"消息详情: message_id={message.id}, user_id={message.user_id}, "
+            f"channel={message.channel}, thread_id={message.thread_id}"
         )
 
-        # 内部消息（例如作业监控通知）已经是渲染后的文本，
-        # 应直接转发给用户，不进入常规的用户输入管道（LLM/工具循环）。
-        # is_internal 字段和 into_internal() 设置器是 pub(crate) 的，
-        # 因此外部渠道无法伪造此标志。
+        # 内部消息直接转发
         if message.is_internal:
-            logger.debug(
-                "转发内部消息: message_id=%s, channel=%s",
-                message.id, message.channel,
-            )
+            logger.debug(f"转发内部消息: message_id={message.id}, channel={message.channel}")
             return HandleOutcome.Respond(OutgoingResponse.text(message.content))
 
-        # 设置本轮的消息工具上下文（当前频道和目标）
-        # 对于 Signal，使用来自元数据的 signal_target（group:ID 或电话号码），
-        # 否则回退到 user_id
-        target = message.routing_target or message.user_id
-        # ------Step1: 设置Agent可见的内置工具------
-        await self.tools.set_message_tool_context(message.channel, target)
+        # 设置本轮的工具上下文
+        target = message.routing_target() or message.user_id
+        await self.tools().set_message_tool_context(message.channel, target)
 
-        # ------Step2: 解析提交类型------
-        submission = message.structured_submission or SubmissionParser.parse(message.content)
-        logger.log(TRACE, "[agent_loop] 已解析提交: %s", type(submission).__name__)
+        # 解析提交类型
+        submission = (
+            message.structured_submission.clone()
+            if message.structured_submission is not None
+            else SubmissionParser.parse(message.content)
+        )
+        logger.debug(f"[agent_loop] 解析的提交: {type(submission).__name__}")
 
-        # 引擎 V2 早期降级：当没有待处理的审批门控或认证流程时，
-        # 将裸关键词 ApprovalResponse 降级为 UserInput。
-        # 在 BeforeInbound 钩子检查之前完成，以便降级后的消息经过完整的 UserInput 管道。
-        # 仅适用于 engine_v2，因为遗留路径需要会话/线程状态（尚未解析）来确定 AwaitingApproval。
-        if (
-                self.config.engine_v2
-                and isinstance(submission, Submission.ApprovalResponse)
-                and not message.content.strip().startswith('/')
-        ):
-            has_pending = (
-                    await has_pending_auth(message.user_id)
-                    or await has_any_pending_gate(message.user_id, message.conversation_scope())
-            )
-            if not has_pending:
-                submission = Submission.UserInput(content=message.content)
-
-        # 钩子：BeforeInbound — 允许钩子修改或拒绝用户输入
-        # ------Step3: 允许拦截恶意内容或修改用户消息------
-        if isinstance(submission, Submission.UserInput):
+        # BeforeInbound 钩子：允许修改或拒绝用户输入
+        if isinstance(submission, UserInput):
             content = submission.content
             event = HookEvent.Inbound(
                 user_id=message.user_id,
                 channel=message.channel,
                 content=content,
-                thread_id=message.thread_id,
+                thread_id=str(message.thread_id) if message.thread_id else None,
             )
-            hook_result = await self.hooks.run(event)
-
-            if isinstance(hook_result, HookError.Rejected):
-                # 对应 Rust: Err(HookError::Rejected { reason }) => { ... }
-                return HandleOutcome.Respond(
-                    OutgoingResponse.text(f"[消息被拒绝: {hook_result.reason}]")
-                )
-
+            hook_result = await self.hooks().run(event)
             if isinstance(hook_result, HookError):
-                # 对应 Rust: Err(err) => { ... }
+                if hasattr(hook_result, 'rejected') and hook_result.rejected:
+                    return HandleOutcome.Respond(
+                        OutgoingResponse.text(f"[消息被拒绝: {hook_result.reason}]")
+                    )
+                else:
+                    return HandleOutcome.Respond(
+                        OutgoingResponse.text(f"[消息被钩子策略阻止: {hook_result}]")
+                    )
+            elif (
+                    isinstance(hook_result, HookOutcome)
+                    and hook_result.type == "Continue"
+                    and hook_result.modified is not None
+            ):
+                submission = UserInput(content=hook_result.modified)
+
+        # 拒绝不再支持的提交
+        match submission:
+            case ExternalCallback():
                 return HandleOutcome.Respond(
-                    OutgoingResponse.text(f"[消息被钩子策略阻止: {hook_result}]")
+                    OutgoingResponse.text("错误: 不再支持外部回调")
                 )
-
-            if isinstance(hook_result, HookOutcome.Continue) and hook_result.modified is not None:
-                # 对应 Rust: Ok(HookOutcome::Continue { modified: Some(new_content) }) => { ... }
-                submission = Submission.UserInput(content=hook_result.modified)
-
-        # 引擎 V2 路由（策略 C：并行部署）。
-        # 桥接处理程序返回 BridgeOutcome，直接映射到 HandleOutcome ——
-        # 门控状态编码在返回类型中，而不是事后查询。
-        # ------Step4: 处理消息------
-        # ------Step4-1: 重定向到handle_with_engine进行处理，而不是v1 agentic loop------
-        if self.config.engine_v2:
-            if isinstance(submission, Submission.UserInput):
-                outcome = await handle_with_engine(self, message, submission.content)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.ApprovalResponse):
-                if await has_pending_auth(message.user_id):
-                    outcome = await handle_with_engine(self, message, message.content)
-                    return HandleOutcome.from_bridge_outcome(outcome)
-                outcome = await handle_approval(self, message, submission.approved, submission.always)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.ExecApproval):
-                outcome = await handle_exec_approval(
-                    self, message, submission.request_id, submission.approved, submission.always,
-                )
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.ExternalCallback):
-                outcome = await handle_external_callback(
-                    self, message, submission.request_id, submission.payload,
-                )
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.GateAuthResolution):
-                outcome = await handle_auth_gate_resolution(
-                    self, message, submission.request_id, submission.resolution,
-                )
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.Interrupt):
-                outcome = await handle_interrupt(self, message)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.NewThread):
-                outcome = await handle_new_thread(self, message)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.Clear):
-                outcome = await handle_clear(self, message)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.Expected):
-                outcome = await handle_expected(self, message, submission.description)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            elif isinstance(submission, Submission.PairingClaim):
-                outcome = await handle_pairing_claim(self, message, submission.channel, submission.code)
-                return HandleOutcome.from_bridge_outcome(outcome)
-
-            # Undo/Redo/Resume/SwitchThread: v1-only（引擎没有撤销；线程切换通过 ConversationManager 隐式处理）。
-            # Compact/Summarize/Suggest: 与引擎正交（压缩是内部的）。
-            # Heartbeat/SystemCommand/JobStatus/JobCancel/Quit: v1 基础设施。
-
-        # V2-only 结构化提交必须在遗留路径上进行任何会话/线程解析之前失败。
-        # 否则，精心构造的请求可以在返回预期的 ENGINE_V2 错误之前
-        # 通过 conversation_scope 切换活跃线程。
-        # 对应 Rust: if !self.config.engine_v2 { match submission { ... } }
-        if not self.config.engine_v2:
-            if isinstance(submission, Submission.ExternalCallback):
+            case GateAuthResolution():
                 return HandleOutcome.Respond(
-                    OutgoingResponse.text("错误: 外部回调需要 ENGINE_V2")
+                    OutgoingResponse.text("错误: 不再支持认证门控解析")
                 )
-            if isinstance(submission, Submission.GateAuthResolution):
-                return HandleOutcome.Respond(
-                    OutgoingResponse.text("错误: 认证门控解析需要 ENGINE_V2")
-                )
+            case _:
+                pass
 
-        # 如果是不在内存中的历史线程，则从数据库恢复线程
-        # 对应 Rust: if let Some(external_thread_id) = message.conversation_scope() { ... }
+        # 从 DB 水合历史线程
         external_thread_id = message.conversation_scope()
         if external_thread_id is not None:
-            logger.log(TRACE, "从数据库恢复线程: message_id=%s, thread_id=%s", message.id, external_thread_id)
+            logger.debug(
+                f"从数据库水合线程: message_id={message.id}, thread_id={external_thread_id}"
+            )
             rejection = await self.maybe_hydrate_thread(message, external_thread_id)
             if rejection is not None:
                 return HandleOutcome.Respond(OutgoingResponse.text(f"错误: {rejection}"))
 
-        # 解析会话和线程。审批提交允许通过 UUID 跨频道
-        # 定位已加载的所属线程，以便 web 审批 UI 可以审批源自 HTTP/其他
-        # 所有者范围频道的作业。
+        # 解析审批线程 UUID
         approval_thread_uuid = None
-        if isinstance(submission, (Submission.ExecApproval, Submission.ApprovalResponse,
-                                   Submission.ExternalCallback, Submission.GateAuthResolution)):
+        if isinstance(submission, (ExecApproval, ApprovalResponse, ExternalCallback, GateAuthResolution)):
             scope = message.conversation_scope()
             if scope is not None:
                 try:
                     approval_thread_uuid = uuid.UUID(scope)
                 except ValueError:
-                    approval_thread_uuid = None
+                    pass
 
+        # 解析 session 和 thread_id
         if approval_thread_uuid is not None:
-            # 对应 Rust: let session = self.session_manager.get_or_create_session(&message.user_id).await;
             session = await self.session_manager.get_or_create_session(message.user_id)
-
-            async with session.lock:
-                if approval_thread_uuid in session.threads:
-                    thread = session.threads[approval_thread_uuid]
-
-                    # 阻止在没有待处理审批时进行 ExecApproval（来自审批 UI 的 JSON）
-                    # —— 防止通过 UUID 劫持线程。
-                    if thread.pending_approval is None and isinstance(submission, Submission.ExecApproval):
+            async with session.lock() as sess:
+                if approval_thread_uuid in sess.threads:
+                    thread = sess.threads[approval_thread_uuid]
+                    # 无挂起审批时阻止 ExecApproval
+                    if thread.pending_approval is None and isinstance(submission, ExecApproval):
                         logger.warning(
-                            "阻止了对没有待处理审批的线程的审批: thread_id=%s, channel=%s",
-                            approval_thread_uuid, message.channel,
+                            f"阻止对无挂起审批线程的审批: thread_id={approval_thread_uuid}"
                         )
                         return HandleOutcome.Respond(
-                            OutgoingResponse.text("错误: 此线程没有待处理的审批")
+                            OutgoingResponse.text("错误: 此线程上没有挂起的审批")
                         )
-
-                    # 如果有待处理审批，检查跨频道授权
+                    # 有挂起审批时检查跨频道授权
                     if thread.pending_approval is not None:
                         authorized = is_approval_authorized(
-                            thread.source_channel, message.channel,
+                            thread.source_channel, message.channel
                         )
                         if not authorized:
                             logger.warning(
-                                "阻止了跨频道审批尝试: thread_id=%s, source_channel=%s, approval_channel=%s",
-                                approval_thread_uuid, thread.source_channel, message.channel,
+                                f"阻止跨频道审批: thread_id={approval_thread_uuid}"
                             )
                             return HandleOutcome.Respond(
-                                OutgoingResponse.text("错误: 审批未授权此频道")
+                                OutgoingResponse.text("错误: 此频道未授权审批")
                             )
-
-                    session.active_thread = approval_thread_uuid
-                    session.last_active_at = datetime.now(timezone.utc)
-
-                else:
-                    session, approval_thread_uuid = await self.session_manager.resolve_thread_with_parsed_uuid(
-                        message.user_id, message.channel, message.conversation_scope(), approval_thread_uuid,
-                    )
+                    sess.active_thread = approval_thread_uuid
+                    sess.last_active_at = datetime.now(timezone.utc)
+                # endif
+            await self.session_manager.register_thread(
+                message.user_id, message.channel, approval_thread_uuid, session,
+            )
+            thread_id = approval_thread_uuid
         else:
-            # 对应 Rust: else { self.session_manager.resolve_thread(...).await }
             session, thread_id = await self.session_manager.resolve_thread(
                 message.user_id, message.channel, message.conversation_scope(),
             )
-            if approval_thread_uuid is None:
-                thread_id = thread_id
-            else:
-                thread_id = approval_thread_uuid
 
-        logger.debug(
-            "已解析会话和线程: message_id=%s, thread_id=%s",
-            message.id, thread_id,
-        )
+        logger.debug(f"已解析会话和线程: message_id={message.id}, thread_id={thread_id}")
 
-        # 认证模式拦截：如果线程正在等待令牌，将消息直接路由到凭据存储。
-        # 不接触日志、回合、历史或压缩。
-        # 对应 Rust: let pending_auth = { let sess = session.lock().await; sess.threads.get(&thread_id).and_then(|t| t.pending_auth.clone()) };
-        async with session.lock:
-            thread = session.threads.get(thread_id)
-            pending_auth = thread.pending_auth.clone() if thread is not None else None
+        # 认证模式拦截
+        async with session.lock() as sess:
+            t = sess.threads.get(thread_id)
+            pending_auth = t.pending_auth.clone() if t and t.pending_auth else None
 
         if pending_auth is not None:
             if pending_auth.is_expired():
-                # TTL 已超 —— 清除过期的认证模式
-                logger.warning(
-                    "认证模式在 TTL 后过期，正在清除: extension=%s",
-                    pending_auth.extension_name,
-                )
-                async with session.lock:
-                    thread = session.threads.get(thread_id)
-                    if thread is not None:
-                        thread.pending_auth = None
-
-                if isinstance(submission, Submission.UserInput):
+                logger.warning(f"认证模式过期: extension={pending_auth.extension_name}")
+                async with session.lock() as sess:
+                    if thread_id in sess.threads:
+                        sess.threads[thread_id].pending_auth = None
+                if isinstance(submission, UserInput):
                     return HandleOutcome.Respond(
                         OutgoingResponse.text(
-                            f"对 **{pending_auth.extension_name}** 的认证已过期。请重试。"
+                            f"**{pending_auth.extension_name}** 的认证已过期。请重试。"
                         )
                     )
+                # 控制提交继续正常处理
             else:
-                if isinstance(submission, Submission.UserInput):
-                    result = await self.process_auth_token(
+                if isinstance(submission, UserInput):
+                    legacy_result = await self.process_auth_token(
                         message, pending_auth, submission.content, session, thread_id,
                     )
-                    return HandleOutcome.from_legacy(result)
-
-                # 任何控制提交（中断、撤销等）都会取消认证模式
-                async with session.lock:
-                    thread = session.threads.get(thread_id)
-                    if thread is not None:
-                        thread.pending_auth = None
-
-        logger.log("收到来自 %s 在 %s 的消息（%d 字符）", message.user_id, message.channel, len(message.content))
-
-        # 检查例程引擎事件触发器
-        # 对应 Rust: if !message.is_internal && let Submission::UserInput { ref content } = submission && let Some(engine) = self.routine_engine().await { ... }
-        if not message.is_internal and isinstance(submission, Submission.UserInput):
-            engine = await self.routine_engine()
-            if engine is not None:
-                content = submission.content
-                single_message_repl = is_single_message_repl(message)
-                if single_message_repl:
-                    fired = await engine.check_event_triggers_and_wait(message, content)
+                    return HandleOutcome.from_legacy(legacy_result)
                 else:
-                    fired = await engine.check_event_triggers(message, content)
+                    async with session.lock() as sess:
+                        if thread_id in sess.threads:
+                            sess.threads[thread_id].pending_auth = None
 
-                if fired > 0:
-                    logger.debug(
-                        "消费了带有匹配事件触发例程的入站用户消息: channel=%s, user=%s, fired=%d",
-                        message.channel, message.user_id, fired,
-                    )
-                    if single_message_repl:
-                        return HandleOutcome.Shutdown()
-                    else:
-                        return HandleOutcome.NoResponse()
+        logger.debug(
+            f"从 {message.user_id} 在 {message.channel} 接收到消息 "
+            f"({len(message.content)} 个字符)"
+        )
 
-        # 构建按租户的执行上下文一次；贯穿所有处理程序。
-        # 对应 Rust: let tenant = self.tenant_ctx(&message.user_id).await;
-        tenant = await self.tenant_ctx(message.user_id)
-
-        session_for_empty_exit = session
-
-        # 根据提交类型处理
-        if isinstance(submission, Submission.UserInput):
-            result = await self._handle_user_input_with_drain(
-                message, tenant, session, thread_id, submission.content,
+        # 检查事件触发的例程
+        if (
+                not message.is_internal
+                and isinstance(submission, UserInput)
+                and (engine := await self.routine_engine()) is not None
+        ):
+            content = submission.content
+            single_message_repl = is_single_message_repl(message)
+            fired = (
+                await engine.check_event_triggers_and_wait(message, content)
+                if single_message_repl
+                else await engine.check_event_triggers(message, content)
             )
+            if fired > 0:
+                logger.debug(f"消费了入站消息，匹配了 {fired} 个事件触发例程")
+                return HandleOutcome.Shutdown() if single_message_repl else HandleOutcome.NoResponse()
 
-        elif isinstance(submission, Submission.SystemCommand):
-            command = submission.command
-            args = submission.args
-            logger.debug("[agent_loop] SystemCommand: command=%s, channel=%s", command, message.channel)
+        # 构建租户上下文
+        tenant = await self.tenant_ctx(message.user_id)
+        session_for_empty_exit = session.clone()
 
-            if command == "reasoning":
-                result = await self.handle_reasoning_command(args, session, thread_id)
-                if isinstance(result, SubmissionResult.Response):
+        # 根据提交类型分发
+        match submission:
+            case UserInput(content=content):
+                result = await self.process_user_input(
+                    message, tenant.clone(), session.clone(), thread_id, content,
+                )
+
+                # 排空循环：合并排队消息
+                while (
+                        isinstance(result, SubmissionResult)
+                        and result.type == "Response"
+                ):
+                    async with session.lock() as sess:
+                        t = sess.threads.get(thread_id)
+                        merged = t.drain_pending_messages() if t else None
+                    if merged is None:
+                        break
+
+                    logger.debug(f"排空循环: thread_id={thread_id}, merged_len={len(merged)}")
+
                     response = await build_outgoing_response_for_thread(
                         session, thread_id, result.content, result.attachments,
                     )
-                    return HandleOutcome.Respond(response)
-                elif isinstance(result, SubmissionResult.Ok):
-                    return HandleOutcome.from_legacy(result.message)
-                elif isinstance(result, SubmissionResult.Error):
-                    return HandleOutcome.Respond(OutgoingResponse.text(f"错误: {result.message}"))
-                else:
-                    if is_single_message_repl(message):
-                        return HandleOutcome.Shutdown()
+                    try:
+                        await self.respond_then_done(message, response)
+                    except Exception as e:
+                        logger.warning(f"发送中间排空循环响应失败: {e}")
+
+                    queued_msg = message.clone()
+                    queued_msg.attachments.clear()
+                    result = await self.process_user_input(
+                        queued_msg, tenant.clone(), session.clone(), thread_id, merged,
+                    )
+
+                    if not (isinstance(result, SubmissionResult) and result.type == "Response"):
+                        async with session.lock() as sess:
+                            if thread_id in sess.threads:
+                                sess.threads[thread_id].requeue_drained(merged)
+                                logger.debug("非 Response 结果后重新排队排空内容")
+
+                return_result = result
+
+            case SystemCommand(command=command, args=args):
+                logger.debug(f"[agent_loop] SystemCommand: command={command}")
+                if command == "reasoning":
+                    reason_result = await self.handle_reasoning_command(args, session, thread_id)
+                    if reason_result.type == "Response":
+                        response = await build_outgoing_response_for_thread(
+                            session, thread_id, reason_result.content, reason_result.attachments,
+                        )
+                        return HandleOutcome.Respond(response)
+                    elif reason_result.type == "Ok":
+                        return HandleOutcome.from_legacy(reason_result.message)
+                    elif reason_result.type == "Error":
+                        return HandleOutcome.Respond(
+                            OutgoingResponse.text(f"错误: {reason_result.message}")
+                        )
                     else:
-                        return HandleOutcome.NoResponse()
-
-            result = await self.handle_system_command(command, args, message.channel, tenant)
-
-        elif isinstance(submission, Submission.Undo):
-            result = await self.process_undo(session, thread_id)
-        elif isinstance(submission, Submission.Redo):
-            result = await self.process_redo(session, thread_id)
-        elif isinstance(submission, Submission.Interrupt):
-            result = await self.process_interrupt(session, thread_id)
-        elif isinstance(submission, Submission.Compact):
-            result = await self.process_compact(session, thread_id)
-        elif isinstance(submission, Submission.Clear):
-            result = await self.process_clear(session, thread_id)
-        elif isinstance(submission, Submission.NewThread):
-            result = await self.process_new_thread(message)
-        elif isinstance(submission, Submission.Heartbeat):
-            result = await self.process_heartbeat(message.user_id)
-        elif isinstance(submission, Submission.Summarize):
-            result = await self.process_summarize(session, thread_id)
-        elif isinstance(submission, Submission.Suggest):
-            result = await self.process_suggest(session, thread_id)
-        elif isinstance(submission, Submission.Expected):
-            result = await self.process_expected(session, thread_id, submission.description, message.user_id)
-        elif isinstance(submission, Submission.JobStatus):
-            result = await self.process_job_status(tenant, submission.job_id)
-        elif isinstance(submission, Submission.JobCancel):
-            result = await self.process_job_cancel(tenant, submission.job_id)
-        elif isinstance(submission, Submission.Quit):
-            return HandleOutcome.Shutdown()
-        elif isinstance(submission, Submission.SwitchThread):
-            result = await self.process_switch_thread(message, submission.thread_id)
-        elif isinstance(submission, Submission.Resume):
-            result = await self.process_resume(session, thread_id, submission.checkpoint_id)
-        elif isinstance(submission, Submission.ListThreads):
-            result = await self.process_list_threads(session, message)
-        elif isinstance(submission, Submission.ExecApproval):
-            result = await self.process_approval(
-                message, session, thread_id, submission.request_id,
-                submission.approved, submission.always,
-            )
-        elif isinstance(submission, Submission.ExternalCallback):
-            result = SubmissionResult.Error(message="外部回调需要 ENGINE_V2")
-        elif isinstance(submission, Submission.GateAuthResolution):
-            result = SubmissionResult.Error(message="认证门控解析需要 ENGINE_V2")
-        elif isinstance(submission, Submission.ApprovalResponse):
-            async with session.lock:
-                thread = session.threads.get(thread_id)
-                thread_state = thread.state if thread is not None else ThreadState.IDLE
-
-            if should_route_as_approval(thread_state, message.content):
-                result = await self.process_approval(
-                    message, session, thread_id, None,
-                    submission.approved, submission.always,
+                        return (
+                            HandleOutcome.Shutdown()
+                            if is_single_message_repl(message)
+                            else HandleOutcome.NoResponse()
+                        )
+                return_result = await self.handle_system_command(
+                    command, args, message.channel, tenant,
                 )
-            else:
-                result = await self._handle_approval_as_user_input(
-                    message, tenant, session, thread_id,
-                )
-        elif isinstance(submission, Submission.PairingClaim):
-            outcome = await handle_pairing_claim(self, message, submission.channel, submission.code)
-            if isinstance(outcome, BridgeOutcome.Respond):
-                result = SubmissionResult.Response(content=outcome.text, attachments=[])
-            elif isinstance(outcome, (BridgeOutcome.NoResponse, BridgeOutcome.Pending)):
-                result = SubmissionResult.Ok(message=None)
-            else:
-                result = SubmissionResult.Error(message=f"配对批准失败: {outcome}")
-        elif isinstance(submission, Submission.Plan):
-            sub = submission.sub
-            if isinstance(sub, PlanSubcommand.Create):
-                rewritten = f"[PLAN MODE] 创建计划: {sub.description}"
-            elif isinstance(sub, PlanSubcommand.Approve):
-                plan_ref = sub.plan_ref or "最近的计划"
-                rewritten = (
-                    f"[PLAN MODE] 批准并执行计划 {plan_ref}。"
-                    f"使用 mission_create 从计划内容创建任务，然后使用 mission_fire 启动它。"
-                )
-            elif isinstance(sub, PlanSubcommand.Status):
-                plan_ref = sub.plan_ref or "最近的计划"
-                rewritten = (
-                    f"[PLAN MODE] 显示计划 {plan_ref} 的状态。"
-                    f"检查关联任务的 thread_history、current_focus 和 approach_history。"
-                )
-            elif isinstance(sub, PlanSubcommand.Revise):
-                plan_ref = sub.plan_ref or "最近的计划"
-                rewritten = f"[PLAN MODE] 基于以下反馈修订计划 {plan_ref}: {sub.feedback}"
-            elif isinstance(sub, PlanSubcommand.List):
-                rewritten = "[PLAN MODE] 列出所有计划。搜索内存中的计划文档并显示其状态。"
-            else:
-                rewritten = "[PLAN MODE]"
 
-            result = await self.process_user_input(message, tenant, session, thread_id, rewritten)
+            case Undo():
+                return_result = await self.process_undo(session.clone(), thread_id)
+            case Redo():
+                return_result = await self.process_redo(session.clone(), thread_id)
+            case Interrupt():
+                return_result = await self.process_interrupt(session.clone(), thread_id)
+            case Compact():
+                return_result = await self.process_compact(session.clone(), thread_id)
+            case Clear():
+                return_result = await self.process_clear(session.clone(), thread_id)
+            case NewThread():
+                return_result = await self.process_new_thread(message)
+            case Heartbeat():
+                return_result = await self.process_heartbeat(message.user_id)
+            case Summarize():
+                return_result = await self.process_summarize(session.clone(), thread_id)
+            case Suggest():
+                return_result = await self.process_suggest(session.clone(), thread_id)
+            case Expected(description=description):
+                return_result = await self.process_expected(
+                    session.clone(), thread_id, description, message.user_id,
+                )
+            case JobStatus(job_id=job_id):
+                return_result = await self.process_job_status(tenant, job_id)
+            case JobCancel(job_id=job_id):
+                return_result = await self.process_job_cancel(tenant, job_id)
+            case Quit():
+                return HandleOutcome.Shutdown()
+            case SwitchThread(thread_id=target):
+                return_result = await self.process_switch_thread(message, target)
+            case Resume(checkpoint_id=checkpoint_id):
+                return_result = await self.process_resume(session.clone(), thread_id, checkpoint_id)
+            case ListThreads():
+                return_result = await self.process_list_threads(session.clone(), message)
+            case ExecApproval(request_id=request_id, approved=approved, always=always):
+                return_result = await self.process_approval(
+                    message, session.clone(), thread_id, request_id, approved, always,
+                )
+            case ExternalCallback():
+                return_result = SubmissionResult.Error(message="不再支持外部回调")
+            case GateAuthResolution():
+                return_result = SubmissionResult.Error(message="不再支持认证门控解析")
+            case ApprovalResponse(approved=approved, always=always):
+                async with session.lock() as sess:
+                    t = sess.threads.get(thread_id)
+                    thread_state = t.state if t else ThreadState.Idle
+                if should_route_as_approval(thread_state, message.content):
+                    return_result = await self.process_approval(
+                        message, session.clone(), thread_id, None, approved, always,
+                    )
+                else:
+                    # 降级为用户输入，重新运行 BeforeInbound 钩子
+                    content = message.content
+                    hook_event = HookEvent.Inbound(
+                        user_id=message.user_id,
+                        channel=message.channel,
+                        content=content,
+                        thread_id=str(message.thread_id) if message.thread_id else None,
+                    )
+                    hook_result = await self.hooks().run(hook_event)
+                    if isinstance(hook_result, HookError):
+                        if getattr(hook_result, 'rejected', False):
+                            return HandleOutcome.Respond(
+                                OutgoingResponse.text(f"[消息被拒绝: {hook_result.reason}]")
+                            )
+                        else:
+                            return HandleOutcome.Respond(
+                                OutgoingResponse.text(f"[消息被钩子策略阻止: {hook_result}]")
+                            )
+                    elif (
+                            isinstance(hook_result, HookOutcome)
+                            and hook_result.modified is not None
+                    ):
+                        content = hook_result.modified
+
+                    result = await self.process_user_input(
+                        message, tenant.clone(), session.clone(), thread_id, content,
+                    )
+
+                    # 排空循环
+                    while (
+                            isinstance(result, SubmissionResult)
+                            and result.type == "Response"
+                    ):
+                        async with session.lock() as sess:
+                            t = sess.threads.get(thread_id)
+                            merged = t.drain_pending_messages() if t else None
+                        if merged is None:
+                            break
+
+                        response = await build_outgoing_response_for_thread(
+                            session, thread_id, result.content, result.attachments,
+                        )
+                        try:
+                            await self.respond_then_done(message, response)
+                        except Exception as e:
+                            logger.warning(f"发送中间排空循环响应失败: {e}")
+
+                        queued_msg = message.clone()
+                        queued_msg.attachments.clear()
+                        result = await self.process_user_input(
+                            queued_msg, tenant.clone(), session.clone(), thread_id, merged,
+                        )
+
+                        if not (isinstance(result, SubmissionResult) and result.type == "Response"):
+                            async with session.lock() as sess:
+                                if thread_id in sess.threads:
+                                    sess.threads[thread_id].requeue_drained(merged)
+
+                    return_result = result
+
+            case PairingClaim(channel=ch, code=code):
+                text = await self.process_pairing_claim(message, ch, code)
+                return_result = SubmissionResult.Response(content=text, attachments=[])
+
+            case Plan(sub=sub):
+                # 重写计划命令为自然语言
+                if isinstance(sub, PlanSubcommand.Create):
+                    rewritten = f"[PLAN MODE] 创建计划: {sub.description}"
+                elif isinstance(sub, PlanSubcommand.Approve):
+                    r = sub.plan_ref or "最近的计划"
+                    rewritten = (
+                        f"[PLAN MODE] 批准并执行计划 {r}。"
+                        "使用 mission_create 从计划内容创建任务，然后用 mission_fire 触发。"
+                    )
+                elif isinstance(sub, PlanSubcommand.Status):
+                    r = sub.plan_ref or "最近的计划"
+                    rewritten = (
+                        f"[PLAN MODE] 显示计划 {r} 的状态。"
+                        "检查关联任务的 thread_history、current_focus 和 approach_history。"
+                    )
+                elif isinstance(sub, PlanSubcommand.Revise):
+                    r = sub.plan_ref or "最近的计划"
+                    rewritten = f"[PLAN MODE] 基于反馈修订计划 {r}: {sub.feedback}"
+                elif isinstance(sub, PlanSubcommand.List):
+                    rewritten = "[PLAN MODE] 列出所有计划。搜索内存中的计划文档并显示其状态。"
+                else:
+                    rewritten = ""
+                return_result = await self.process_user_input(
+                    message, tenant, session.clone(), thread_id, rewritten,
+                )
+
+            case _:
+                return_result = SubmissionResult.Error(message=f"未知的提交类型: {type(submission).__name__}")
 
         # 将 SubmissionResult 转换为 HandleOutcome
-        # 对应 Rust: match result? { ... }
-        if isinstance(result, SubmissionResult.Response):
-            return await submission_response_to_handle_outcome(
-                session, thread_id, result.content, result.attachments,
-            )
-        elif isinstance(result, SubmissionResult.Ok):
-            output_message = result.message
-            should_exit = (
-                    output_message == ""
-                    and is_single_message_repl(message)
-            )
-            if should_exit:
-                async with session_for_empty_exit.lock:
-                    thread = session_for_empty_exit.threads.get(thread_id)
-                    if thread is None or thread.state != ThreadState.AWAITING_APPROVAL:
-                        return HandleOutcome.Shutdown()
-            return HandleOutcome.from_legacy(output_message)
-        elif isinstance(result, SubmissionResult.Error):
-            return HandleOutcome.Respond(OutgoingResponse.text(f"错误: {result.message}"))
-        elif isinstance(result, SubmissionResult.Interrupted):
-            return HandleOutcome.Respond(OutgoingResponse.text("已中断。"))
-        elif isinstance(result, SubmissionResult.AuthPending):
-            return HandleOutcome.Pending()
-        elif isinstance(result, SubmissionResult.NeedApproval):
-            return HandleOutcome.Pending()
+        if isinstance(return_result, Exception):
+            raise return_result
+
+        match return_result:
+            case SubmissionResult.Response(content=content, attachments=attachments):
+                return await submission_response_to_handle_outcome(
+                    session, thread_id, content, attachments,
+                )
+            case SubmissionResult.Ok(message=output_message):
+                should_exit = (
+                        output_message == ""
+                        and is_single_message_repl(message)
+                        and (
+                                await (lambda: (
+                                    session_for_empty_exit.lock().__aenter__().threads.get(thread_id)
+                                )).state != ThreadState.AwaitingApproval
+                        )
+                )
+                if should_exit:
+                    return HandleOutcome.Shutdown()
+                else:
+                    return HandleOutcome.from_legacy(output_message)
+            case SubmissionResult.Error(message=message):
+                return HandleOutcome.Respond(OutgoingResponse.text(f"错误: {message}"))
+            case SubmissionResult.Interrupted():
+                return HandleOutcome.Respond(OutgoingResponse.text("已中断。"))
+            case SubmissionResult.AuthPending():
+                return HandleOutcome.Pending()
+            case SubmissionResult.NeedApproval():
+                return HandleOutcome.Pending()
+            case _:
+                return HandleOutcome.NoResponse()
 
     # -------------------------thread_ops.rs中的内容------------------------
     async def persist_user_message(self, thread_id: str, channel: str, user_id: str, user_input: str):
@@ -1446,93 +1429,474 @@ class Agent:
         应在 `thread.start_turn()` 之后立即调用此方法。
         """
 
-    async def process_user_input(self,
-                                 message: IncomingMessage,
-                                 tenant,
-                                 session: Session,
-                                 thread_id: str,
-                                 content: str):
-        logging.debug(
-            "Processing user input: message_id=%s, thread_id=%s, content_len=%s",
-            message.id,
-            message.thread_id,
-            len(content),
+    async def process_user_input(
+            self,
+            message,
+            tenant,
+            session,
+            thread_id,
+            content,
+    ):
+        """处理用户输入的主入口，保持与 Rust 实现相同的逻辑结构。"""
+
+        logger.debug(
+            f"处理用户输入: message_id={message.id}, thread_id={thread_id}, "
+            f"content_len={len(content)}"
         )
 
-        # 首先检查线程状态，在 I/O 操作期间不持有锁。
+        # 附件增强
+        augmented = augment_with_attachments(content, message.attachments)
+        if augmented is not None:
+            effective_content = augmented.text
+            image_parts = augmented.image_parts
+        else:
+            effective_content = content
+            image_parts = []
 
-        # 用户输入的安全验证。
+        # 先在不持有锁的情况下检查线程状态
+        async with session.lock() as sess:
+            thread = sess.threads.get(thread_id)
+            if thread is None:
+                raise Error.from_job_error(JobError.NotFound(id=thread_id))
+            thread_state = thread.state
+            pending_approval = thread.pending_approval.clone() if thread.pending_approval else None
 
-        # 扫描入站消息中的密钥（API 密钥、令牌）。
-        # 在此处捕获它们可以防止大语言模型将其回显，
-        # 否则会触发外发泄漏检测器并造成错误循环。
+        logger.debug(
+            f"已检查线程状态: message_id={message.id}, thread_id={thread_id}, "
+            f"thread_state={thread_state}"
+        )
 
-        # 直接处理以 / 开头的显式命令
-        # 其余所有内容都通过正常的智能体循环（带工具）处理
-        temp_message = message
+        # 根据线程状态分支处理
+        match thread_state:
+            case ThreadState.Processing:
+                async with session.lock() as sess:
+                    thread = sess.threads.get(thread_id)
+                    if thread is None:
+                        return SubmissionResult.error("线程不再存在。")
+
+                    # 在锁下重新检查 — 回合可能在快照读取和此可变锁获取之间已完成
+                    if thread.state == ThreadState.Processing:
+                        # 拒绝带附件的消息 — 队列仅存储文本，附件会被静默丢弃
+                        if message.attachments:
+                            return SubmissionResult.error(
+                                "在回合处理期间无法排队带附件的消息。"
+                                "请在当前回合完成后重新发送。"
+                            )
+
+                        # 运行与正常路径相同的安全检查，确保被阻止的内容不会存储在 pending_messages 中
+                        rejection = self.reject_unsafe_inbound_user_message(
+                            message, effective_content
+                        )
+                        if rejection is not None:
+                            return rejection
+
+                        if not thread.queue_message(content):
+                            return SubmissionResult.error(
+                                f"消息队列已满 ({MAX_PENDING_MESSAGES})。等待当前回合完成。"
+                            )
+                        # 返回 Ok（不是 Response），以便 agent_loop.rs 中的排空循环中断 —
+                        # Ok 表示控制确认，不是已完成的 LLM 回合
+                        return SubmissionResult.Ok(
+                            message="消息已排队 — 将在当前回合后处理。"
+                        )
+                    # 状态已改变（回合已完成）— 继续正常处理
+                    # 注意：sess（Mutex 守卫）在此 Processing 匹配分支末尾被丢弃，
+                    # 在 process_user_input 的其余部分运行之前释放会话锁。不会死锁
+
+            case ThreadState.AwaitingApproval:
+                logger.warning(
+                    f"线程等待审批，拒绝新输入: message_id={message.id}, thread_id={thread_id}"
+                )
+                if pending_approval is not None:
+                    try:
+                        await self.channels.send_status(
+                            message.channel,
+                            pending_approval_status_update(pending_approval),
+                            message.metadata,
+                        )
+                    except Exception:
+                        pass
+                msg = pending_approval_message(pending_approval)
+                return SubmissionResult.pending(msg)
+
+            case ThreadState.Completed:
+                logger.warning(
+                    f"线程已完成，拒绝新输入: message_id={message.id}, thread_id={thread_id}"
+                )
+                return SubmissionResult.error("线程已完成。使用 /thread new。")
+
+            case ThreadState.Idle | ThreadState.Interrupted:
+                # 可以继续
+                pass
+
+        # 验证入站内容
+        rejection = self.reject_unsafe_inbound_user_message(message, effective_content)
+        if rejection is not None:
+            return rejection
+
+        # 处理显式命令（以 / 开头）
+        temp_message = message.clone()
         temp_message.content = content
 
-        if intent := self.router.route_command(temp_message):
-            # 直接处理以 / 开头的显式命令
-            return await self.handle_job_or_command(intent, message)
+        intent = self.router.route_command(temp_message)
+        if intent is not None:
+            # 显式命令如 /status、/job、/list — 直接处理
+            return await self.handle_job_or_command(intent, message, tenant)
 
-        # 自然语言将通过智能体循环处理
-        # 作业工具（create_job、list_jobs 等）位于工具注册表中
-        #
-        # 在添加新轮次之前，如果需要则自动压缩会话
-        thread = session.threads.get(thread_id, None)
-        if not thread:
-            raise RuntimeError(f"线程 {thread_id} 不存在")
+        # 自然语言通过代理循环处理
 
-        messages = thread.messages()
+        # 在添加新回合之前自动压缩
+        async with session.lock() as sess:
+            thread = sess.threads.get(thread_id)
+            if thread is None:
+                raise Error.from_job_error(JobError.NotFound(id=thread_id))
 
-        if strategy := self.context_monitor.suggest_compaction(messages):
-            pct = self.context_monitor.usage_percent(messages)
-            logger.info(f"上下文容量已达 {pct}%，正在自动压缩")
+            messages = thread.messages()
+            strategy = self.context_monitor.suggest_compaction(messages)
+            if strategy is not None:
+                pct = self.context_monitor.usage_percent(messages)
+                logger.info(f"上下文容量达 {pct:.1f}%，正在自动压缩")
 
-            # 通知用户正在执行压缩操作。
-            _ = await self.channels.send_status()
-            compactor = ContextCompactor(llm=self.llm)
-            workspace = self.workspace_for_user(message.user_id)
+                # 通知用户正在进行压缩
+                try:
+                    await self.channels.send_status(
+                        message.channel,
+                        StatusUpdate.Status(f"上下文容量达 {pct:.0f}%，正在压缩..."),
+                        message.metadata,
+                    )
+                except Exception:
+                    pass
+
+                compactor = ContextCompactor(self.llm().clone())
+                workspace = self.workspace_for_user(message.user_id)
+                try:
+                    await compactor.compact(thread, strategy, workspace)
+                except Exception as e:
+                    logger.warning(f"自动压缩失败: {e}")
+
+        # 在回合之前创建检查点
+        undo_mgr = self.session_manager.get_undo_manager(thread_id)
+        async with session.lock() as sess:
+            thread = sess.threads.get(thread_id)
+            if thread is None:
+                raise Error.from_job_error(JobError.NotFound(id=thread_id))
+
+            async with undo_mgr.lock() as mgr:
+                mgr.checkpoint(
+                    thread.turn_number(),
+                    thread.messages(),
+                    f"回合 {thread.turn_number()} 之前",
+                )
+
+        # 开始回合并获取消息
+        async with session.lock() as sess:
+            thread = sess.threads.get(thread_id)
+            if thread is None:
+                raise Error.from_job_error(JobError.NotFound(id=thread_id))
+            turn = thread.start_turn(effective_content)
+            turn.image_content_parts = image_parts
+            turn_number = turn.turn_number
+            turn_started_at = turn.started_at
+            turn_messages = thread.messages()
+
+        # 立即将用户消息持久化到数据库，以便在崩溃后存活
+        logger.debug(
+            f"持久化用户消息到数据库: message_id={message.id}, thread_id={thread_id}"
+        )
+        persisted_user_message_id = await self.persist_user_message(
+            thread_id,
+            message.channel,
+            message.user_id,
+            turn_number,
+            effective_content,
+            turn_started_at,
+        )
+
+        if persisted_user_message_id is not None:
+            async with session.lock() as sess:
+                thread = sess.threads.get(thread_id)
+                if thread is not None:
+                    turn = thread.turns[-1] if thread.turns else None
+                    if turn is not None and turn.turn_number == turn_number:
+                        turn.user_message_id = persisted_user_message_id
+
+        logger.debug(
+            f"用户消息已持久化，启动代理循环: message_id={message.id}, thread_id={thread_id}"
+        )
+
+        # 发送"思考中"状态
+        try:
+            await self.channels.send_status(
+                message.channel,
+                StatusUpdate.Thinking("处理中..."),
+                message.metadata,
+            )
+        except Exception:
+            pass
+
+        # 运行代理工具执行循环
+        result = await self.run_agentic_loop(
+            message, tenant, session.clone(), thread_id, turn_messages,
+        )
+
+        # 重新获取锁并检查是否被中断
+        async with session.lock() as sess:
+            thread = sess.threads.get(thread_id)
+            if thread is None:
+                raise Error.from_job_error(JobError.NotFound(id=thread_id))
+
+            if thread.state == ThreadState.Interrupted:
+                # 锁在此处隐式释放（离开 async with 块时）
+                pass
+
+        if thread.state == ThreadState.Interrupted:
+            await self.clear_conversation_live_state(
+                thread_id, message.channel, message.user_id,
+            )
+            turn_usage = turn_usage_from_result(result)
+            if turn_usage is not None:
+                await self.send_turn_cost_status(
+                    message.channel, message.metadata, turn_usage,
+                )
             try:
-                await compactor.compact(thread, strategy, workspace)
-            except Exception as e:
-                logger.warning(f"上下文自动压缩失败: {e}")
+                await self.channels.send_status(
+                    message.channel,
+                    StatusUpdate.Status("已中断"),
+                    message.metadata,
+                )
+            except Exception:
+                pass
+            return SubmissionResult.Interrupted()
 
-        # 在轮次开始前创建检查点。
-        undo_mgr = await self.session_manager.get_undo_manager(thread_id)
-        thread = session.threads.get(thread_id, None)
-        if not thread:
-            raise RuntimeError(f"线程 {thread_id} 不存在")
+        # 完成、失败或请求审批
+        if isinstance(result, Exception):
+            error_message = str(result)
+            thread.conclude_turn(TurnOutcome.Failed(error_message))
+            turn = thread.turns[-1] if thread.turns else None
+            turn_number = turn.turn_number if turn else 0
+            tool_calls = turn.tool_calls if turn else []
+            narrative = turn.narrative if turn else None
+        else:
+            match result:
+                case AgenticLoopResult.Response(text=response, turn_usage=turn_usage):
+                    # 在用户看到之前从响应文本中提取 <suggestions>
+                    response, suggestions = extract_suggestions(response)
 
-        undo_mgr.checkpoint(thread.turn_number, thread.messages())
+                    # Hook: TransformResponse — 允许钩子修改或拒绝最终响应
+                    response_attachments_allowed = True
+                    event = HookEvent.ResponseTransform(
+                        user_id=message.user_id,
+                        thread_id=str(thread_id),
+                        response=response,
+                    )
+                    hook_result = await self.hooks().run(event)
+                    if isinstance(hook_result, HookError):
+                        if getattr(hook_result, 'rejected', False):
+                            response_attachments_allowed = False
+                            response = f"[响应已过滤: {hook_result.reason}]"
+                        else:
+                            response_attachments_allowed = False
+                            response = f"[响应被钩子策略阻止: {hook_result}]"
+                    elif (
+                            isinstance(hook_result, HookOutcome)
+                            and hook_result.modified is not None
+                    ):
+                        response = hook_result.modified
 
-        # 使用附件上下文（转录文本、元数据、图像）增强内容。
-        effective_content, image_parts = content, None
-        # 开始这一轮并获取消息。
-        thread = session.threads.get(thread_id, None)
-        if not thread:
-            raise RuntimeError(f"线程 {thread_id} 不存在")
-        turn = thread.start_turn(effective_content)
-        turn.image_content_parts = image_parts
-        # 获取所有轮次消息
-        turn_messages = thread.messages()
+                    # 响应附件
+                    if response_attachments_allowed:
+                        current_tool_calls = (
+                            thread.turns[-1].tool_calls if thread.turns else []
+                        )
+                        response_attachments = stage_generated_image_response_attachments(
+                            current_tool_calls
+                        )
+                    else:
+                        response_attachments = []
 
-        # 立即将用户消息持久化到数据库，以便在崩溃时能够保留。
-        await self.persist_user_message(thread_id, message.channel, message.user_id, effective_content)
+                    if response_attachments:
+                        response = strip_markdown_image_lines(response)
 
-        # 发送思考状态。
-        _ = await self.channels.send_status()
+                    thread.conclude_turn(TurnOutcome.Completed(response))
+                    last_turn = thread.turns[-1] if thread.turns else None
+                    turn_number = last_turn.turn_number if last_turn else 0
+                    tool_calls = last_turn.tool_calls if last_turn else []
+                    narrative = last_turn.narrative if last_turn else None
+                    # 锁在此处隐式释放
+                    # 释放 sess 锁后执行持久化和通知
+                    if thread.state != ThreadState.Interrupted:
+                        # 此处需要重新获取数据（因为在释放锁之前已提取）
+                        await self.persist_tool_calls(PersistToolCallsInput(
+                            thread_id=thread_id,
+                            channel=message.channel,
+                            user_id=message.user_id,
+                            turn_number=turn_number,
+                            tool_calls=tool_calls,
+                            narrative=narrative,
+                            outcome=trace_turn_outcome_success(),
+                        ))
+                        await self.persist_assistant_response(
+                            thread_id,
+                            message.channel,
+                            message.user_id,
+                            response,
+                        )
 
-        # 运行智能体工具执行循环。
-        result = await self.run_agentic_loop(message, tenant, session, thread_id, turn_messages)
+                        if suggestions:
+                            try:
+                                await self.channels.send_status(
+                                    message.channel,
+                                    StatusUpdate.Suggestions(suggestions=suggestions),
+                                    message.metadata,
+                                )
+                            except Exception:
+                                pass
 
-        # 重新获取锁并检查是否被中断。
-        thread = session.threads.get(thread_id, None)
-        if not thread:
-            raise RuntimeError(f"线程 {thread_id} 不存在")
+                        await self.send_turn_cost_status(
+                            message.channel, message.metadata, turn_usage,
+                        )
 
-        # 完成、失败或请求批准。
+                        self.spawn_autonomous_trace_contribution(
+                            message.user_id,
+                            thread_id,
+                            message.channel,
+                            message.metadata,
+                        )
+
+                        return SubmissionResult.response_with_attachments(
+                            response, response_attachments,
+                        )
+                    else:
+                        return SubmissionResult.Interrupted()
+
+                case AgenticLoopResult.NeedApproval(
+                    pending=pending, turn_usage=turn_usage
+                ):
+                    # 在线程中存储挂起的审批并更新状态
+                    request_id = pending.request_id
+                    tool_name = pending.tool_name
+                    description = pending.description
+                    parameters = pending.display_parameters
+                    allow_always = pending.allow_always
+                    thread.await_approval(pending)
+                    # 释放 sess
+                    # 锁在此处隐式释放
+
+                case AgenticLoopResult.AuthPending(turn_usage=turn_usage):
+                    # 认证所需卡片已由调度器发送，线程已在认证模式中
+                    thread.conclude_turn(TurnOutcome.CompletedSilently)
+                    last_turn = thread.turns[-1] if thread.turns else None
+                    turn_number = last_turn.turn_number if last_turn else 0
+                    tool_calls = last_turn.tool_calls if last_turn else []
+                    narrative = last_turn.narrative if last_turn else None
+                    # 锁在此处隐式释放
+
+                case AgenticLoopResult.Failed(error=error, turn_usage=turn_usage):
+                    error_message = str(error)
+                    thread.conclude_turn(TurnOutcome.Failed(error_message))
+                    last_turn = thread.turns[-1] if thread.turns else None
+                    turn_number = last_turn.turn_number if last_turn else 0
+                    tool_calls = last_turn.tool_calls if last_turn else []
+                    narrative = last_turn.narrative if last_turn else None
+                    # 锁在此处隐式释放
+
+        # 处理 NeedApproval 分支（在释放锁后）
+        if isinstance(result, AgenticLoopResult) and result.type == "NeedApproval":
+            await self.clear_conversation_live_state(
+                thread_id, message.channel, message.user_id,
+            )
+            await self.send_turn_cost_status(
+                message.channel, message.metadata, result.turn_usage,
+            )
+            try:
+                await self.channels.send_status(
+                    message.channel,
+                    StatusUpdate.ApprovalNeeded(
+                        request_id=str(result.pending.request_id),
+                        tool_name=result.pending.tool_name,
+                        description=result.pending.description,
+                        parameters=result.pending.display_parameters,
+                        allow_always=result.pending.allow_always,
+                    ),
+                    message.metadata,
+                )
+            except Exception:
+                pass
+            return SubmissionResult.NeedApproval(
+                request_id=result.pending.request_id,
+                tool_name=result.pending.tool_name,
+                description=result.pending.description,
+                parameters=result.pending.display_parameters,
+                allow_always=result.pending.allow_always,
+            )
+
+        # 处理 AuthPending 分支
+        if isinstance(result, AgenticLoopResult) and result.type == "AuthPending":
+            await self.persist_tool_calls(PersistToolCallsInput(
+                thread_id=thread_id,
+                channel=message.channel,
+                user_id=message.user_id,
+                turn_number=turn_number,
+                tool_calls=tool_calls,
+                narrative=narrative,
+                outcome=None,
+            ))
+            await self.send_turn_cost_status(
+                message.channel, message.metadata, result.turn_usage,
+            )
+            return SubmissionResult.auth_pending()
+
+        # 处理 Failed 或 Err 分支
+        if isinstance(result, AgenticLoopResult) and result.type in ("Failed", "Error"):
+            error_message = str(result.error) if hasattr(result, 'error') else str(result)
+            await self.send_turn_cost_status(
+                message.channel, message.metadata, result.turn_usage,
+            )
+            await self.persist_tool_calls(PersistToolCallsInput(
+                thread_id=thread_id,
+                channel=message.channel,
+                user_id=message.user_id,
+                turn_number=turn_number,
+                tool_calls=tool_calls,
+                narrative=narrative,
+                outcome=trace_turn_outcome_failure(error_message),
+            ))
+            await self.clear_conversation_live_state(
+                thread_id, message.channel, message.user_id,
+            )
+            self.spawn_autonomous_trace_contribution(
+                message.user_id,
+                thread_id,
+                message.channel,
+                message.metadata,
+            )
+            return SubmissionResult.error(error_message)
+
+        # 处理裸 Exception
+        if isinstance(result, Exception):
+            error_message = str(result)
+            await self.persist_tool_calls(PersistToolCallsInput(
+                thread_id=thread_id,
+                channel=message.channel,
+                user_id=message.user_id,
+                turn_number=turn_number,
+                tool_calls=tool_calls,
+                narrative=narrative,
+                outcome=trace_turn_outcome_failure(error_message),
+            ))
+            await self.clear_conversation_live_state(
+                thread_id, message.channel, message.user_id,
+            )
+            self.spawn_autonomous_trace_contribution(
+                message.user_id,
+                thread_id,
+                message.channel,
+                message.metadata,
+            )
+            return SubmissionResult.error(error_message)
+
+        # 默认返回
+        return SubmissionResult.error("未知的处理结果")
 
     async def run_agentic_loop(self,
                                message: IncomingMessage,
@@ -1722,81 +2086,363 @@ class Agent:
 
         turn_usage = delegate.turn_usage_summary()
 
-    async def run(self):
-        """
-        运行Agent主循环
-        """
-        # 提前初始化 v2 引擎，以便网关 API 端点能够在首条聊天消息到达之前提供数据（项目、任务、对话线程）。
-        if self.config.engine_v2:
-            from bridge.router import init_engine
-            try:
-                await init_engine(self)
-            except Exception as e:
-                logger.debug(f"engine v2: 初始化失败: {e}")
-
-        # 启动消息接受通道。返回的是asyncio.Queue()
+    async def run(self) -> None:
+        """运行代理主循环"""
+        # 启动频道，获取消息流
         message_stream = await self.channels.start_all()
 
-        # 启动自我修复任务并转发通知
+        # 启动自修复任务（带通知转发）
+        self_repair = DefaultSelfRepair(
+            self.context_manager.clone(),
+            self.config.stuck_threshold,
+            self.config.max_repair_attempts,
+        )
+        if (system := self.system_store()) is not None:
+            self_repair = self_repair.with_store(system)
+        if (builder := self.deps.builder) is not None:
+            self_repair = self_repair.with_builder(builder, self.tools())
+        repair = self_repair  # 假设可以共享引用
+        repair_interval = self.config.repair_check_interval
+        repair_channels = self.channels
+        repair_owner_id = str(self.owner_id())
 
-        # 生成会话修剪任务
+        async def repair_task() -> None:
+            # 跟踪已通知 ManualRequired 的作业，防止重复通知
+            notified_manual: set = set()
+            while True:
+                await asyncio.sleep(repair_interval.total_seconds())
 
-        # 如果已启用，则生成心跳任务
+                # 检查卡住的作业
+                stuck_jobs = await repair.detect_stuck_jobs()
+                for job in stuck_jobs:
+                    logger.info(f"尝试修复卡住的作业 {job.job_id}")
+                    result = await repair.repair_stuck_job(job)
+                    notification = None
+                    if isinstance(result, RepairResult):
+                        if result.type == "Success":
+                            logger.info(f"修复成功: {result.message}")
+                            notification = (
+                                f"作业 {job.job_id} 卡住了 {job.stuck_duration.total_seconds()}s，"
+                                f"恢复成功: {result.message}"
+                            )
+                        elif result.type == "Failed":
+                            logger.error(f"修复失败: {result.message}")
+                            if job.job_id not in notified_manual:
+                                notified_manual.add(job.job_id)
+                                notification = (
+                                    f"作业 {job.job_id} 卡住了 {job.stuck_duration.total_seconds()}s，"
+                                    f"恢复永久失败: {result.message}"
+                                )
+                        elif result.type == "ManualRequired":
+                            logger.warning(f"需要手动干预: {result.message}")
+                            if job.job_id not in notified_manual:
+                                notified_manual.add(job.job_id)
+                                notification = (
+                                    f"作业 {job.job_id} 需要手动干预: {result.message}"
+                                )
+                        elif result.type == "Retry":
+                            logger.warning(f"修复需要重试: {result.message}")
+                    elif isinstance(result, Exception):
+                        logger.error(f"修复错误: {result}")
 
-        # 如果已启用，则生成例程引擎
+                    if notification:
+                        response = OutgoingResponse.text(f"自修复: {notification}")
+                        await repair_channels.broadcast_all(repair_owner_id, response)
 
-        # 使用现有引擎线程和例程填充 TUI 侧边栏，以便在首条用户消息之前活动面板就已填充完成。
+                # 检查损坏的工具
+                broken_tools = await repair.detect_broken_tools()
+                for tool in broken_tools:
+                    logger.info(f"尝试修复损坏的工具: {tool.name}")
+                    result = await repair.repair_broken_tool(tool)
+                    if isinstance(result, RepairResult) and result.type == "Success":
+                        response = OutgoingResponse.text(
+                            f"自修复: 工具 '{tool.name}' 已修复: {result.message}"
+                        )
+                        await repair_channels.broadcast_all(repair_owner_id, response)
+                    else:
+                        logger.info(f"工具修复结果: {result}")
+
+        repair_handle = asyncio.create_task(repair_task())
+
+        # 启动会话修剪任务
+        session_mgr = self.session_manager.clone()
+        session_idle_timeout = self.config.session_idle_timeout
+
+        async def pruning_task() -> None:
+            await asyncio.sleep(0)  # 跳过立即第一次 tick
+            while True:
+                await asyncio.sleep(600)  # 每 10 分钟
+                await session_mgr.prune_stale_sessions(session_idle_timeout)
+
+        pruning_handle = asyncio.create_task(pruning_task())
+
+        # 启动追踪队列刷新 worker
+        trace_queue_worker_handle = spawn_trace_queue_flush_worker(
+            str(self.owner_id()),
+            self.deps.store.clone(),
+            self.channels.clone(),
+        )
+
+        # 如果启用心跳，则启动心跳任务
+        heartbeat_handle: Optional[asyncio.Task] = None
+        if self.heartbeat_config is not None and self.heartbeat_config.enabled:
+            if (workspace := self.workspace()) is not None:
+                config = AgentHeartbeatConfig.default()
+                config = config.with_interval(self.heartbeat_config.interval_secs)
+                config.quiet_hours_start = self.heartbeat_config.quiet_hours_start
+                config.quiet_hours_end = self.heartbeat_config.quiet_hours_end
+                config.multi_tenant = self.heartbeat_config.multi_tenant
+                config.timezone = self.heartbeat_config.timezone or self.config.default_timezone
+                heartbeat_notify_user = resolve_owner_scope_notification_user(
+                    self.heartbeat_config.notify_user,
+                    str(self.owner_id()),
+                )
+                if (
+                        self.heartbeat_config.notify_channel is not None
+                        and heartbeat_notify_user is not None
+                ):
+                    config = config.with_notify(heartbeat_notify_user, self.heartbeat_config.notify_channel)
+
+                # 设置通知通道
+                notify_queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+
+                async def heartbeat_notification_forwarder() -> None:
+                    while True:
+                        response = await notify_queue.get()
+                        effective_user = None
+                        if config.multi_tenant:
+                            effective_user = response.metadata.get("owner_id")
+                        # 尝试配置的频道
+                        targeted_ok = False
+                        if self.heartbeat_config.notify_channel is not None:
+                            target = effective_user or heartbeat_notify_user
+                            if target:
+                                try:
+                                    await self.channels.broadcast(
+                                        self.heartbeat_config.notify_channel,
+                                        target,
+                                        response.clone(),
+                                    )
+                                    targeted_ok = True
+                                except Exception:
+                                    pass
+                        if not targeted_ok:
+                            fallback = effective_user or heartbeat_notify_user
+                            if fallback:
+                                results = await self.channels.broadcast_all(fallback, response)
+                                for ch, result in results:
+                                    if isinstance(result, Exception):
+                                        logger.warning(f"广播心跳到 {ch} 失败: {result}")
+
+                asyncio.create_task(heartbeat_notification_forwarder())
+
+                hygiene = (
+                    self.hygiene_config.to_workspace_config()
+                    if self.hygiene_config is not None
+                    else None
+                )
+
+                if config.multi_tenant:
+                    if (system := self.system_store()) is not None:
+                        heartbeat_handle = spawn_multi_user_heartbeat(
+                            config, hygiene, self.cheap_llm().clone(), notify_queue, system
+                        )
+                    else:
+                        logger.warning("多租户心跳需要数据库存储")
+                else:
+                    heartbeat_handle = spawn_heartbeat(
+                        config,
+                        hygiene,
+                        workspace.clone(),
+                        self.cheap_llm().clone(),
+                        notify_queue,
+                        self.system_store(),
+                    )
+            else:
+                logger.warning("心跳已启用但工作区不可用")
+
+        # 如果启用例程引擎，则启动例程
+        routine_handle = None
+        if self.routine_config is not None and self.routine_config.enabled:
+            if (store := self.store()) is not None and (workspace := self.workspace()) is not None:
+                notify_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+
+                engine = RoutineEngine(
+                    self.routine_config.clone(),
+                    SystemScope(store.clone()),
+                    self.llm().clone(),
+                    workspace.clone(),
+                    notify_queue,
+                    self.scheduler.clone(),
+                    self.deps.extension_manager.clone(),
+                    self.tools().clone(),
+                    self.safety().clone(),
+                    self.deps.sandbox_readiness,
+                    self.deps.http_interceptor.clone(),
+                )
+                if (policy := self.deps.runtime_policy) is not None:
+                    engine.set_runtime_policy(policy.clone())
+                engine = engine  # 共享引用
+
+                # 注册例程工具
+                self.deps.tools.register_routine_tools(store.clone(), engine.clone())
+
+                await engine.refresh_event_cache()
+
+                async def routine_notification_forwarder() -> None:
+                    while True:
+                        response = await notify_queue.get()
+                        notify_channel = response.metadata.get("notify_channel")
+                        fallback_user = resolve_owner_scope_notification_user(
+                            response.metadata.get("notify_user"),
+                            response.metadata.get("owner_id"),
+                        )
+                        user = await resolve_routine_notification_target(
+                            self.deps.extension_manager,
+                            response.metadata,
+                        )
+                        if user is None:
+                            logger.warning("跳过没有目标或所有者范围的例程通知")
+                            continue
+
+                        targeted_ok = False
+                        if notify_channel is not None:
+                            try:
+                                await self.channels.broadcast(notify_channel, user, response.clone())
+                                targeted_ok = True
+                            except Exception as e:
+                                if should_fallback_routine_notification(e):
+                                    pass
+                                else:
+                                    continue
+                        if not targeted_ok and fallback_user is not None:
+                            results = await self.channels.broadcast_all(fallback_user, response)
+                            for ch, result in results:
+                                if isinstance(result, Exception):
+                                    logger.warning(f"广播例程通知到 {ch} 失败: {result}")
+
+                asyncio.create_task(routine_notification_forwarder())
+
+                cron_interval = self.routine_config.cron_check_interval_secs
+                cron_handle = spawn_cron_ticker(engine.clone(), cron_interval)
+
+                # 将引擎暴露给网关以进行手动触发
+                await self.routine_engine_slot.write(engine.clone())
+
+                logger.debug(
+                    f"例程已启用: cron ticker 每 {cron_interval}s，最大并发 {self.routine_config.max_concurrent_routines}"
+                )
+                routine_handle = (cron_handle, engine.clone())
+            else:
+                logger.warning("例程已启用但存储/工作区不可用")
+
+        # 水合 TUI 侧边栏，使其在第一条用户消息之前填充
+        await self.hydrate_tui_sidebar()
+
+        logger.debug(f"代理 {self.config.name} 已就绪并监听")
 
         # 主消息循环
-        logger.debug(f"Agent {self.config.name} ready and listening")
-        # 创建一个 asyncio.Event 用于通知关闭
-        shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
-        # 注册 SIGINT (Ctrl+C) 信号处理器，触发关闭事件
-        # 注意：add_signal_handler 仅在 Unix 系统上可用，若需跨平台可改用其他方式
-        loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+        shutdown_event = asyncio.Event()
 
-        while True:
-            # 创建两个任务：等待关闭事件 和 从异步迭代器获取下一条消息
-            shutdown_task = asyncio.create_task(shutdown_event.wait())
-            # 创建消息读取的任务。
-            next_msg_task = asyncio.create_task(message_stream.__anext__())
-            # get_msg_task = asyncio.create_task(message_stream.get())
+        # 注册信号处理
+        def _signal_handler() -> None:
+            shutdown_event.set()
 
-            # 等待最先完成的任务（模拟 select! 的并发等待）
-            done, pending = await asyncio.wait(
-                [shutdown_task, next_msg_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            # 检查是否收到了 Ctrl+C
-            if shutdown_task in done:
-                logging.debug("收到Ctrl+C，正在关闭...")
-                break
+        loop.add_signal_handler(signal.SIGINT, _signal_handler)
 
-            # 否则获取message
-            message = next_msg_task.result()
-            if message is None:
-                logger.debug("所有通道流已结束，正在关闭...")
-                break
+        try:
+            while not shutdown_event.is_set():
+                # 使用 asyncio.wait 同时等待消息和关闭信号
+                msg_task = asyncio.ensure_future(message_stream.next())
+                shutdown_task = asyncio.ensure_future(shutdown_event.wait())
 
-            # 将转录中间件应用于音频附件
-            if self.deps.transcription:
-                await self.deps.transcription.process(message)
+                done, pending = await asyncio.wait(
+                    [msg_task, shutdown_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            # 应用文档提取中间件
-            if self.deps.document_extraction:
-                await self.deps.document_extraction.process(message)
+                if shutdown_task in done:
+                    logger.debug("接收到 Ctrl+C，正在关闭...")
+                    break
 
-            # 存储提取的文档
-            await self.store_extracted_documents(message)
+                message = msg_task.result()
+                if message is None:
+                    logger.debug("所有频道流已结束，正在关闭...")
+                    break
 
-            # 判断是否为内部消息(如心跳任务等)，避免重复处理
-            if (
-                    not message.is_internal  # 非内部消息
-                    # and self._is_user_input(message.content)  # 是用户输入
-                    # and routine_engine_for_loop is not None  # let Some(ref engine)
-            ):
-                continue
+                # 取消未完成的任务
+                for task in pending:
+                    task.cancel()
 
-            # 处理消息
-            response, error = await self.handle_message(message)
+                # 将转录中间件应用于音频附件
+                if (transcription := self.deps.transcription) is not None:
+                    await transcription.process(message.attachments, message.content)
+
+                # 将文档提取中间件应用于文档附件
+                if (doc_extraction := self.deps.document_extraction) is not None:
+                    await doc_extraction.process(message)
+
+                # 将成功提取的文档文本存储到工作区以进行索引
+                await self.store_extracted_documents(message)
+
+                # 处理消息
+                outcome = await self.handle_message(message)
+                if outcome.type == "Respond":
+                    response = outcome.response
+                    # 钩子：BeforeOutbound — 允许钩子修改或抑制出站消息
+                    event = HookEvent.Outbound(
+                        user_id=message.user_id,
+                        channel=message.channel,
+                        content=response.content,
+                        thread_id=str(message.thread_id) if message.thread_id else None,
+                    )
+                    hook_result = await self.hooks().run(event)
+                    if isinstance(hook_result, Exception):
+                        logger.warning(f"BeforeOutbound 钩子阻止了响应: {hook_result}")
+                        remove_staged_generated_image_attachments(response.attachments)
+                        await self.send_done(message)
+                    elif (
+                            isinstance(hook_result, HookOutcome)
+                            and hook_result.type == "Continue"
+                            and hook_result.modified is not None
+                    ):
+                        response.content = hook_result.modified
+                        try:
+                            await self.respond_then_done(message, response)
+                        except Exception as e:
+                            logger.error(f"发送响应到频道失败 ({message.channel}): {e}")
+                    else:
+                        try:
+                            await self.respond_then_done(message, response)
+                        except Exception as e:
+                            logger.error(f"发送响应到频道失败 ({message.channel}): {e}")
+                elif outcome.type == "NoResponse":
+                    logger.debug(f"抑制空响应 (未发送到频道) ({message.channel}/{message.user_id})")
+                    await self.send_done(message)
+                elif outcome.type == "Pending":
+                    logger.debug(f"轮次暂停 (Pending)；抑制 Done ({message.channel}/{message.user_id})")
+                elif outcome.type == "Shutdown":
+                    logger.debug("接收到关闭命令，正在退出...")
+                    break
+                else:
+                    logger.error(f"处理消息时出错: {outcome}")
+                    try:
+                        await self.respond_then_done(
+                            message,
+                            OutgoingResponse.text(f"错误: {outcome}"),
+                        )
+                    except Exception as send_err:
+                        logger.error(f"发送错误响应到频道失败 ({message.channel}): {send_err}")
+        finally:
+            # 清理
+            logger.debug("代理正在关闭...")
+            repair_handle.cancel()
+            pruning_handle.cancel()
+            trace_queue_worker_handle.cancel()
+            if heartbeat_handle is not None:
+                heartbeat_handle.cancel()
+            if routine_handle is not None:
+                routine_handle[0].cancel()
+            await self.scheduler.stop_all()
+            await self.channels.shutdown_all()

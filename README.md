@@ -28,3 +28,11 @@ LlmProvider	通过 LlmBridgeAdapter 包装，转换 ThreadMessage ↔ ChatMessag
 ToolRegistry	通过 EffectBridgeAdapter 包装，路由工具调用到 WASM 沙箱工具 2026-03-20-engine-v2-architecture.md:340-341
 SafetyLayer	在 EffectBridgeAdapter 边界应用，引擎是纯编排 2026-03-20-engine-v2-architecture.md:493-494
 ChannelManager	通过 ConversationManager 桥接，路由通道消息到线程 2026-03-20-engine-v2-architecture.md:322-325
+
+
+
+
+# 流程
+Agent.run()
+Agent.handle_message()
+Agent.process_user_input()  # thread_ops
