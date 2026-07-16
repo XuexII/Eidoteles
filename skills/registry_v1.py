@@ -158,7 +158,7 @@ class SkillRegistry:
         if len(loaded_names) < MAX_DISCOVERED_SKILLS:
             cap = MAX_DISCOVERED_SKILLS - len(loaded_names)
             skills = await self._discover_from_dir(
-                self.user_dir, SkillTrust.Trusted, SkillSource.User, cap, 0,
+                self.user_dir, SkillTrust.Trusted, SkillSource.UserProvenance, cap, 0,
             )
             self._absorb(skills, seen, loaded_names, "user")
 

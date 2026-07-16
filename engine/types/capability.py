@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from engine.types.thread import ThreadId
 
 
 # ── 为action 授权 ────────────────────────────────────────

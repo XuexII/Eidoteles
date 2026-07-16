@@ -1014,7 +1014,7 @@ async def refresh_llm_messages_for_current_surface(
     # 检查消息中是否已存在引擎拥有的系统提示
     has_system_prompt = False
     for message in messages:
-        if message.role == MessageRole.System and is_codeact_system_prompt(message.content):
+        if message.role == MessageRole.SystemProvenance and is_codeact_system_prompt(message.content):
             has_system_prompt = True
             break
 

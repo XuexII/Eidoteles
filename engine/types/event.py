@@ -1,7 +1,9 @@
-# 事件溯源类型。
-#
-# 线程中的每个重要操作都被记录为一个事件。
-# 这支持重放、调试、反思和基于追踪的测试。
+"""
+ThreadEvent——事件溯源的基本单元
+
+用于记录Thread执行过程中的完整追踪信息，支持重放、调试和反思
+每个Thread维护一个事件日志，记录从启动到完成的所有关键事件
+"""
 
 import re
 import uuid
@@ -10,8 +12,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from engine.types.capability import LeaseId
-from engine.types.step import StepId, TokenUsage, CodeExecutionFailure
-from engine.types.thread import ThreadId, ThreadState
+from engine.types.step import CodeExecutionFailure
+from engine.types.thread import ThreadState
+from metrics import TokenUsage
 
 
 def summarize_params(action_name: str, params: Dict[str, Any]) -> Optional[str]:
@@ -203,16 +206,6 @@ def _truncate(s: str, max_len: int) -> str:
     return f"{s[:end]}..."
 
 
-# ── 事件 ──────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class EventId:
-    """强类型事件标识符。"""
-    value: uuid.UUID = field(default_factory=uuid.uuid4)
-
-    def __str__(self) -> str:
-        return str(self.value)
-
 
 class EventKind:
     """发生的事件的具体类型。"""
@@ -230,27 +223,27 @@ class EventKindStateChanged(EventKind):
 @dataclass
 class EventKindStepStarted(EventKind):
     """步骤开始。"""
-    step_id: StepId
+    step_id: str
 
 
 @dataclass
 class EventKindStepCompleted(EventKind):
     """步骤完成。"""
-    step_id: StepId
+    step_id: str
     tokens: TokenUsage
 
 
 @dataclass
 class EventKindStepFailed(EventKind):
     """步骤失败。"""
-    step_id: StepId
+    step_id: str
     error: str
 
 
 @dataclass
 class EventKindActionExecuted(EventKind):
     """操作执行成功。"""
-    step_id: StepId
+    step_id: str
     action_name: str
     call_id: str
     duration_ms: int
@@ -261,7 +254,7 @@ class EventKindActionExecuted(EventKind):
 @dataclass
 class EventKindActionFailed(EventKind):
     """操作执行失败。"""
-    step_id: StepId
+    step_id: str
     action_name: str
     call_id: str
     error: str
@@ -300,14 +293,14 @@ class EventKindMessageAdded(EventKind):
 @dataclass
 class EventKindChildSpawned(EventKind):
     """子线程已生成。"""
-    child_id: ThreadId
+    child_id: str
     goal: str
 
 
 @dataclass
 class EventKindChildCompleted(EventKind):
     """子线程已完成。"""
-    child_id: ThreadId
+    child_thread_id: str
 
 
 @dataclass
@@ -360,7 +353,7 @@ class EventKindCodeExecutionFailed(EventKind):
     当代码（REPL）执行尝试失败时发出。启用代码执行失败模式的聚合分析，
     以确定运行时（Monty）、LLM 还是工具分派是失败的主要来源。
     """
-    step_id: StepId
+    step_id: str
     # 分类的失败类别
     category: CodeExecutionFailure
     # 错误消息文本（截断到 500 字符）
@@ -377,7 +370,7 @@ class EventKindCodeExecuted(EventKind):
     CodeAct 执行跟踪——原始代码 + stdout 保留给观察者（调试面板、跟踪重放）。
     上下文内聊天摘要太有损；此变体保留完整证据。
     """
-    step_id: StepId
+    step_id: str
     code: str
     stdout: str
     return_value: Optional[Dict[str, Any]] = None
@@ -401,10 +394,21 @@ class EventKindUnknown(EventKind):
     pass
 
 
+def generate_event_id() -> str:
+    return str(uuid.uuid4())
+
+
 @dataclass(kw_only=True)
 class ThreadEvent:
     """线程执行历史中的记录事件。"""
-    id: EventId = field(default_factory=EventId)
-    thread_id: ThreadId
+    _id: str = field(default_factory=generate_event_id, init=False)
+    # 关联的Thread ID
+    thread_id: str
+    # 事件发生时间
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # 事件类型
     kind: EventKind
+
+    @property
+    def id(self):
+        return self._id

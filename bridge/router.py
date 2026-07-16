@@ -4975,7 +4975,7 @@ def thread_to_info(t: Thread) -> EngineThreadInfo:
         thread_type=str(t.thread_type),
         state=str(t.state),
         project_id=str(t.project_id),
-        parent_id=str(t.parent_id) if t.parent_id else None,
+        parent_id=str(t.parent_thread_id) if t.parent_thread_id else None,
         step_count=t.step_count,
         total_tokens=t.total_tokens_used,
         created_at=t.created_at.isoformat(),
@@ -5042,7 +5042,7 @@ async def get_engine_thread(
         thread_type=str(thread.thread_type),
         state=str(thread.state),
         project_id=str(thread.project_id),
-        parent_id=str(thread.parent_id) if thread.parent_id else None,
+        parent_id=str(thread.parent_thread_id) if thread.parent_thread_id else None,
         step_count=thread.step_count,
         total_tokens=thread.total_tokens_used,
         created_at=thread.created_at.isoformat(),
@@ -5337,7 +5337,7 @@ async def list_engine_missions(
             status=str(m.status),
             cadence_type=cadence_type_label(m.cadence),
             cadence_description=cadence_description(m.cadence),
-            thread_count=len(m.thread_history),
+            thread_count=len(m.history_thread_ids),
             current_focus=m.current_focus,
             created_at=m.created_at.isoformat(),
             updated_at=m.updated_at.isoformat(),
@@ -5373,7 +5373,7 @@ async def get_engine_mission(
 
     # 为生成的线程表加载线程摘要
     threads: List[EngineThreadInfo] = []
-    for tid in m.thread_history:
+    for tid in m.history_thread_ids:
         try:
             thread = await guard.store.load_thread(tid)
             if thread is not None:
@@ -5388,7 +5388,7 @@ async def get_engine_mission(
         status=str(m.status),
         cadence_type=cadence_type_label(m.cadence),
         cadence_description=cadence_description(m.cadence),
-        thread_count=len(m.thread_history),
+        thread_count=len(m.history_thread_ids),
         current_focus=m.current_focus,
         created_at=m.created_at.isoformat(),
         updated_at=m.updated_at.isoformat(),

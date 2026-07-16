@@ -7,7 +7,34 @@
     - 检测是否包含 API 密钥（sk-...）、GitHub token（ghp_...）等敏感信息
   - 在EffectBridgeAdapter中，对工具的调用结果进行清理。具体为`.sanitize_tool_output`
 
-# 2. 完全被 V2 原语替代的组件
+
+# 2. 实现
+## Thread
+Thread代表一个完整的执行任务，具有自己的生命周期、状态机、能力租约和资源消耗跟踪。由ThreadManager管理(创建、执行)
+## Project
+
+## ThreadMessage
+线程中对话消息的基本单元
+
+## Provenance
+标记每条数据的来源
+
+## Step
+每个Step代表一次完整的LLM调用及其相关的工具/代码执行
+
+## Mission
+任务代表一个持续进行的目标，它会定期生成线程以推进工作
+
+## MemoryDoc
+持久化知识单元，用于存储结构化的知识
+
+## ThreadEvent
+用于记录Thread执行过程中的完整追踪信息，支持重放、调试和反思
+doing
+
+
+
+# 完全被 V2 原语替代的组件
 
 | V1 | v2 | 说明 |
 |----|----|----|

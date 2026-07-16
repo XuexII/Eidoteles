@@ -1,8 +1,9 @@
-# 记忆文档——持久化知识的单位。
-#
-# 记忆文档是已完成线程反思后生成的结构化知识。
-# 它们限定在项目范围内，用于上下文构建（检索而非原始历史重放）。
+"""
+记忆文档——持久化知识的单位
 
+记忆文档是已完成线程反思后生成的结构化知识
+它们限定在项目范围内，用于上下文构建（检索而非原始历史重放）
+"""
 
 import uuid
 from dataclasses import dataclass, field
@@ -10,18 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .project import ProjectId
-from .thread import ThreadId
-from ..types import OwnerId, default_user_id
-
-
-@dataclass(frozen=True)
-class DocId:
-    """强类型文档标识符。"""
-    value: uuid.UUID = field(default_factory=uuid.uuid4)
-
-    def __str__(self) -> str:
-        return str(self.value)
+from ironclaw_common.common import OwnerId, DEFAULT_USER_ID
 
 
 class DocType(str, Enum):
@@ -42,36 +32,44 @@ class DocType(str, Enum):
     Plan = "plan"
 
 
-def _default_user_id() -> str:
-    """默认用户 ID（用于 serde 默认值）。"""
-    return "legacy"
+def generate_doc_id() -> str:
+    return str(uuid.uuid4())
 
 
 @dataclass(kw_only=True)
 class MemoryDoc:
     """内存文档——结构化的持久知识。"""
-    id: DocId = field(default_factory=DocId)
-    project_id: ProjectId
+    _id: str = field(default_factory=generate_doc_id, init=False)
+    # 所属项目，用于上下文隔离
+    project_id: str
     # 租户隔离：拥有此文档的用户
-    user_id: str = default_user_id
+    user_id: str = DEFAULT_USER_ID
+    # 文档类型（Summary/Lesson/Issue/Spec/Note/Skill/Plan)
     doc_type: DocType
+    # 文档标题，用于显示和检索
     title: str
+    # 文档内容，存储实际知识
     content: str
-    source_thread_id: Optional[ThreadId] = None
+    # 来源thread ID，用于追溯知识来源
+    source_thread_id: Optional[str] = None
+    # 标签，用于分类和检索
     tags: List[str] = field(default_factory=list)
+    # 扩展元数据，存储自定义信息
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def with_source_thread(self, thread_id: ThreadId) -> "MemoryDoc":
+    @property
+    def id(self):
+        return self._id
+
+    def with_source_thread(self, thread_id: str):
         """设置来源线程。"""
         self.source_thread_id = thread_id
-        return self
 
-    def with_tags(self, tags: List[str]) -> "MemoryDoc":
+    def with_tags(self, tags: List[str]):
         """设置标签。"""
         self.tags = tags
-        return self
 
     @property
     def owner_id(self) -> OwnerId:
@@ -80,4 +78,4 @@ class MemoryDoc:
 
     def is_owned_by(self, user_id: str) -> bool:
         """检查是否由指定用户拥有。"""
-        return self.owner_id().matches_user(user_id)
+        return self.owner_id.matches_user(user_id)

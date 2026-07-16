@@ -2059,7 +2059,7 @@ class Agent:
 
             # 从后向前查找最后一条角色为 User 的消息并替换其内容
             for msg in reversed(messages_for_llm):
-                if msg.role == Role.User:  # 假设 Role.User 已定义
+                if msg.role == Role.UserProvenance:  # 假设 Role.User 已定义
                     # 将最后一条用户消息替换为新的用户内容
                     # 注意：这里假设 ChatMessage.user() 是一个构造方法
                     # 实际替换方式取决于 ChatMessage 的设计

@@ -958,7 +958,7 @@ class MissionManager:
     async def count_running_threads(self, mission: Mission) -> int:
         """计算任务生成的非终止状态线程数"""
         running = 0
-        for tid in reversed(mission.thread_history):
+        for tid in reversed(mission.history_thread_ids):
             try:
                 thread = await self.store.load_thread(tid)
             except Exception:
@@ -1124,7 +1124,7 @@ def build_meta_prompt(
     # 当前焦点
     if mission.current_focus:
         parts.append(f"\n## 当前焦点\n{mission.current_focus}")
-    elif not mission.thread_history:
+    elif not mission.history_thread_ids:
         parts.append(
             "\n## 当前焦点\n这是首次运行。从理解目标并确定第一步开始。"
         )
@@ -1152,7 +1152,7 @@ def build_meta_prompt(
 
     # 线程计数
     parts.append(
-        f"\n这是此任务的第 {len(mission.thread_history) + 1} 个线程。"
+        f"\n这是此任务的第 {len(mission.history_thread_ids) + 1} 个线程。"
     )
 
     # 指令

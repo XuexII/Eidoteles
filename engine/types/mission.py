@@ -1,7 +1,10 @@
-# Missions——长期运行的目标，会随时间生成线程。
-#
-# 任务代表一个持续进行的目标，它会定期生成线程以推进工作。
-# 任务可以按计划（cron）运行、响应事件触发或手动触发。
+"""
+Missions——长期运行的目标，会随时间生成线程
+
+任务代表一个持续进行的目标，它会定期生成线程以推进工作
+任务可以按计划（cron）运行、响应事件触发或手动触发。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -12,28 +15,14 @@ from enum import Enum
 from typing import Optional, List, Dict
 
 from engine.gate import ResumeKind
-from ironclaw_common import ValidTimezone
-from .project import ProjectId
-from .thread import ThreadId
-from ..types import OwnerId
+from ironclaw_common.common import OwnerId
 
 logger = logging.getLogger(__name__)
 
 
-# ── 任务标识符 ───────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class MissionId:
-    """强类型任务标识符"""
-    value: uuid.UUID = field(default_factory=uuid.uuid4)
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
 # ── 任务状态 ─────────────────────────────────────────────────
 
-class MissionStatus(Enum):
+class MissionStatus(str, Enum):
     """任务的生命周期状态"""
     # 任务正在按节奏主动生成线程
     Active = "Active"
@@ -46,45 +35,14 @@ class MissionStatus(Enum):
     Failed = "Failed"
 
 
-# ── 任务节奏 ─────────────────────────────────────────────────
-
-class MissionCadence:
-    """任务如何触发新线程
-
-    引擎定义触发*类型*。桥接/主机实现实际的触发基础设施
-    （cron 计时器、webhook 端点、事件匹配器）。引擎只需要被告知"现在触发此任务"
-    """
-    pass
-
-
 @dataclass
-class Cron(MissionCadence):
-    """按 cron 计划生成（例如 "0 */6 * * *" 表示每 6 小时）"""
+class CronTrigger:
+    """定时触发（例如 "0 */6 * * *" 表示每 6 小时）"""
     expression: str
-    timezone: Optional[ValidTimezone] = None
 
 
 @dataclass
-class OnEvent(MissionCadence):
-    """响应匹配正则表达式模式的频道消息生成。
-    `channel` 设置后，将触发限制为来自特定频道名称（不区分大小写）的消息
-    """
-    event_pattern: str
-    channel: Optional[str] = None
-
-
-@dataclass
-class OnSystemEvent(MissionCadence):
-    """响应结构化系统事件生成（来自工具或外部）。
-    `filters` 非空时，要求每个键/值对精确匹配事件负载的顶级字段
-    """
-    source: str
-    event_type: str
-    filters: Dict[str, any] = field(default_factory=dict)
-
-
-@dataclass
-class Webhook(MissionCadence):
+class WebhookTrigger:
     """在注册路径收到外部 webhook 时生成。
     桥接注册 webhook 端点并将负载路由到这里
     """
@@ -93,9 +51,34 @@ class Webhook(MissionCadence):
 
 
 @dataclass
-class Manual(MissionCadence):
-    """仅在手动触发时生成（通过 mission_fire 工具或 API）"""
+class OnEventTrigger:
+    """
+    响应匹配正则表达式模式的频道消息生成。
+    `channel` 设置后，将触发限制为来自特定频道名称（不区分大小写）的消息
+    """
+    event_pattern: str
+    channel: Optional[str] = None
+
+
+@dataclass
+class OnSystemEventTrigger:
+    """响应结构化系统事件生成（来自工具或外部）。
+    `filters` 非空时，要求每个键/值对精确匹配事件负载的顶级字段
+    """
+    source: str
+    event_type: str
+    filters: Dict[str, any] = field(default_factory=dict)
+
+
+class ManualTrigger:
+    """
+    手动触发
+    """
     pass
+
+
+# mission 触发新线程的方式
+MissionCadence = CronTrigger | WebhookTrigger | OnEventTrigger | OnSystemEventTrigger | ManualTrigger
 
 
 # ── 任务门控信息 ─────────────────────────────────────────────
@@ -129,22 +112,29 @@ class MissionGateInfo:
 
 
 # ── 任务 ─────────────────────────────────────────────────────
+def generate_mission_id() -> str:
+    return str(uuid.uuid4())
+
 
 @dataclass(kw_only=True)
 class Mission:
     """任务 — 一个长期运行的目标，随时间推移生成线程"""
-    id: MissionId = field(default_factory=MissionId)
-    project_id: ProjectId
-    # 租户隔离：拥有此任务的用户
+    _id: str = field(default_factory=generate_mission_id, init=False)
+    # 所属项目，用于上下文隔离
+    project_id: str
+    # 租户隔离，拥有该mission的用户
     user_id: str
+    # Mission名称，用于标识和显示
     name: str
-    goal: str
-    status: MissionStatus = MissionStatus.Active
-    cadence: MissionCadence
     # 可选的人类可读描述（与目标声明分开）。
     # 例程 `description` 字段映射到这里
     description: Optional[str] = None
-
+    # Mission的核心目标陈述
+    goal: str
+    # 当前状态
+    status: MissionStatus = MissionStatus.Active
+    # 触发方式
+    cadence: MissionCadence
     # ── 演进策略 ──
     # 下一个线程应关注什么（在每个线程后更新）
     current_focus: Optional[str] = None
@@ -152,8 +142,8 @@ class Mission:
     approach_history: List[str] = field(default_factory=list)
 
     # ── 进度跟踪 ──
-    # 此任务生成的线程历史
-    thread_history: List[ThreadId] = field(default_factory=list)
+    # 该mission spawn的所有threads id历史
+    history_thread_ids: List[str] = field(default_factory=list)
     # 声明任务完成的可选标准
     success_criteria: Optional[str] = None
 
@@ -161,12 +151,12 @@ class Mission:
     # 任务线程完成时要通知的频道（例如 "gateway"、"repl"）。
     # 空意味着不主动通知（结果仅在 approach_history 中）
     notify_channels: List[str] = field(default_factory=list)
-    # 通知的可选每频道用户/接收者目标。映射自例程 `delivery.user`。
+    # mission thread完成时通知的channels。映射自例程 `delivery.user`。
     # 为 None 时，使用频道的最后已知接收者
     notify_user: Optional[str] = None
 
     # ── 上下文预加载 ──
-    # 任务触发时将其内容加载到线程元提示中的工作区路径
+    # workspace路径，mission fire时加载到thread的meta-prompt中
     # （例如 `["MEMORY.md", "context/profile.json"]`）。
     # 映射自例程 `execution.context_paths`
     context_paths: List[str] = field(default_factory=list)
@@ -208,15 +198,18 @@ class Mission:
     paused_gate: Optional[MissionGateInfo] = None
 
     def __post_init__(self):
-        if isinstance(self.cadence, (OnEvent, OnSystemEvent, Webhook)):
+        if isinstance(self.cadence, (OnEventTrigger, OnSystemEventTrigger, WebhookTrigger)):
             self.max_threads_per_day = 24
             self.cooldown_secs = 300
             self.max_concurrent = 1
 
-    def with_success_criteria(self, criteria: str) -> "Mission":
+    @property
+    def id(self):
+        return self._id
+
+    def with_success_criteria(self, criteria: str):
         """设置成功标准并返回 self 以支持链式调用"""
         self.success_criteria = criteria
-        return self
 
     @property
     def owner_id(self) -> OwnerId:
@@ -225,11 +218,11 @@ class Mission:
 
     def is_owned_by(self, user_id: str) -> bool:
         """检查任务是否属于指定用户"""
-        return self.owner_id().matches_user(user_id)
+        return self.owner_id.matches_user(user_id)
 
-    def record_thread(self, thread_id: ThreadId) -> None:
+    def record_thread(self, thread_id: str) -> None:
         """记录为此任务生成了一个线程"""
-        self.thread_history.append(thread_id)
+        self.history_thread_ids.append(thread_id)
         self.updated_at = datetime.now(timezone.utc)
 
     def is_terminal(self) -> bool:
@@ -240,11 +233,11 @@ class Mission:
         """任务是否是事件驱动的（响应外部刺激触发，而非固定计划）。
         事件驱动的任务在完成后可能合法地重新触发 — 每个事件都是新的调查
         """
-        return isinstance(self.cadence, (OnSystemEvent, OnEvent, Webhook))
+        return isinstance(self.cadence, (OnSystemEventTrigger, OnEventTrigger, WebhookTrigger))
 
 
 # ── Cron 辅助函数 ────────────────────────────────────────────
-
+# TODO: mission的辅助函数
 def normalize_cron_expression(expression: str) -> str:
     """将 cron 表达式规范化为 cron 库期望的 7 字段格式
 

@@ -1,7 +1,8 @@
-# 步骤——线程内的执行单元。
-#
-# 每个步骤对应一次大语言模型调用及其后续的动作执行。
-# 这取代了现有 `run_agentic_loop` 中隐式的"迭代"计数器。
+"""
+Step——线程内的执行单元
+
+每个Step代表一次完整的LLM调用及其相关的工具/代码执行
+"""
 
 from __future__ import annotations
 
@@ -12,25 +13,14 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List
 
-from .thread import ThreadId
+from metrics import TokenUsage
 
 logger = logging.getLogger(__name__)
 
 
-# ── 强类型步骤标识符 ─────────────────────────────────────────
-
-@dataclass(frozen=True)
-class StepId:
-    """强类型步骤标识符"""
-    value: uuid.UUID = field(default_factory=uuid.uuid4)
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
 # ── 步骤状态 ─────────────────────────────────────────────────
 
-class StepStatus(Enum):
+class StepStatus(str, Enum):
     """步骤在其生命周期中的状态"""
     Pending = "Pending"
     LlmCalling = "LlmCalling"
@@ -41,7 +31,7 @@ class StepStatus(Enum):
 
 # ── 执行层 ───────────────────────────────────────────────────
 
-class ExecutionTier(Enum):
+class ExecutionTier(str, Enum):
     """哪个执行层处理步骤的代码/动作
 
     Monty 是唯一的 CodeAct/RLM 执行器。WASM 和 Docker 用于
@@ -53,6 +43,34 @@ class ExecutionTier(Enum):
     Scripting = "Scripting"
 
 
+def generate_step_id() -> str:
+    return str(uuid.uuid4())
+
+
+@dataclass(kw_only=True)
+class Step:
+    """线程中的单个执行步骤"""
+    _id: str = field(default_factory=generate_step_id, init=False)
+    thread_id: str
+    # 步骤序列号，从0开始递增
+    sequence: int
+    # 当前状态（Running/Completed/Failed等）
+    status: StepStatus = StepStatus.Pending
+    # 执行层级
+    tier: ExecutionTier = ExecutionTier.Structured
+    llm_response: Optional[LlmResponse] = None
+    # 该step中所有action的结果
+    action_results: List[ActionResult] = field(default_factory=list)
+    tokens_used: TokenUsage = field(default_factory=TokenUsage)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = None
+
+    @property
+    def id(self):
+        return self._id
+
+
+# TODO 放在合适的位置
 # ── LLM 响应类型 ─────────────────────────────────────────────
 class LlmResponse:
     """LLM 的响应：文本、动作调用或可执行代码"""
@@ -132,39 +150,3 @@ class CodeExecutionFailure(str, Enum):
     ToolError = "tool_error"
     # 尝试了 OS 操作（被沙箱阻止）
     OsDenied = "os_denied"
-
-
-# ── Token 使用量 ─────────────────────────────────────────────
-
-@dataclass
-class TokenUsage:
-    """单次 LLM 调用的 token 使用量"""
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-    # 此次调用的美元成本（如果成本数据可用，由 LlmBackend 填充）
-    cost_usd: float = 0.0
-
-    @property
-    def total(self) -> int:
-        """返回总的 token 使用量"""
-        return self.input_tokens + self.output_tokens
-
-
-# ── 步骤 ─────────────────────────────────────────────────────
-
-@dataclass(kw_only=True)
-class Step:
-    """线程中的单个执行步骤"""
-    id: StepId = field(default_factory=StepId)
-    thread_id: ThreadId
-    # 线程内从 1 开始的序列号
-    sequence: int
-    status: StepStatus = StepStatus.Pending
-    tier: ExecutionTier = ExecutionTier.Structured
-    llm_response: Optional[LlmResponse] = None
-    action_results: List[ActionResult] = field(default_factory=list)
-    tokens_used: TokenUsage = field(default_factory=TokenUsage)
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    completed_at: Optional[datetime] = None

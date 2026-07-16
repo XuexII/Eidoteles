@@ -1,8 +1,14 @@
-# 线程——工作单元。
-#
-# 线程是一个有边界限制的任务或调查。
-# 它将会话（交互式对话）、作业（后台工作）、例程（定时执行）和子智能体（委托推理）的概念统一为具有共享状态机的单一抽象。
+"""
+Thread——工作单元
 
+每个Thread代表一个完整的执行任务，具有自己的生命周期、状态机、能力租约和资源消耗跟踪
+它将会话（交互式对话）、作业（后台工作）、例程（定时执行）和子智能体（委托推理）的概念统一为具有共享状态机的单一抽象
+
+流程:
+ThreadManager创建Thread实例，设置goal为用户输入，授予capability leases，并启动执行
+"""
+
+from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -17,28 +23,14 @@ from .event import (
     EventKindMessageAdded,
     ThreadEvent
 )
-from .memory import DocId
 from .message import ThreadMessage
-from .project import ProjectId
-from ..types import OwnerId, default_user_id
+from ironclaw_common.common import DEFAULT_USER_ID, OwnerId
 
 logger = logging.getLogger(__name__)
 
 
-# ── 强类型线程标识符 ─────────────────────────────────────────
-
-@dataclass(frozen=True)
-class ThreadId:
-    """强类型线程标识符"""
-    value: uuid.UUID = field(default_factory=uuid.uuid4)
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
-# ── 状态机 ───────────────────────────────────────────────────
-
-class ThreadState(Enum):
+# 标识线程的状态
+class ThreadState(str, Enum):
     """线程状态枚举"""
     # 线程已创建但尚未启动
     Created = "Created"
@@ -81,9 +73,8 @@ class ThreadState(Enum):
         return self in (ThreadState.Running, ThreadState.Waiting)
 
 
-# ── 线程类型 ─────────────────────────────────────────────────
-
-class ThreadType(Enum):
+# 标识线程/任务的类型
+class ThreadType(str, Enum):
     """线程执行的工作性质"""
     # 与用户的交互式对话
     Foreground = "Foreground"
@@ -93,14 +84,19 @@ class ThreadType(Enum):
     Mission = "Mission"
 
 
-# ── 线程配置 ─────────────────────────────────────────────────
+# LLM 调用的目的
+class LlmCallPurpose(str, Enum):
+    """LLM 调用的目的"""
+    Chat = "chat"
 
+
+# 线程配置
 @dataclass
 class ThreadConfig:
     """线程的执行参数"""
     # LLM 调用迭代的最大次数
     max_iterations: int = 50
-    # 线程的最大实际持续时间
+    # 最大执行时长
     max_duration: Optional[timedelta] = None
     # 是否检测并提示没有动作调用的工具意图
     enable_tool_intent_nudge: bool = True
@@ -138,8 +134,8 @@ class ThreadConfig:
 
 @dataclass
 class ActiveSkillProvenance:
-    """线程执行期间活跃技能的溯源信息"""
-    doc_id: DocId
+    """线程执行期间处于激活状态的skill的来源信息"""
+    doc_id: str
     name: str
     version: int
     snippet_names: List[str] = field(default_factory=list)
@@ -147,45 +143,61 @@ class ActiveSkillProvenance:
 
 
 ACTIVE_SKILLS_METADATA_KEY = "active_skills"
+LLM_USAGE_METADATA_USER_ID_MAX_LEN = 255
 
 
 # ── 线程 ─────────────────────────────────────────────────────
+def generate_thread_id() -> str:
+    return str(uuid.uuid4())
+
 
 @dataclass(kw_only=True)
 class Thread:
     """线程 — 工作单元"""
-    id: ThreadId = field(default_factory=ThreadId)
+    _id: str = field(default_factory=generate_thread_id, init=False)
+    # 执行目标/用户输入
     goal: str
-    # 简短的人类可读标签，用于频道 UI（例如网关侧边栏）。
-    # `goal` 是执行提示，可能是多段落的元提示；`title` 是用户看到的紧凑标签
+    # 用户可见的简短标签，用于UI显示（如侧边栏）
     title: Optional[str] = None
-
+    # thread类型
     thread_type: ThreadType
+    # 当前状态
     state: ThreadState = ThreadState.Created
-    project_id: ProjectId
+    # 所属项目，用于隔离上下文
+    project_id: str
     # 租户隔离：拥有此线程的用户。
-    user_id: str = default_user_id
-    parent_id: Optional[ThreadId] = None
+    user_id: str = DEFAULT_USER_ID
+    # 父thread ID，支持层级嵌套
+    parent_thread_id: Optional[str] = None
+    # 执行配置（迭代限制、预算、超时等
     config: ThreadConfig
-    # 线程的用户可见转录
+    # 用户可见的对话历史
     messages: List[ThreadMessage] = field(default_factory=list)
-    # 编排器用于推理、工具追踪、压缩和可恢复工作状态的内部执行转录
+    # 内部执行记录，用于orchestrator推理和工具追踪
     internal_messages: List[ThreadMessage] = field(default_factory=list)
+    # 事件日志，记录执行过程中的关键事件
     events: List[ThreadEvent] = field(default_factory=list)
+    # 授予的能力租约，定义可执行的操作范围
     capability_leases: List[LeaseId] = field(default_factory=list)
+    # 扩展元数据，存储自定义信息
     metadata: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
+    # 执行步数统计
     step_count: int = 0
+    # 累计token消耗
     total_tokens_used: int = 0
     # 所有步骤的累计美元成本
     total_cost_usd: float = 0.0
 
-    def with_parent(self, parent_id: ThreadId) -> "Thread":
-        """创建带有父引用的子线程"""
-        self.parent_id = parent_id
-        return self
+    @property
+    def id(self):
+        return self._id
+
+    def with_parent(self, parent_thread_id: str):
+        """设置父线程"""
+        self.parent_thread_id = parent_thread_id
 
     @staticmethod
     def derive_title_from_message(message: str) -> Optional[str]:
@@ -230,10 +242,41 @@ class Thread:
         """检查线程是否属于指定用户"""
         return self.owner_id.matches_user(user_id)
 
+    def llm_usage_metadata(self, purpose: LlmCallPurpose) -> dict:
+        """构建附加到引擎 LLM 使用记账记录的元数据
+
+        Args:
+            purpose: LLM 调用的目的
+
+        Returns:
+            包含 thread_id、purpose 以及可选的 user_id、conversation_scope、
+            v1_conversation_id 的元数据字典
+        """
+        metadata = {
+            "thread_id": str(self.id),
+            "purpose": purpose,
+        }
+
+        # 仅在 user_id 非空且长度未超过限制时附加
+        if self.user_id and len(self.user_id) <= LLM_USAGE_METADATA_USER_ID_MAX_LEN:
+            metadata["user_id"] = self.user_id
+
+        # 附加 conversation_scope（如果存在）
+        if scope := self.metadata.get("conversation_scope"):
+            if isinstance(scope, str):
+                metadata["conversation_scope"] = scope
+
+        # 附加 v1_conversation_id（如果存在）
+        if conversation_id := self.metadata.get("v1_conversation_id"):
+            if isinstance(conversation_id, str):
+                metadata["v1_conversation_id"] = conversation_id
+
+        return metadata
+
     def set_active_skills(
             self,
             active_skills: List[ActiveSkillProvenance],
-    ) -> None:
+    ):
         """在线程元数据中持久化活跃技能溯源"""
         if not isinstance(self.metadata, dict):
             raise RuntimeError("Store: 线程元数据不是 JSON 对象")
@@ -250,9 +293,6 @@ class Thread:
     def active_skills(self) -> List[ActiveSkillProvenance]:
         """从线程元数据中加载活跃技能溯源"""
         skills_data = self.metadata.get(ACTIVE_SKILLS_METADATA_KEY, [])
-        if not skills_data:
-            return []
-
         try:
             return [ActiveSkillProvenance(**skill) for skill in skills_data]
         except Exception as e:
@@ -262,10 +302,10 @@ class Thread:
             self,
             new_state: ThreadState,
             reason: Optional[str] = None,
-    ) -> None:
+    ):
         """转换到新状态，记录事件"""
         if not self.state.can_transition_to(new_state):
-            raise RuntimeError(f"InvalidTransition from {self.state} to {new_state}")
+            raise RuntimeError(f"从{self.state} 到 {new_state} 的转换无效")
 
         event = ThreadEvent(
             thread_id=self.id,
@@ -282,12 +322,12 @@ class Thread:
         if new_state in (ThreadState.Completed, ThreadState.Done):
             self.completed_at = datetime.now(timezone.utc)
 
-    def add_event(self, kind: EventKind) -> None:
+    def add_event(self, kind: EventKind):
         """向该线程的日志中添加事件"""
         self.events.append(ThreadEvent(thread_id=self.id, kind=kind))
         self.updated_at = datetime.now(timezone.utc)
 
-    def add_message(self, message: ThreadMessage) -> None:
+    def add_message(self, message: ThreadMessage):
         """向该线程的对话中添加消息"""
         content = message.content
         if len(content) > 80:
@@ -301,7 +341,7 @@ class Thread:
         ))
         self.messages.append(message)
 
-    def add_internal_message(self, message: ThreadMessage) -> None:
+    def add_internal_message(self, message: ThreadMessage):
         """向内部执行转录中添加消息，不将其作为用户可见的对话消息暴露"""
         self.internal_messages.append(message)
         self.updated_at = datetime.now(timezone.utc)

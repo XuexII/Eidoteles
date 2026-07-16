@@ -1,13 +1,23 @@
-# 线程消息——引擎自身的消息类型。
-#
-# 比主 crate 的 `ChatMessage` 更简单。桥接适配器负责 `ThreadMessage` 和 `ChatMessage` 之间的转换。
+"""
+ThreadMessage——引擎自身的消息类型
+
+用于构建Thread的对话历史和执行上下文
+"""
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Optional
 
-from .provenance import Provenance
+from .provenance import (
+    Provenance,
+    UserProvenance,
+    SystemProvenance,
+    ToolOutputProvenance,
+    LlmGeneratedProvenance
+
+)
 from .step import ActionCall
 
 
@@ -25,13 +35,16 @@ class ThreadMessage:
     """线程对话历史中的消息。"""
     role: MessageRole
     content: str
+    # 消息来源（User/System/ToolOutput/LlmGenerated等)
     provenance: Provenance
-    # 对于 ActionResult 消息：此消息响应的调用 ID
+    # 对于 ActionResult 消息：调用的action id
     action_call_id: Optional[str] = None
-    # 对于 ActionResult 消息：操作名称
+    # 对于 ActionResult 消息：调用的action name
     action_name: Optional[str] = None
-    # 对于 Assistant 消息：LLM 想要执行的操作
+    # 对于 Assistant 消息：LLM 输出的工具调用
+    # TODO: ActionCall 单独实现，作为llm的输出
     action_calls: Optional[List[ActionCall]] = None
+    # 时间戳
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @classmethod
@@ -40,8 +53,7 @@ class ThreadMessage:
         return cls(
             role=MessageRole.System,
             content=content,
-            provenance=ProvenanceSystem(),
-            timestamp=datetime.now(timezone.utc),
+            provenance=SystemProvenance()
         )
 
     @classmethod
@@ -50,8 +62,7 @@ class ThreadMessage:
         return cls(
             role=MessageRole.User,
             content=content,
-            provenance=ProvenanceUser(),
-            timestamp=datetime.now(timezone.utc),
+            provenance=UserProvenance(),
         )
 
     @classmethod
@@ -60,8 +71,7 @@ class ThreadMessage:
         return cls(
             role=MessageRole.Assistant,
             content=content,
-            provenance=ProvenanceLlmGenerated(),
-            timestamp=datetime.now(timezone.utc),
+            provenance=LlmGeneratedProvenance(),
         )
 
     @classmethod
@@ -74,9 +84,8 @@ class ThreadMessage:
         return cls(
             role=MessageRole.Assistant,
             content=content or "",
-            provenance=ProvenanceLlmGenerated(),
-            action_calls=calls,
-            timestamp=datetime.now(timezone.utc),
+            provenance=LlmGeneratedProvenance(),
+            action_calls=calls
         )
 
     @classmethod
@@ -90,8 +99,7 @@ class ThreadMessage:
         return cls(
             role=MessageRole.ActionResult,
             content=content,
-            provenance=ProvenanceToolOutput(action_name=action_name),
+            provenance=ToolOutputProvenance(action_name=action_name),
             action_call_id=call_id,
-            action_name=action_name,
-            timestamp=datetime.now(timezone.utc),
+            action_name=action_name
         )

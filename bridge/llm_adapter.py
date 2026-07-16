@@ -167,8 +167,8 @@ def json_has_template_refs(value: Any) -> bool:
 def thread_msg_to_chat(msg: Any) -> Any:
     """将 ThreadMessage 转换为 ChatMessage"""
     role_map = {
-        MessageRole.System: Role.System,
-        MessageRole.User: Role.User,
+        MessageRole.SystemProvenance: Role.System,
+        MessageRole.UserProvenance: Role.User,
         MessageRole.Assistant: Role.Assistant,
         MessageRole.ActionResult: Role.Tool,
     }

@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from engine.types.thread import ThreadId
 
 
 @dataclass(frozen=True)
@@ -43,7 +42,7 @@ class EntrySenderUser(EntrySender):
 @dataclass
 class EntrySenderAgent(EntrySender):
     """代理（来自特定线程）。"""
-    thread_id: ThreadId
+    thread_id: str
 
 
 @dataclass
@@ -59,7 +58,7 @@ class ConversationEntry:
     sender: EntrySender = field(default_factory=EntrySenderUser)
     content: str = ""
     # 哪个线程产生了此条目（如果有）
-    origin_thread_id: Optional[ThreadId] = None
+    origin_thread_id: Optional[str] = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # 可选元数据（通道特定格式、附件等）
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -77,7 +76,7 @@ class ConversationEntry:
         )
 
     @classmethod
-    def agent(cls, thread_id: ThreadId, content: str) -> "ConversationEntry":
+    def agent(cls, thread_id: str, content: str) -> "ConversationEntry":
         """从线程创建代理条目。"""
         return cls(
             id=EntryId(),
@@ -129,7 +128,7 @@ class ConversationSurface:
     # 按时间顺序排列的所有条目
     entries: List[ConversationEntry] = field(default_factory=list)
     # 当前活动（非终端）线程 ID
-    active_threads: List[ThreadId] = field(default_factory=list)
+    active_threads: List[str] = field(default_factory=list)
     # 元数据（通道特定状态、外部线程 ID 等）
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -155,12 +154,12 @@ class ConversationSurface:
         self.entries.append(entry)
         self.updated_at = datetime.now(timezone.utc)
 
-    def track_thread(self, thread_id: ThreadId) -> None:
+    def track_thread(self, thread_id: str) -> None:
         """在线程中注册为活动状态。"""
         if thread_id not in self.active_threads:
             self.active_threads.append(thread_id)
 
-    def untrack_thread(self, thread_id: ThreadId) -> None:
+    def untrack_thread(self, thread_id: str) -> None:
         """从活动列表中移除线程（它已完成或失败）。"""
         self.active_threads = [tid for tid in self.active_threads if tid != thread_id]
 
@@ -168,6 +167,6 @@ class ConversationSurface:
         """获取最近的条目（如果有）。"""
         return self.entries[-1] if self.entries else None
 
-    def entries_for_thread(self, thread_id: ThreadId) -> List[ConversationEntry]:
+    def entries_for_thread(self, thread_id: str) -> List[ConversationEntry]:
         """获取来自特定线程的所有条目。"""
         return [e for e in self.entries if e.origin_thread_id == thread_id]

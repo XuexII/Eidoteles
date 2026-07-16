@@ -199,7 +199,7 @@ def analyze_trace(thread: Thread) -> List[TraceIssue]:
         ]
         for i, msg in enumerate(thread.messages):
             is_code_output = (
-                    msg.role == MessageRole.User
+                    msg.role == MessageRole.UserProvenance
                     and (msg.content.startswith("[stdout]")
                          or msg.content.startswith("[stderr]")
                          or msg.content.startswith("[code ")
@@ -234,7 +234,7 @@ def analyze_trace(thread: Thread) -> List[TraceIssue]:
         m.role == MessageRole.ActionResult for m in thread.messages
     )
     has_tool_output_in_context = any(
-        m.role == MessageRole.User and (" result]" in m.content or " error]" in m.content)
+        m.role == MessageRole.UserProvenance and (" result]" in m.content or " error]" in m.content)
         for m in thread.messages
     )
     if has_tool_results and not has_tool_output_in_context:

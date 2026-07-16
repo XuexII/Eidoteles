@@ -183,7 +183,7 @@ class ExecutionLoop:
 
         def messages_have_prompt(messages: List[ThreadMessage]) -> bool:
             for message in messages:
-                if (message.role == MessageRole.System
+                if (message.role == MessageRole.SystemProvenance
                         and is_codeact_system_prompt(message.content)):
                     return True
             return False

@@ -501,7 +501,7 @@ class HybridStore(Store):
         # 收集被任务引用但在线程映射中缺失的线程 ID
         missing = []
         for m in self.missions.values():
-            for tid in m.thread_history:
+            for tid in m.history_thread_ids:
                 if tid not in self.threads:
                     missing.append(tid)
 
@@ -1473,7 +1473,7 @@ def thread_from_archive(summary: dict) -> Optional[Thread]:
         state=state,
         project_id=ProjectId(uuid.UUID(int=0)),  # nil UUID
         user_id='default',
-        parent_id=None,
+        parent_thread_id=None,
         config=ThreadConfig(),
         messages=[],
         internal_messages=[],

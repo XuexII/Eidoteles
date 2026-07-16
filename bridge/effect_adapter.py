@@ -650,7 +650,7 @@ class EffectBridgeAdapter(EffectExecutor):
                         "name": m.name,
                         "goal": m.goal,
                         "status": str(m.status),
-                        "threads": len(m.thread_history),
+                        "threads": len(m.history_thread_ids),
                     }
                     for m in missions
                 ]
